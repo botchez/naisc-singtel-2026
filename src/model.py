@@ -31,8 +31,15 @@ def prepare_features(
     X_train = train[feature_cols].copy()
     X_test = test[feature_cols].copy()
 
-    # Encode categoricals and temporals with label encoding (fitted on train+test combined)
-    cat_cols = [c for c in feature_types["categorical"] + feature_types["temporal"] if c in feature_cols]
+    # Convert temporal columns to month number (1-12)
+    for col in feature_types["temporal"]:
+        if col in feature_cols:
+            for df in [X_train, X_test]:
+                df[col] = pd.to_datetime(df[col], format="%y-%b", errors="coerce").dt.month
+                df[col] = df[col].fillna(0).astype(int)
+
+    # Encode categoricals with label encoding (fitted on train+test combined)
+    cat_cols = [c for c in feature_types["categorical"] if c in feature_cols]
     encoders = {}
     for col in cat_cols:
         le = LabelEncoder()
