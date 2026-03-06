@@ -25,3 +25,13 @@ python ./src/main.py --train_data_filepath public_data/train.csv --test_data_fil
 - Console: drift detection summary, runtime, AU-PRC metrics
 - `prediction.csv`: CustomerID and probability scores
 - `model.joblib`: trained LightGBM model
+
+## Dashboard
+
+Interactive drift visualization dashboard:
+
+```bash
+streamlit run src/dashboard.py
+```
+
+Opens in browser at `http://localhost:8501`.
