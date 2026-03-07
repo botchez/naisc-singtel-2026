@@ -92,7 +92,6 @@ def evaluate_and_save(
     customer_ids: list[str],
     test: pd.DataFrame,
     feature_types: dict[str, list[str]],
-    label: str = "baseline",
 ) -> dict[str, float]:
     """Predict, compute AU-PRC, save model and predictions."""
     # Train AU-PRC
@@ -107,20 +106,18 @@ def evaluate_and_save(
         y_test = (test[target_col] == "Yes").astype(int)
         test_auprc = average_precision_score(y_test, test_proba)
 
-    # Save prediction and model with label
-    pred_file = f"prediction_{label}.csv"
-    model_file = f"model_{label}.joblib"
+    # Save prediction and model
     pred_df = pd.DataFrame({"CustomerID": customer_ids, "probability_score": test_proba})
-    pred_df.to_csv(pred_file, index=False)
-    logger.info(f"Saved {pred_file}")
+    pred_df.to_csv("prediction.csv", index=False)
+    logger.info("Saved prediction.csv")
 
-    joblib.dump(model, model_file)
-    logger.info(f"Saved {model_file}")
+    joblib.dump(model, "model.joblib")
+    logger.info("Saved model.joblib")
 
     # Print metrics
     metrics = {"train_auprc": train_auprc}
     print("\n" + "=" * 70)
-    print(f"MODEL PERFORMANCE ({label.upper()})")
+    print("MODEL PERFORMANCE")
     print("=" * 70)
     print(f"  AU-PRC (train): {train_auprc:.4f}")
     if test_auprc is not None:
