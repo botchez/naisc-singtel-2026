@@ -1,6 +1,6 @@
 # NAISC Singtel 2026 — Adaptive Drift Intelligence Challenge
 
-**Team Name:** [TODO: Add team name]
+**Team Name:** junyiding
 
 ## Setup
 
