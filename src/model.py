@@ -11,6 +11,7 @@ def prepare_features(
     train: pd.DataFrame,
     test: pd.DataFrame,
     feature_types: dict[str, list[str]],
+    extra_drop_cols: list[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, list[str]]:
     """Minimal preprocessing: encode categoricals, drop IDs, split X/y.
 
@@ -26,6 +27,8 @@ def prepare_features(
 
     # Columns to use as features
     drop_cols = feature_types["id"] + feature_types["target"]
+    if extra_drop_cols:
+        drop_cols = drop_cols + [c for c in extra_drop_cols if c not in drop_cols]
     feature_cols = [c for c in train.columns if c not in drop_cols]
 
     X_train = train[feature_cols].copy()
@@ -89,6 +92,7 @@ def evaluate_and_save(
     customer_ids: list[str],
     test: pd.DataFrame,
     feature_types: dict[str, list[str]],
+    label: str = "baseline",
 ) -> dict[str, float]:
     """Predict, compute AU-PRC, save model and predictions."""
     # Train AU-PRC
@@ -103,19 +107,20 @@ def evaluate_and_save(
         y_test = (test[target_col] == "Yes").astype(int)
         test_auprc = average_precision_score(y_test, test_proba)
 
-    # Save prediction.csv
+    # Save prediction and model with label
+    pred_file = f"prediction_{label}.csv"
+    model_file = f"model_{label}.joblib"
     pred_df = pd.DataFrame({"CustomerID": customer_ids, "probability_score": test_proba})
-    pred_df.to_csv("prediction.csv", index=False)
-    logger.info("Saved prediction.csv")
+    pred_df.to_csv(pred_file, index=False)
+    logger.info(f"Saved {pred_file}")
 
-    # Save model
-    joblib.dump(model, "model.joblib")
-    logger.info("Saved model.joblib")
+    joblib.dump(model, model_file)
+    logger.info(f"Saved {model_file}")
 
     # Print metrics
     metrics = {"train_auprc": train_auprc}
     print("\n" + "=" * 70)
-    print("MODEL PERFORMANCE")
+    print(f"MODEL PERFORMANCE ({label.upper()})")
     print("=" * 70)
     print(f"  AU-PRC (train): {train_auprc:.4f}")
     if test_auprc is not None:
