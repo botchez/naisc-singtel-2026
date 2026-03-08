@@ -1,5 +1,23 @@
 # Changelog
 
+## Iteration 15 — F7: Zero-Importance Feature Selection
+- **Status:** COMMITTED
+- **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **AFTER:**  Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **Delta:**  Mitigated train +0.0000 | CV +0.0000
+- **Summary:** Added zero-importance feature selection: trains a preliminary model, drops features with zero gain importance (never used by LightGBM). Removed 9 features (Country, State, Month_cos, Month_sin, PrioritySupport_is_null, 4 aggregation features), reducing from 61 to 52 features. No metric change on public data (LightGBM already ignored these), but reduces overfitting potential on hidden datasets.
+
+---
+
+## Iteration 14 — A4: Hellinger Distance
+- **Status:** REVERTED (no improvement)
+- **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **AFTER:**  Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **Delta:**  Mitigated train +0.0000 | CV +0.0000
+- **Summary:** Added Hellinger distance (bounded [0,1], sensitive to small-probability differences) to categorical drift detection alongside JSD and Cramér's V. Used in `_categorical_severity`: H>0.3 with JSD>=0.05 → high; H>0.15 → moderate. No severity classifications changed on this dataset — existing JSD/chi2/Cramér's V thresholds already capture all categorical drift. Reverted: zero improvement doesn't meet ≥0.001 commit threshold. Unlike tail divergence (A7), Hellinger is largely redundant with JSD for this class of distributions.
+
+---
+
 ## Iteration 13 — F2: Stratified CV for Classification
 - **Status:** COMMITTED
 - **BEFORE:** Baseline train=0.8899 test=0.7378 | Mitigated train=0.8894 test=0.8565 | CV AU-PRC=0.8599

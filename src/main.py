@@ -323,6 +323,18 @@ def main():
             train_m, test_m, feature_types, extra_drop_cols=drop_cols
         )
 
+        # --- Feature selection: drop zero-importance features ---
+        try:
+            pre_model = train_model(X_train_m, y_train_m)
+            importances = pre_model.feature_importances_
+            zero_imp_cols = [c for c, imp in zip(X_train_m.columns, importances) if imp == 0]
+            if zero_imp_cols:
+                X_train_m = X_train_m.drop(columns=zero_imp_cols)
+                X_test_m = X_test_m.drop(columns=zero_imp_cols)
+                logger.info(f"Dropped {len(zero_imp_cols)} zero-importance features: {zero_imp_cols}")
+        except Exception as e:
+            logger.warning(f"Feature selection skipped: {e}")
+
         # --- Sample weight tournament with cross-validation ---
         import numpy as np
         from sklearn.metrics import average_precision_score
