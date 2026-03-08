@@ -129,7 +129,7 @@ def print_model_performance_summary(
     mitigated_metrics: dict[str, float],
 ) -> None:
     """Print model performance table comparing baseline vs mitigated."""
-    CW = (24, 14, 14)
+    CW = (24, 14, 14, 14)
     total = sum(CW) + len(CW) - 1
     title = "MODEL PERFORMANCE SUMMARY"
 
@@ -137,17 +137,28 @@ def print_model_performance_summary(
         v = metrics.get(key)
         return f"{v:.4f}" if v is not None else "N/A"
 
+    def _delta(key: str) -> str:
+        b = baseline_metrics.get(key)
+        m = mitigated_metrics.get(key)
+        if b is None or m is None:
+            return "N/A"
+        d = m - b
+        sign = "+" if d >= 0 else ""
+        return f"{sign}{d:.4f}"
+
     rows = [
-        ("AU-PRC (train)", _fmt(baseline_metrics, "train_auprc"), _fmt(mitigated_metrics, "train_auprc")),
-        ("AU-PRC (test)", _fmt(baseline_metrics, "test_auprc"), _fmt(mitigated_metrics, "test_auprc")),
+        ("AU-PRC (train)", "train_auprc"),
+        ("AU-PRC (test)", "test_auprc"),
     ]
+
+    h = lambda l, m, r: f"{l}{'═'*CW[0]}{m}{'═'*CW[1]}{m}{'═'*CW[2]}{m}{'═'*CW[3]}{r}"
 
     print()
     print(f"╔{'═' * total}╗")
     print(f"║{title:^{total}}║")
-    print(f"╠{'═' * CW[0]}╦{'═' * CW[1]}╦{'═' * CW[2]}╣")
-    print(f"║{'Metric':<{CW[0]}}║{'Baseline':^{CW[1]}}║{'Mitigated':^{CW[2]}}║")
-    print(f"╠{'═' * CW[0]}╬{'═' * CW[1]}╬{'═' * CW[2]}╣")
-    for label, base_val, mit_val in rows:
-        print(f"║ {label:<{CW[0] - 1}}║ {base_val:<{CW[1] - 1}}║ {mit_val:<{CW[2] - 1}}║")
-    print(f"╚{'═' * CW[0]}╩{'═' * CW[1]}╩{'═' * CW[2]}╝")
+    print(h("╠", "╦", "╣"))
+    print(f"║{'Metric':<{CW[0]}}║{'Baseline':^{CW[1]}}║{'Mitigated':^{CW[2]}}║{'Delta':^{CW[3]}}║")
+    print(h("╠", "╬", "╣"))
+    for label, key in rows:
+        print(f"║ {label:<{CW[0] - 1}}║ {_fmt(baseline_metrics, key):<{CW[1] - 1}}║ {_fmt(mitigated_metrics, key):<{CW[2] - 1}}║ {_delta(key):<{CW[3] - 1}}║")
+    print(h("╚", "╩", "╝"))
