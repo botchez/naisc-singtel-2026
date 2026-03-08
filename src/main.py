@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pandas as pd
 from profiler import load_data, detect_feature_types, profile_data
 from drift_detector import run_drift_analysis
-from model import prepare_features, train_model, evaluate_and_save
+from model import prepare_features, train_model, evaluate_and_save, print_model_performance_summary
 from mitigation import apply_all_mitigations
 from utils import Timer
 
@@ -112,7 +112,7 @@ def print_runtime_summary(
 
     title = "RUNTIME SUMMARY"
 
-    print("\n")
+    print()
     print(full_sep("╔", "╗"))
     print(f"║{title:^{W}}║")
     print(h_line("╠", "╦", "╣"))
@@ -148,9 +148,6 @@ def main():
             train, test, drift_df, feature_types
         )
 
-    # --- Print Drift & Mitigation Summary ---
-    print_drift_mitigation_summary(drift_df, drop_cols)
-
     # --- Stage 4: Model Training & Prediction ---
     with Timer("Model training") as model_timer:
         X_train, y_train, X_test, customer_ids = prepare_features(
@@ -161,7 +158,14 @@ def main():
             lgbm, X_train, y_train, X_test, customer_ids, test_m, feature_types,
         )
 
-    # --- Runtime Summary ---
+    # --- All tables printed after all stages complete ---
+    ascii_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "teamASCII.txt")
+    if os.path.exists(ascii_path):
+        print("\n")
+        with open(ascii_path) as f:
+            print(f.read())
+    print_drift_mitigation_summary(drift_df, drop_cols)
+    print_model_performance_summary(metrics)
     print_runtime_summary(drift_timer.elapsed, mitigation_timer.elapsed, model_timer.elapsed)
 
 
