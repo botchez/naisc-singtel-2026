@@ -4,3 +4,5 @@ __pycache__/
 *.joblib
 .env
 CLAUDE.md
+!prediction.csv
+!model.joblib
