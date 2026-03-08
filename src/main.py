@@ -16,45 +16,114 @@ from utils import Timer
 def print_drift_mitigation_summary(
     drift_df: pd.DataFrame,
     drop_cols: list[str],
-    drift_time: float,
-    mitigation_time: float,
 ) -> None:
-    """Print combined drift detection & mitigation summary."""
-    print("\n" + "=" * 70)
-    print("DATA DRIFT DETECTION & MITIGATION SUMMARY")
-    print("=" * 70)
+    """Print combined drift detection & mitigation summary as a unified double-line table."""
+    CW = (24, 14, 34, 20)
+    FULL_W = sum(CW) + len(CW) - 1  # 85
+
+    def full_row(text):
+        return f"║ {text:<{FULL_W - 1}}║"
+
+    def col_row(c1, c2, c3, c4):
+        return f"║ {c1:<{CW[0]-2}} ║ {c2:<{CW[1]-2}} ║ {c3:<{CW[2]-2}} ║ {c4:<{CW[3]-2}} ║"
+
+    def h_line(left, mid, right):
+        return f"{left}{'═'*CW[0]}{mid}{'═'*CW[1]}{mid}{'═'*CW[2]}{mid}{'═'*CW[3]}{right}"
+
+    def full_sep(left, right):
+        return f"{left}{'═' * FULL_W}{right}"
+
+    title = "DATA DRIFT DETECTION & MITIGATION SUMMARY"
+
+    print("\n")
+    print(full_sep("╔", "╗"))
+    print(f"║{title:^{FULL_W}}║")
 
     if drift_df.empty:
-        print("No features analysed.")
-    else:
-        # Columns with detected drift (moderate or high)
-        drifted = drift_df[drift_df["severity"].isin(["high", "moderate"])]
-        if not drifted.empty:
-            print(f"\nColumns with detected drift ({len(drifted)}):")
-            for _, row in drifted.iterrows():
-                col = row["column"]
-                ftype = row["feature_type"]
-                severity = row["severity"]
-                if ftype == "numerical":
-                    tests = f"KS={row['ks_stat']:.4f} (p={row['ks_pval']:.4f}), PSI={row['psi']:.4f}, Wasserstein={row['wasserstein']:.4f}"
-                else:
-                    tests = f"Chi2={row['chi2_stat']:.4f} (p={row['chi2_pval']:.4f}), JSD={row['jsd']:.4f}"
-                print(f"  {col:30s}  type={ftype:<12s}  severity={severity:<10s}  {tests}")
+        print(full_sep("╠", "╣"))
+        print(full_row("No features analysed."))
+        print(full_sep("╚", "╝"))
+        return
+
+    # Filter to only drifted features (high or moderate)
+    drifted = drift_df[drift_df["severity"].isin(["high", "moderate"])].copy()
+
+    if drifted.empty:
+        print(full_sep("╠", "╣"))
+        print(full_row("No high or moderate drift detected across all features."))
+        print(full_sep("╚", "╝"))
+        return
+
+    drop_set = set(drop_cols)
+
+    # Title → header (introduces column dividers)
+    print(h_line("╠", "╦", "╣"))
+    print(col_row("Column", "Type", "Drift Description", "Mitigation"))
+    # Header → data (crossing)
+    print(h_line("╠", "╬", "╣"))
+
+    # Data rows
+    for _, r in drifted.iterrows():
+        col_name = r["column"][:CW[0] - 2]
+        ftype = r["feature_type"]
+        sev = r["severity"].capitalize()
+
+        if ftype == "numerical":
+            drift_desc = f"{sev}: PSI={r['psi']:.2f}, KS p={r['ks_pval']:.3f}"
         else:
-            print("\nNo significant drift detected.")
+            drift_desc = f"{sev}: JSD={r['jsd']:.2f}, Chi2 p={r['chi2_pval']:.3f}"
+        drift_desc = drift_desc[:CW[2] - 2]
 
-    # Mitigation methods applied
-    print(f"\nMitigation methods applied:")
-    print(f"  - Data quality normalization (city abbreviation mapping, lowercase, hyphen removal)")
-    if drop_cols:
-        print(f"  - Dropped {len(drop_cols)} high-drift features: {drop_cols}")
-    else:
-        print(f"  - No features dropped (no high-drift columns)")
+        normalized = ftype in ("categorical", "temporal")
+        dropped = r["column"] in drop_set
+        if normalized and dropped:
+            mitigation = "Normalized+Dropped"
+        elif dropped:
+            mitigation = "Dropped"
+        elif normalized:
+            mitigation = "Normalized"
+        else:
+            mitigation = "Retained"
 
-    # Runtime
-    total = drift_time + mitigation_time
-    print(f"\nRuntime: {total:.2f}s (detection: {drift_time:.2f}s, mitigation: {mitigation_time:.2f}s)")
-    print("=" * 70)
+        print(col_row(col_name, ftype, drift_desc, mitigation))
+
+    # Close table
+    print(h_line("╚", "╩", "╝"))
+
+
+def print_runtime_summary(
+    drift_time: float,
+    mitigation_time: float,
+    model_time: float,
+) -> None:
+    """Print a separate runtime breakdown table using box-drawing characters."""
+    total = drift_time + mitigation_time + model_time
+    CW = (24, 14)
+    W = sum(CW) + len(CW) - 1
+
+    def h_line(left, mid, right):
+        return f"{left}{'═'*CW[0]}{mid}{'═'*CW[1]}{right}"
+
+    def full_sep(left, right):
+        return f"{left}{'═' * W}{right}"
+
+    def col_row(c1, c2):
+        return f"║ {c1:<{CW[0]-2}} ║ {c2:<{CW[1]-2}} ║"
+
+    title = "RUNTIME SUMMARY"
+
+    print("\n")
+    print(full_sep("╔", "╗"))
+    print(f"║{title:^{W}}║")
+    print(h_line("╠", "╦", "╣"))
+    print(col_row("Stage", "Time"))
+    print(h_line("╠", "╬", "╣"))
+    print(col_row("Drift Detection", f"{drift_time:.2f}s"))
+    print(col_row("Drift Mitigation", f"{mitigation_time:.2f}s"))
+    print(col_row("Model Training", f"{model_time:.2f}s"))
+    print(h_line("╠", "╬", "╣"))
+    print(col_row("Total", f"{total:.2f}s"))
+    print(h_line("╚", "╩", "╝"))
 
 
 def main():
@@ -80,7 +149,7 @@ def main():
         )
 
     # --- Print Drift & Mitigation Summary ---
-    print_drift_mitigation_summary(drift_df, drop_cols, drift_timer.elapsed, mitigation_timer.elapsed)
+    print_drift_mitigation_summary(drift_df, drop_cols)
 
     # --- Stage 4: Model Training & Prediction ---
     with Timer("Model training") as model_timer:
@@ -93,13 +162,7 @@ def main():
         )
 
     # --- Runtime Summary ---
-    total_time = drift_timer.elapsed + mitigation_timer.elapsed + model_timer.elapsed
-    print(
-        f"\nTotal runtime: {total_time:.2f}s "
-        f"(drift: {drift_timer.elapsed:.2f}s, "
-        f"mitigation: {mitigation_timer.elapsed:.2f}s, "
-        f"model: {model_timer.elapsed:.2f}s)"
-    )
+    print_runtime_summary(drift_timer.elapsed, mitigation_timer.elapsed, model_timer.elapsed)
 
 
 if __name__ == "__main__":

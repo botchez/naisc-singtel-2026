@@ -22,4 +22,3 @@ class Timer:
 
     def __exit__(self, *exc):
         self.elapsed = time.perf_counter() - self.start
-        logger.info(f"{self.label}: {self.elapsed:.2f}s")

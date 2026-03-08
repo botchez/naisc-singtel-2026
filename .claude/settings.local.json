@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "WebSearch",
+      "Bash(python3:*)",
+      "Bash(timeout 15 streamlit run:*)"
+    ]
+  }
+}
