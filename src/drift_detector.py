@@ -97,7 +97,9 @@ def detect_categorical_drift(
 
 def _numerical_severity(ks_pval: float, psi: float) -> str:
     """Classify drift severity for numerical features."""
-    if psi >= 0.25 or ks_pval < 0.001:
+    if psi >= 0.25:
+        return "high"
+    if psi >= 0.15 and ks_pval < 0.001:
         return "high"
     if psi >= 0.1 or ks_pval < 0.05:
         return "moderate"
@@ -106,9 +108,11 @@ def _numerical_severity(ks_pval: float, psi: float) -> str:
 
 def _categorical_severity(chi2_pval: float, jsd: float) -> str:
     """Classify drift severity for categorical features."""
-    if jsd >= 0.1 or chi2_pval < 0.001:
+    if jsd >= 0.1:
         return "high"
-    if jsd >= 0.05 or chi2_pval < 0.05:
+    if jsd >= 0.05 or chi2_pval < 0.001:
+        return "moderate"
+    if chi2_pval < 0.05:
         return "moderate"
     return "low"
 
