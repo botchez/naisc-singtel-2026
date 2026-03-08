@@ -106,7 +106,7 @@ def detect_numerical_drift(
     std_train = np.std(train_vals)
     wasserstein_norm = wasserstein / (std_train + 1e-8)
 
-    severity = _numerical_severity(ks_pval, psi, wasserstein_norm)
+    severity = _numerical_severity(ks_pval, psi, wasserstein_norm, ks_stat)
     severity = _escalate_severity(severity, miss_sev)
 
     return {
@@ -189,10 +189,11 @@ def detect_categorical_drift(
     }
 
 
-def _numerical_severity(ks_pval: float, psi: float, wasserstein_norm: float = 0.0) -> str:
+def _numerical_severity(ks_pval: float, psi: float, wasserstein_norm: float = 0.0, ks_stat: float = 0.0) -> str:
     """Classify drift severity for numerical features.
 
-    Uses PSI, KS p-value, and normalized Wasserstein distance.
+    Uses PSI, KS p-value, KS D-statistic (effect size), and normalized Wasserstein distance.
+    KS D-statistic gates p-value to prevent large-sample false positives.
     """
     if psi >= 0.25:
         return "high"
@@ -201,7 +202,10 @@ def _numerical_severity(ks_pval: float, psi: float, wasserstein_norm: float = 0.
     # Large distributional shift confirmed by both Wasserstein and PSI
     if wasserstein_norm >= 1.0 and psi >= 0.1:
         return "high"
-    if psi >= 0.1 or ks_pval < 0.05 or (wasserstein_norm >= 0.3 and psi >= 0.05):
+    # Large KS effect size combined with moderate PSI
+    if ks_stat >= 0.15 and psi >= 0.1:
+        return "high"
+    if psi >= 0.1 or (ks_pval < 0.05 and ks_stat >= 0.05) or (wasserstein_norm >= 0.3 and psi >= 0.05):
         return "moderate"
     return "low"
 
@@ -341,7 +345,8 @@ def _apply_bh_correction(drift_df: pd.DataFrame) -> pd.DataFrame:
                 ks_p = row.get("ks_pval", 1.0)
             psi = row.get("psi") or 0.0
             w_norm = row.get("wasserstein_norm") or 0.0
-            drift_df.loc[idx, "severity"] = _numerical_severity(ks_p, psi, w_norm)
+            ks_d = row.get("ks_stat") or 0.0
+            drift_df.loc[idx, "severity"] = _numerical_severity(ks_p, psi, w_norm, ks_d)
         elif row["feature_type"] in ("categorical", "temporal"):
             chi2_p = row.get("chi2_pval_bh", row.get("chi2_pval", 1.0))
             if pd.isna(chi2_p):

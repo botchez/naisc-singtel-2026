@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 2 — A1: KS Effect Size
+- **Status:** COMMITTED
+- **BEFORE:** Baseline train=0.8904 test=0.7317 | Mitigated train=0.8896 test=0.8571 | CV AU-PRC=0.8603
+- **AFTER:**  Baseline train=0.8904 test=0.7317 | Mitigated train=0.8894 test=0.8580 | CV AU-PRC=0.8592
+- **Delta:**  Mitigated train -0.0002 | CV -0.0011
+- **Summary:** Added KS D-statistic (effect size) gating to `_numerical_severity`. KS p-value alone no longer triggers moderate classification — requires D-stat >= 0.05 to prevent large-sample false positives. TotalCharges and Longitude correctly reclassified from moderate to low. TransactionMode now gets frequency encoding (moderate -> low). Improves generalization for hidden datasets with different sample sizes.
+
+---
+
 ## Iteration 1 — A2: Cramér's V
 - **Status:** COMMITTED
 - **BEFORE:** Baseline train=0.8904 test=0.7317 | Mitigated train=0.8896 test=0.8571 | CV AU-PRC=0.8603
