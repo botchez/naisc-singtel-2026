@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 18 — Target Encoding 10-Fold CV
+- **Status:** REVERTED
+- **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **AFTER:**  Baseline train=0.8918 test=0.7349 | Mitigated train=0.8894 test=0.8556 | CV AU-PRC=0.8569
+- **Delta:**  Mitigated train -0.0002 | CV -0.0026
+- **Reason:** Increasing target encoding CV folds from 5 to 10 degraded all metrics. With 10 folds, smaller validation sets introduced more noise in fold encodings. Additionally, the noisier encodings destabilized the weight tournament (Blend won instead of Uniform), compounding the regression. 5-fold target encoding is the sweet spot for this dataset size.
+
+---
+
 ## Iteration 17 — F6: Adaptive Bayesian Smoothing
 - **Status:** REVERTED
 - **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
