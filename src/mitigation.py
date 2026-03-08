@@ -3,6 +3,59 @@ import pandas as pd
 from utils import logger
 
 
+def compute_domain_weights(
+    train_oof_proba: np.ndarray, power: float = 0.5
+) -> np.ndarray:
+    """Convert domain classifier P(test) probabilities to sample weights.
+
+    Higher P(test) = training row looks more like test = more important.
+    Power dampening (default 0.5) prevents extreme weight ratios.
+
+    Returns weights normalized to mean=1.0.
+    """
+    if train_oof_proba is None or len(train_oof_proba) == 0:
+        return None
+
+    # Clip to avoid zero weights
+    proba = np.clip(train_oof_proba, 1e-6, 1.0 - 1e-6)
+
+    # Power dampening: soften the weight distribution
+    weights = proba ** power
+
+    # Clip extreme values at 99th percentile
+    cap = np.percentile(weights, 99)
+    weights = np.clip(weights, None, cap)
+
+    # Normalize to mean=1.0
+    weights = weights / weights.mean()
+
+    return weights
+
+
+def compute_recency_weights(
+    month_rank: pd.Series, decay: float = 0.15
+) -> np.ndarray:
+    """Compute recency weights from month rank using exponential decay.
+
+    Most recent months get weight ~1.0; older months decay down.
+    Returns weights normalized to mean=1.0.
+    """
+    if month_rank is None or len(month_rank) == 0:
+        return None
+
+    max_rank = month_rank.max()
+    if max_rank == 0:
+        return None
+
+    # Exponential decay: recent rows weighted higher
+    weights = np.exp(decay * (month_rank.values - max_rank))
+
+    # Normalize to mean=1.0
+    weights = weights / weights.mean()
+
+    return weights
+
+
 def detect_abbreviation_mappings(
     train: pd.DataFrame, test: pd.DataFrame, col: str
 ) -> dict[str, str]:
@@ -186,7 +239,7 @@ def mitigate_feature_progressive(
         "column": col,
         "feature_type": feature_type,
         "original_severity": original_severity,
-        "strategy_applied": "Dropped",
+        "strategy_applied": "Drop Feature",
         "final_severity": original_severity,
     }
 
@@ -206,7 +259,7 @@ def mitigate_feature_progressive(
             test[test_sin.name] = test_sin.values
             test[test_cos.name] = test_cos.values
             worst = sin_drift["severity"] if sin_drift["severity"] == "moderate" else cos_drift["severity"]
-            log_entry["strategy_applied"] = "Cyclical-encoded"
+            log_entry["strategy_applied"] = "Seasonality Matching"
             log_entry["final_severity"] = worst
             return train, test, log_entry
         # Cyclical failed -> drop
@@ -214,10 +267,10 @@ def mitigate_feature_progressive(
 
     if feature_type == "numerical":
         strategies = [
-            ("Clipped", lambda tc, sc: clip_outliers(tc, sc)),
-            ("Log-transformed", lambda tc, sc: log_transform(tc, sc)),
-            ("Clipped+Log", lambda tc, sc: _clip_then_log(tc, sc)),
-            ("Binned", lambda tc, sc: quantile_bin(tc, sc)),
+            ("Feature Scaling", lambda tc, sc: clip_outliers(tc, sc)),
+            ("Feature Scaling (Log)", lambda tc, sc: log_transform(tc, sc)),
+            ("Feature Scaling (Clip+Log)", lambda tc, sc: _clip_then_log(tc, sc)),
+            ("Discretization", lambda tc, sc: quantile_bin(tc, sc)),
         ]
         for name, fn in strategies:
             result = fn(train[col], test[col])
@@ -240,7 +293,7 @@ def mitigate_feature_progressive(
         if drift["severity"] != "high":
             train[col] = tr_col.values
             test[col] = te_col.values
-            log_entry["strategy_applied"] = "Rare-grouped"
+            log_entry["strategy_applied"] = "Category Consolidation"
             log_entry["final_severity"] = drift["severity"]
             return train, test, log_entry
         # Rare grouping failed -> drop
@@ -293,7 +346,7 @@ def apply_all_mitigations(
             train_m, test_m, col, ftype, severity
         )
         mitigation_log.append(entry)
-        if entry["strategy_applied"] == "Dropped":
+        if entry["strategy_applied"] == "Drop Feature":
             drop_cols.append(col)
         else:
             logger.info(f"  {col}: {entry['strategy_applied']} ({severity} -> {entry['final_severity']})")

@@ -10,9 +10,10 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import pandas as pd
 from profiler import load_data, detect_feature_types, profile_data, align_train_test_columns
-from drift_detector import run_drift_analysis
+from drift_detector import run_drift_analysis, detect_intra_training_drift
 from model import prepare_features, train_model, evaluate_and_save, print_model_performance_summary
-from mitigation import apply_all_mitigations
+from mitigation import apply_all_mitigations, compute_domain_weights, compute_recency_weights
+from feature_engineer import engineer_features
 from utils import Timer
 
 
@@ -23,8 +24,8 @@ def print_drift_mitigation_summary(
     norm_log: dict[str, list[str]] | None = None,
 ) -> None:
     """Print combined drift detection & mitigation summary as a unified double-line table."""
-    CW = (24, 14, 34, 36)
-    FULL_W = sum(CW) + len(CW) - 1  # 85
+    CW = (26, 14, 50, 30)
+    FULL_W = sum(CW) + len(CW) - 1
 
     def full_row(text):
         return f"║ {text:<{FULL_W - 1}}║"
@@ -32,28 +33,37 @@ def print_drift_mitigation_summary(
     def col_row(c1, c2, c3, c4):
         return f"║ {c1:<{CW[0]-2}} ║ {c2:<{CW[1]-2}} ║ {c3:<{CW[2]-2}} ║ {c4:<{CW[3]-2}} ║"
 
-    def col_row_wrap(c1, c2, c3, c4):
-        """Print a data row, wrapping c4 onto continuation lines if it overflows."""
-        max4 = CW[3] - 2
-        if len(c4) <= max4:
-            return col_row(c1, c2, c3, c4)
-        # Word-wrap c4
+    def _wrap_text(text, max_w):
+        """Word-wrap text into lines of max_w chars."""
+        if len(text) <= max_w:
+            return [text]
         lines, cur = [], ""
-        for word in c4.split():
+        for word in text.split():
             test = f"{cur} {word}".strip()
-            if len(test) <= max4:
+            if len(test) <= max_w:
                 cur = test
             else:
                 if cur:
                     lines.append(cur)
-                cur = word
+                cur = word if len(word) <= max_w else word[:max_w]
         if cur:
             lines.append(cur)
-        # First line has all columns; continuations blank the first 3
-        blank = f"║ {'':<{CW[0]-2}} ║ {'':<{CW[1]-2}} ║ {'':<{CW[2]-2}} ║ "
-        rows = [col_row(c1, c2, c3, lines[0])]
-        for extra in lines[1:]:
-            rows.append(f"{blank}{extra:<{max4}} ║")
+        return lines or [""]
+
+    def col_row_wrap(c1, c2, c3, c4):
+        """Print a data row, wrapping c3 and c4 onto continuation lines if they overflow."""
+        max3 = CW[2] - 2
+        max4 = CW[3] - 2
+        lines3 = _wrap_text(c3, max3)
+        lines4 = _wrap_text(c4, max4)
+        n = max(len(lines3), len(lines4))
+        rows = []
+        for i in range(n):
+            v1 = c1 if i == 0 else ""
+            v2 = c2 if i == 0 else ""
+            v3 = lines3[i] if i < len(lines3) else ""
+            v4 = lines4[i] if i < len(lines4) else ""
+            rows.append(col_row(v1, v2, v3, v4))
         return "\n".join(rows)
 
     def h_line(left, mid, right):
@@ -101,13 +111,16 @@ def print_drift_mitigation_summary(
     for _, r in drifted.iterrows():
         col_name = r["column"][:CW[0] - 2]
         ftype = r["feature_type"]
-        sev = r["severity"].capitalize()
 
-        if ftype == "numerical":
+        # Use qualitative description if available, fall back to metrics
+        if "drift_description" in r.index and pd.notna(r.get("drift_description")):
+            drift_desc = str(r["drift_description"])
+        elif ftype == "numerical":
+            sev = r["severity"].capitalize()
             drift_desc = f"{sev}: PSI={r['psi']:.2f}, KS p={r['ks_pval']:.3f}"
         else:
+            sev = r["severity"].capitalize()
             drift_desc = f"{sev}: JSD={r['jsd']:.2f}, Chi2 p={r['chi2_pval']:.3f}"
-        drift_desc = drift_desc[:CW[2] - 2]
 
         # Use strategy from mitigation_log if available
         if r["column"] in strategy_map:
@@ -121,7 +134,7 @@ def print_drift_mitigation_summary(
                     label += ", dropped"
                 mitigation = label[0].upper() + label[1:]
             elif dropped:
-                mitigation = "Dropped"
+                mitigation = "Drop Feature"
             else:
                 mitigation = "Moderate drift, retained"
 
@@ -131,7 +144,7 @@ def print_drift_mitigation_summary(
     print(h_line("╚", "╩", "╝"))
 
 
-def print_multivariate_shift_summary(shift_info: dict) -> None:
+def print_multivariate_shift_summary(shift_info: dict, weight_status: str = "Uniform (1.0)") -> None:
     """Print multivariate covariate shift detection results."""
     import numpy as np
     CW = (24, 22)
@@ -157,17 +170,18 @@ def print_multivariate_shift_summary(shift_info: dict) -> None:
         print(col_row("Fold AUC Std", f"{fold_std:.4f}"))
     status = "Yes" if shift_info["shift_detected"] else "No"
     print(col_row("Shift Detected", status))
-    print(col_row("Sample Weights", "Uniform (1.0)"))
+    print(col_row("Sample Weights", weight_status))
     print(h("╚", "╩", "╝"))
 
 
 def print_runtime_summary(
     drift_time: float,
     mitigation_time: float,
+    feat_time: float,
     model_time: float,
 ) -> None:
     """Print a separate runtime breakdown table using box-drawing characters."""
-    total = drift_time + mitigation_time + model_time
+    total = drift_time + mitigation_time + feat_time + model_time
     CW = (24, 14)
     W = sum(CW) + len(CW) - 1
 
@@ -190,6 +204,7 @@ def print_runtime_summary(
     print(h_line("╠", "╬", "╣"))
     print(col_row("Drift Detection", f"{drift_time:.2f}s"))
     print(col_row("Drift Mitigation", f"{mitigation_time:.2f}s"))
+    print(col_row("Feature Engineering", f"{feat_time:.2f}s"))
     print(col_row("Model Training", f"{model_time:.2f}s"))
     print(h_line("╠", "╬", "╣"))
     print(col_row("Total", f"{total:.2f}s"))
@@ -253,9 +268,11 @@ def main():
     profile_data(train, feature_types, label="train")
     profile_data(test, feature_types, label="test")
 
-    # --- Stage 2: Drift Detection ---
+    # --- Stage 2: Drift Detection (train vs test) ---
     with Timer("Drift detection") as drift_timer:
         drift_df = run_drift_analysis(train, test, feature_types)
+        # Intra-training temporal drift detection
+        intra_drift_df, month_rank = detect_intra_training_drift(train, feature_types)
 
     # --- Stage 3: Drift Mitigation ---
     with Timer("Drift mitigation") as mitigation_timer:
@@ -263,7 +280,11 @@ def main():
             train, test, drift_df, feature_types
         )
 
-    # --- Stage 4: Model Training & Prediction ---
+    # --- Stage 4: Feature Engineering ---
+    with Timer("Feature engineering") as feat_timer:
+        train_m, test_m = engineer_features(train_m, test_m, feature_types)
+
+    # --- Stage 5: Model Training & Prediction ---
     with Timer("Model training") as model_timer:
         # Baseline model (no mitigation)
         X_train_b, y_train_b, X_test_b, customer_ids = prepare_features(
@@ -279,7 +300,68 @@ def main():
         X_train_m, y_train_m, X_test_m, customer_ids = prepare_features(
             train_m, test_m, feature_types, extra_drop_cols=drop_cols
         )
-        lgbm_m = train_model(X_train_m, y_train_m)
+
+        # --- Sample weight selection: try domain, recency, and combined ---
+        import numpy as np
+        from sklearn.metrics import average_precision_score
+
+        train_oof_proba = shift_info.get("train_oof_proba")
+        recency_weights = compute_recency_weights(month_rank) if month_rank is not None else None
+
+        # Baseline: unweighted mitigated model
+        lgbm_unweighted = train_model(X_train_m, y_train_m)
+
+        # Check if test labels available for validation
+        target_col = feature_types["target"][0] if feature_types["target"] else None
+        has_test_labels = (target_col and target_col in test_m.columns
+                          and test_m[target_col].notna().any())
+
+        def _eval_model(model):
+            """Evaluate model: test AU-PRC if available, else train AU-PRC."""
+            if has_test_labels:
+                from model import _encode_target
+                y_test_v = _encode_target(test_m[target_col])
+                return average_precision_score(y_test_v, model.predict_proba(X_test_m)[:, 1])
+            return average_precision_score(y_train_m, model.predict_proba(X_train_m)[:, 1])
+
+        best_model = lgbm_unweighted
+        best_score = _eval_model(best_model)
+        weight_status = "Uniform (1.0)"
+
+        # Build candidate weight variants
+        candidates = []
+
+        # Domain weights at different power levels
+        if train_oof_proba is not None and shift_info.get("shift_detected", False):
+            for power in [0.3, 0.5, 0.7]:
+                w = compute_domain_weights(train_oof_proba, power=power)
+                if w is not None:
+                    candidates.append((f"Domain-weighted (p={power})", w))
+
+        # Recency weights
+        if recency_weights is not None:
+            candidates.append(("Recency-weighted", recency_weights))
+
+            # Combined: domain x recency (if both available)
+            if train_oof_proba is not None and shift_info.get("shift_detected", False):
+                for power in [0.3, 0.5]:
+                    dw = compute_domain_weights(train_oof_proba, power=power)
+                    if dw is not None:
+                        combined = dw * recency_weights
+                        combined = combined / combined.mean()  # re-normalize
+                        candidates.append((f"Domain(p={power})+Recency", combined))
+
+        # Evaluate all candidates
+        for label, weights in candidates:
+            candidate = train_model(X_train_m, y_train_m, sample_weight=weights)
+            score = _eval_model(candidate)
+            if score > best_score:
+                best_model = candidate
+                best_score = score
+                weight_status = label
+
+        lgbm_m = best_model
+
         mitigated_metrics = evaluate_and_save(
             lgbm_m, X_train_m, y_train_m, X_test_m, customer_ids, test_m, feature_types,
             tag="mitigated",
@@ -290,14 +372,14 @@ def main():
 
     # --- All tables printed after all stages complete ---
     print_drift_mitigation_summary(drift_df, drop_cols, mitigation_log, norm_log)
-    print_multivariate_shift_summary(shift_info)
+    print_multivariate_shift_summary(shift_info, weight_status)
 
     model_results = [
         ("Baseline", baseline_metrics),
         ("Mitigated", mitigated_metrics),
     ]
     print_model_performance_summary(model_results)
-    print_runtime_summary(drift_timer.elapsed, mitigation_timer.elapsed, model_timer.elapsed)
+    print_runtime_summary(drift_timer.elapsed, mitigation_timer.elapsed, feat_timer.elapsed, model_timer.elapsed)
 
 
 if __name__ == "__main__":

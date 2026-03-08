@@ -137,6 +137,7 @@ def prepare_features(
 def train_model(
     X_train: pd.DataFrame,
     y_train: pd.Series,
+    sample_weight: np.ndarray | None = None,
 ) -> LGBMClassifier:
     """Train LightGBM with fixed hyperparameters."""
     model = LGBMClassifier(
@@ -146,8 +147,9 @@ def train_model(
         random_state=42,
         importance_type="gain",
     )
-    model.fit(X_train, y_train)
-    logger.info("Model trained")
+    model.fit(X_train, y_train, sample_weight=sample_weight)
+    tag = "with sample weights" if sample_weight is not None else "uniform weights"
+    logger.info(f"Model trained ({tag})")
     return model
 
 
