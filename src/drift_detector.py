@@ -106,7 +106,14 @@ def detect_numerical_drift(
     std_train = np.std(train_vals)
     wasserstein_norm = wasserstein / (std_train + 1e-8)
 
-    severity = _numerical_severity(ks_pval, psi, wasserstein_norm, ks_stat)
+    # IQR shift detection: spread changes not captured by location-based tests
+    train_q1, train_q3 = np.percentile(train_vals, [25, 75])
+    test_q1, test_q3 = np.percentile(test_vals, [25, 75])
+    train_iqr = train_q3 - train_q1
+    test_iqr = test_q3 - test_q1
+    iqr_ratio = test_iqr / (train_iqr + 1e-8)
+
+    severity = _numerical_severity(ks_pval, psi, wasserstein_norm, ks_stat, iqr_ratio)
     severity = _escalate_severity(severity, miss_sev)
 
     return {
@@ -115,6 +122,7 @@ def detect_numerical_drift(
         "psi": round(psi, 4),
         "wasserstein": round(wasserstein, 4),
         "wasserstein_norm": round(wasserstein_norm, 4),
+        "iqr_ratio": round(iqr_ratio, 4),
         "train_null_pct": round(train_null_pct, 4),
         "test_null_pct": round(test_null_pct, 4),
         "severity": severity,
@@ -189,11 +197,12 @@ def detect_categorical_drift(
     }
 
 
-def _numerical_severity(ks_pval: float, psi: float, wasserstein_norm: float = 0.0, ks_stat: float = 0.0) -> str:
+def _numerical_severity(ks_pval: float, psi: float, wasserstein_norm: float = 0.0,
+                        ks_stat: float = 0.0, iqr_ratio: float = 1.0) -> str:
     """Classify drift severity for numerical features.
 
-    Uses PSI, KS p-value, KS D-statistic (effect size), and normalized Wasserstein distance.
-    KS D-statistic gates p-value to prevent large-sample false positives.
+    Uses PSI, KS p-value, KS D-statistic (effect size), normalized Wasserstein
+    distance, and IQR ratio (test_iqr / train_iqr) for spread shift detection.
     """
     if psi >= 0.25:
         return "high"
@@ -204,6 +213,9 @@ def _numerical_severity(ks_pval: float, psi: float, wasserstein_norm: float = 0.
         return "high"
     # Large KS effect size combined with moderate PSI
     if ks_stat >= 0.15 and psi >= 0.1:
+        return "high"
+    # IQR spread change > 2x (or < 0.5x) combined with moderate PSI
+    if (iqr_ratio > 2.0 or iqr_ratio < 0.5) and psi >= 0.1:
         return "high"
     if psi >= 0.1 or (ks_pval < 0.05 and ks_stat >= 0.05) or (wasserstein_norm >= 0.3 and psi >= 0.05):
         return "moderate"
@@ -346,7 +358,8 @@ def _apply_bh_correction(drift_df: pd.DataFrame) -> pd.DataFrame:
             psi = row.get("psi") or 0.0
             w_norm = row.get("wasserstein_norm") or 0.0
             ks_d = row.get("ks_stat") or 0.0
-            drift_df.loc[idx, "severity"] = _numerical_severity(ks_p, psi, w_norm, ks_d)
+            iqr_r = row.get("iqr_ratio") or 1.0
+            drift_df.loc[idx, "severity"] = _numerical_severity(ks_p, psi, w_norm, ks_d, iqr_r)
         elif row["feature_type"] in ("categorical", "temporal"):
             chi2_p = row.get("chi2_pval_bh", row.get("chi2_pval", 1.0))
             if pd.isna(chi2_p):

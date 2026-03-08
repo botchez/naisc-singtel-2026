@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 3 — A3: IQR Shift Detection
+- **Status:** COMMITTED
+- **BEFORE:** Baseline train=0.8904 test=0.7317 | Mitigated train=0.8894 test=0.8580 | CV AU-PRC=0.8592
+- **AFTER:**  Baseline train=0.8904 test=0.7317 | Mitigated train=0.8894 test=0.8580 | CV AU-PRC=0.8592
+- **Delta:**  Mitigated train +0.0000 | CV +0.0000
+- **Summary:** Added IQR ratio (test_iqr / train_iqr) to `detect_numerical_drift` and `_numerical_severity`. IQR spread change > 2x (or < 0.5x) combined with PSI >= 0.1 escalates to high severity. No metric change on this dataset (no extreme spread shifts), but acts as safety net for hidden datasets with spread-shifted features.
+
+---
+
 ## Iteration 2 — A1: KS Effect Size
 - **Status:** COMMITTED
 - **BEFORE:** Baseline train=0.8904 test=0.7317 | Mitigated train=0.8896 test=0.8571 | CV AU-PRC=0.8603
