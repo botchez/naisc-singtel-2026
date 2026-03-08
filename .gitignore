@@ -4,3 +4,7 @@ __pycache__/
 *.joblib
 .env
 CLAUDE.md
+.gitignore
+challenge_images/
+information/
+.claude/

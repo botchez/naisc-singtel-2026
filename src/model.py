@@ -11,6 +11,7 @@ def prepare_features(
     train: pd.DataFrame,
     test: pd.DataFrame,
     feature_types: dict[str, list[str]],
+    extra_drop_cols: list[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, list[str]]:
     """Minimal preprocessing: encode categoricals, drop IDs, split X/y.
 
@@ -24,19 +25,38 @@ def prepare_features(
     # Encode target
     y_train = (train[target_col] == "Yes").astype(int)
 
-    # Columns to use as features
+    # Columns to use as features (exclude temporal from drop so we can encode them)
     drop_cols = feature_types["id"] + feature_types["target"]
-    feature_cols = [c for c in train.columns if c not in drop_cols]
+    if extra_drop_cols:
+        drop_cols = drop_cols + [c for c in extra_drop_cols if c not in drop_cols]
+    # Don't drop temporal yet — we need to encode them first
+    temporal_in_drop = [c for c in feature_types["temporal"] if c in drop_cols]
+    drop_cols_no_temporal = [c for c in drop_cols if c not in feature_types["temporal"]]
+    feature_cols = [c for c in train.columns if c not in drop_cols_no_temporal]
 
     X_train = train[feature_cols].copy()
     X_test = test[feature_cols].copy()
 
-    # Convert temporal columns to month number (1-12)
+    # Handle temporal columns: encode as sin/cos + integer month, drop raw string
     for col in feature_types["temporal"]:
-        if col in feature_cols:
+        if col not in X_train.columns:
+            continue
+        sin_col = f"{col}_sin"
+        if sin_col in X_train.columns:
+            # FE path: sin/cos already present, just drop raw
+            X_train.drop(columns=[col], inplace=True)
+            X_test.drop(columns=[col], inplace=True)
+        else:
+            # No-FE path: encode inline, then drop raw
             for df in [X_train, X_test]:
-                df[col] = pd.to_datetime(df[col], format="%y-%b", errors="coerce").dt.month
-                df[col] = df[col].fillna(0).astype(int)
+                months = pd.to_datetime(df[col], format="%y-%b", errors="coerce").dt.month
+                if months.isna().all():
+                    months = pd.to_datetime(df[col], format="%b-%y", errors="coerce").dt.month
+                months = months.fillna(6).astype(float)
+                df[f"{col}_sin"] = np.sin(2 * np.pi * months / 12)
+                df[f"{col}_cos"] = np.cos(2 * np.pi * months / 12)
+            X_train.drop(columns=[col], inplace=True)
+            X_test.drop(columns=[col], inplace=True)
 
     # Encode categoricals with label encoding (fitted on train+test combined)
     cat_cols = [c for c in feature_types["categorical"] if c in feature_cols]
@@ -89,6 +109,7 @@ def evaluate_and_save(
     customer_ids: list[str],
     test: pd.DataFrame,
     feature_types: dict[str, list[str]],
+    label: str = "baseline",
 ) -> dict[str, float]:
     """Predict, compute AU-PRC, save model and predictions."""
     # Train AU-PRC
@@ -103,19 +124,20 @@ def evaluate_and_save(
         y_test = (test[target_col] == "Yes").astype(int)
         test_auprc = average_precision_score(y_test, test_proba)
 
-    # Save prediction.csv
+    # Save prediction and model with label
+    pred_file = f"prediction_{label}.csv"
+    model_file = f"model_{label}.joblib"
     pred_df = pd.DataFrame({"CustomerID": customer_ids, "probability_score": test_proba})
-    pred_df.to_csv("prediction.csv", index=False)
-    logger.info("Saved prediction.csv")
+    pred_df.to_csv(pred_file, index=False)
+    logger.info(f"Saved {pred_file}")
 
-    # Save model
-    joblib.dump(model, "model.joblib")
-    logger.info("Saved model.joblib")
+    joblib.dump(model, model_file)
+    logger.info(f"Saved {model_file}")
 
     # Print metrics
     metrics = {"train_auprc": train_auprc}
     print("\n" + "=" * 70)
-    print("MODEL PERFORMANCE")
+    print(f"MODEL PERFORMANCE ({label.upper()})")
     print("=" * 70)
     print(f"  AU-PRC (train): {train_auprc:.4f}")
     if test_auprc is not None:
