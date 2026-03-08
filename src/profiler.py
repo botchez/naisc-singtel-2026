@@ -186,6 +186,15 @@ def detect_feature_types(
             logger.warning(f"Skipping zero-variance column: '{col}'")
             continue
 
+        # Skip near-zero-variance columns (>99% same value) — non-informative
+        try:
+            top_freq = df[col].value_counts(normalize=True).iloc[0]
+            if top_freq > 0.99:
+                logger.warning(f"Skipping near-zero-variance column: '{col}' ({top_freq:.1%} dominant)")
+                continue
+        except Exception:
+            pass
+
         # Temporal heuristic: object column with month-year patterns like "25-Jan"
         if not pd.api.types.is_numeric_dtype(df[col]) and _looks_temporal(df[col]):
             types["temporal"].append(col)

@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 8 — F1: Constant Feature Detection
+- **Status:** COMMITTED
+- **BEFORE:** Baseline train=0.8899 test=0.7378 | Mitigated train=0.8894 test=0.8561 | CV AU-PRC=0.8599
+- **AFTER:**  Baseline train=0.8899 test=0.7378 | Mitigated train=0.8894 test=0.8561 | CV AU-PRC=0.8599
+- **Delta:**  Mitigated train +0.0000 | CV +0.0000
+- **Summary:** Added near-zero-variance detection to feature type classification. Columns where >99% of values are the same are now skipped during profiling. No effect on this dataset (no such columns exist), but prevents noise features on hidden datasets where near-constant columns could cause spurious drift detections or model noise.
+
+---
+
 ## Iteration 7 — F5: Duplicate Column Detection
 - **Status:** COMMITTED
 - **BEFORE:** Baseline train=0.8899 test=0.7378 | Mitigated train=0.8892 test=0.8569 | CV AU-PRC=0.8595
