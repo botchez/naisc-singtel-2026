@@ -300,7 +300,24 @@ def apply_all_mitigations(
     if drop_cols:
         logger.info(f"Dropping {len(drop_cols)} features after all strategies exhausted: {drop_cols}")
 
-    # No sample reweighting — uniform weights
-    sample_weights = np.ones(len(train_m))
+    # Stage 4: Multivariate shift detection and density ratio weighting
+    from drift_detector import detect_multivariate_shift, compute_density_ratio_weights
 
-    return train_m, test_m, sample_weights, drop_cols, mitigation_log, norm_log
+    shift_info = detect_multivariate_shift(train_m, test_m, feature_types, extra_drop_cols=drop_cols)
+
+    if shift_info["shift_detected"]:
+        sample_weights = compute_density_ratio_weights(shift_info["train_proba"])
+        logger.info(
+            f"Multivariate shift detected (AUC={shift_info['auc']:.4f}), "
+            f"applying density ratio weights "
+            f"(mean={sample_weights.mean():.2f}, std={sample_weights.std():.2f}, "
+            f"range=[{sample_weights.min():.2f}, {sample_weights.max():.2f}])"
+        )
+    else:
+        sample_weights = np.ones(len(train_m))
+        logger.info(
+            f"No significant multivariate shift (AUC={shift_info['auc']:.4f}), "
+            f"using uniform weights"
+        )
+
+    return train_m, test_m, sample_weights, drop_cols, mitigation_log, norm_log, shift_info

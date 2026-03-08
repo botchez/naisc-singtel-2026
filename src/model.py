@@ -194,40 +194,32 @@ def evaluate_and_save(
 
 
 def print_model_performance_summary(
-    baseline_metrics: dict[str, float],
-    mitigated_metrics: dict[str, float],
+    model_results: list[tuple[str, dict[str, float]]],
+    selected: str = "",
 ) -> None:
-    """Print model performance table comparing baseline vs mitigated."""
-    CW = (24, 14, 14, 14)
+    """Print model performance table comparing all model variants."""
+    CW = (26, 16, 16)
     total = sum(CW) + len(CW) - 1
     title = "MODEL PERFORMANCE SUMMARY"
 
-    def _fmt(metrics: dict[str, float], key: str) -> str:
-        v = metrics.get(key)
-        return f"{v:.4f}" if v is not None else "N/A"
+    def h(l, m, r):
+        return f"{l}{'═'*CW[0]}{m}{'═'*CW[1]}{m}{'═'*CW[2]}{r}"
 
-    def _delta(key: str) -> str:
-        b = baseline_metrics.get(key)
-        m = mitigated_metrics.get(key)
-        if b is None or m is None:
-            return "N/A"
-        d = m - b
-        sign = "+" if d >= 0 else ""
-        return f"{sign}{d:.4f}"
-
-    rows = [
-        ("AU-PRC (train)", "train_auprc"),
-        ("AU-PRC (test)", "test_auprc"),
-    ]
-
-    h = lambda l, m, r: f"{l}{'═'*CW[0]}{m}{'═'*CW[1]}{m}{'═'*CW[2]}{m}{'═'*CW[3]}{r}"
+    def col_row(c1, c2, c3):
+        return f"║ {c1:<{CW[0]-2}} ║ {c2:<{CW[1]-2}} ║ {c3:<{CW[2]-2}} ║"
 
     print()
     print(f"╔{'═' * total}╗")
     print(f"║{title:^{total}}║")
     print(h("╠", "╦", "╣"))
-    print(f"║{'Metric':<{CW[0]}}║{'Baseline':^{CW[1]}}║{'Mitigated':^{CW[2]}}║{'Delta':^{CW[3]}}║")
+    print(col_row("Model", "AU-PRC (train)", "AU-PRC (test)"))
     print(h("╠", "╬", "╣"))
-    for label, key in rows:
-        print(f"║ {label:<{CW[0] - 1}}║ {_fmt(baseline_metrics, key):<{CW[1] - 1}}║ {_fmt(mitigated_metrics, key):<{CW[2] - 1}}║ {_delta(key):<{CW[3] - 1}}║")
+    for name, metrics in model_results:
+        train_v = f"{metrics['train_auprc']:.4f}" if metrics.get("train_auprc") is not None else "N/A"
+        test_v = f"{metrics['test_auprc']:.4f}" if metrics.get("test_auprc") is not None else "N/A"
+        marker = " *" if name == selected else ""
+        print(col_row(f"{name}{marker}", train_v, test_v))
+    print(h("╠", "╬", "╣"))
+    if selected:
+        print(col_row(f"Selected -> {selected}", "", ""))
     print(h("╚", "╩", "╝"))
