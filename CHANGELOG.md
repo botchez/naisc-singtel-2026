@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 22 — E1: Adaptive PSI/JSD Thresholds
+- **Status:** COMMITTED
+- **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **AFTER:**  Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **Delta:**  Mitigated train +0.0000 | CV +0.0000
+- **Summary:** Added `_small_sample_factor()` that scales PSI and JSD severity thresholds by sqrt(ref_size/n_eff) when effective sample size (harmonic mean of train/test) is below 5000. For this dataset (n_eff≈23500), factor=1.0 (no change). For small hidden datasets (e.g., n_eff=500), thresholds widen by 3.2×, preventing false-positive drift detections from noisy histogram estimates. Applied to both `_numerical_severity` and `_categorical_severity`.
+
+---
+
 ## Iteration 21 — C2: Polynomial Interactions
 - **Status:** REVERTED
 - **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595

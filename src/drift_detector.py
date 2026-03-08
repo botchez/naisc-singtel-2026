@@ -120,7 +120,8 @@ def detect_numerical_drift(
     tail_high = abs(test_p99 - train_p99) / (std_train + 1e-8)
     tail_div = max(tail_low, tail_high)
 
-    severity = _numerical_severity(ks_pval, psi, wasserstein_norm, ks_stat, iqr_ratio, tail_div)
+    ss_factor = _small_sample_factor(len(train_vals), len(test_vals))
+    severity = _numerical_severity(ks_pval, psi, wasserstein_norm, ks_stat, iqr_ratio, tail_div, ss_factor)
     severity = _escalate_severity(severity, miss_sev)
 
     return {
@@ -190,7 +191,10 @@ def detect_categorical_drift(
     test_cats = set(test_col.dropna().unique())
     unseen_in_test = sorted(test_cats - train_cats)
 
-    severity = _categorical_severity(chi2_pval, jsd, cramers_v)
+    n_tr = len(train_col.dropna())
+    n_te = len(test_col.dropna())
+    ss_factor = _small_sample_factor(n_tr, n_te)
+    severity = _categorical_severity(chi2_pval, jsd, cramers_v, ss_factor)
     severity = _escalate_severity(severity, miss_sev)
 
     return {
@@ -205,48 +209,65 @@ def detect_categorical_drift(
     }
 
 
+def _small_sample_factor(n_train: int, n_test: int, ref_size: int = 5000) -> float:
+    """Compute threshold scaling factor for small-sample robustness.
+
+    For large samples (harmonic mean >= ref_size), returns 1.0 (no change).
+    For small samples, returns >1.0 to widen PSI/JSD severity thresholds,
+    reducing false-positive drift detections caused by noisy histogram estimates.
+    """
+    n_eff = 2 * n_train * n_test / (n_train + n_test + 1e-8)
+    if n_eff >= ref_size:
+        return 1.0
+    return (ref_size / n_eff) ** 0.5
+
+
 def _numerical_severity(ks_pval: float, psi: float, wasserstein_norm: float = 0.0,
                         ks_stat: float = 0.0, iqr_ratio: float = 1.0,
-                        tail_div: float = 0.0) -> str:
+                        tail_div: float = 0.0, ss_factor: float = 1.0) -> str:
     """Classify drift severity for numerical features.
 
     Uses PSI, KS p-value, KS D-statistic (effect size), normalized Wasserstein
     distance, IQR ratio (test_iqr / train_iqr), and tail divergence (max shift
     in 1st/99th percentiles normalized by training std).
+
+    ss_factor: small-sample scaling factor for PSI thresholds (>1.0 widens bands).
     """
-    if psi >= 0.25:
+    if psi >= 0.25 * ss_factor:
         return "high"
-    if psi >= 0.15 and ks_pval < 0.001:
+    if psi >= 0.15 * ss_factor and ks_pval < 0.001:
         return "high"
     # Large distributional shift confirmed by both Wasserstein and PSI
-    if wasserstein_norm >= 1.0 and psi >= 0.1:
+    if wasserstein_norm >= 1.0 and psi >= 0.1 * ss_factor:
         return "high"
     # Large KS effect size combined with moderate PSI
-    if ks_stat >= 0.15 and psi >= 0.1:
+    if ks_stat >= 0.15 and psi >= 0.1 * ss_factor:
         return "high"
     # IQR spread change > 2x (or < 0.5x) combined with moderate PSI
-    if (iqr_ratio > 2.0 or iqr_ratio < 0.5) and psi >= 0.1:
+    if (iqr_ratio > 2.0 or iqr_ratio < 0.5) and psi >= 0.1 * ss_factor:
         return "high"
     # Tail divergence: extreme percentile shift (>2 std) with any PSI signal
-    if tail_div > 2.0 and psi >= 0.05:
+    if tail_div > 2.0 and psi >= 0.05 * ss_factor:
         return "high"
-    if psi >= 0.1 or (ks_pval < 0.05 and ks_stat >= 0.05) or (wasserstein_norm >= 0.3 and psi >= 0.05):
+    if psi >= 0.1 * ss_factor or (ks_pval < 0.05 and ks_stat >= 0.05) or (wasserstein_norm >= 0.3 and psi >= 0.05 * ss_factor):
         return "moderate"
-    if tail_div > 1.0 and psi >= 0.03:
+    if tail_div > 1.0 and psi >= 0.03 * ss_factor:
         return "moderate"
     return "low"
 
 
-def _categorical_severity(chi2_pval: float, jsd: float, cramers_v: float = 0.0) -> str:
+def _categorical_severity(chi2_pval: float, jsd: float, cramers_v: float = 0.0,
+                          ss_factor: float = 1.0) -> str:
     """Classify drift severity for categorical features.
 
     Uses JSD, Chi² p-value, and Cramér's V (sample-size-normalized effect size).
+    ss_factor: small-sample scaling factor for JSD thresholds (>1.0 widens bands).
     """
-    if jsd >= 0.1:
+    if jsd >= 0.1 * ss_factor:
         return "high"
-    if cramers_v >= 0.3 and jsd >= 0.05:
+    if cramers_v >= 0.3 and jsd >= 0.05 * ss_factor:
         return "high"
-    if jsd >= 0.05 or chi2_pval < 0.001 or cramers_v >= 0.15:
+    if jsd >= 0.05 * ss_factor or chi2_pval < 0.001 or cramers_v >= 0.15:
         return "moderate"
     if chi2_pval < 0.05:
         return "moderate"
@@ -365,6 +386,7 @@ def _apply_bh_correction(drift_df: pd.DataFrame) -> pd.DataFrame:
         drift_df.loc[idx, f"{pval_col}_bh"] = round(corr_p, 6)
 
     # Re-classify severity using corrected p-values
+    # Note: ss_factor was already applied during initial detection; BH only adjusts p-values
     for idx, row in drift_df.iterrows():
         if row["feature_type"] == "numerical":
             ks_p = row.get("ks_pval_bh", row.get("ks_pval", 1.0))
