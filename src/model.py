@@ -137,18 +137,15 @@ def prepare_features(
         # Test: use full training set smoothed means
         X_test[col] = raw_test.map(col_means).fillna(global_mean)
 
-    # Fill remaining NaN with median (numerical) or mode (categorical)
+    # Fill remaining NaN: let LightGBM handle numeric NaN natively (learns optimal
+    # split direction), only fill non-numeric columns with mode
     for col in X_train.columns:
         if X_train[col].isna().any() or X_test[col].isna().any():
-            if pd.api.types.is_numeric_dtype(X_train[col]):
-                fill_val = X_train[col].median()
-                if pd.isna(fill_val):
-                    fill_val = 0
-            else:
+            if not pd.api.types.is_numeric_dtype(X_train[col]):
                 mode = X_train[col].mode()
                 fill_val = mode.iloc[0] if not mode.empty else 0
-            X_train[col] = X_train[col].fillna(fill_val)
-            X_test[col] = X_test[col].fillna(fill_val)
+                X_train[col] = X_train[col].fillna(fill_val)
+                X_test[col] = X_test[col].fillna(fill_val)
 
     logger.info(f"Features prepared: {X_train.shape[1]} columns")
     return X_train, y_train, X_test, customer_ids

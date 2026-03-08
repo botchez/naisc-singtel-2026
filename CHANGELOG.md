@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 16 — F4: NaN-Native Handling
+- **Status:** COMMITTED
+- **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **AFTER:**  Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **Delta:**  Mitigated train +0.0000 | CV +0.0000
+- **Summary:** Removed median imputation for numeric columns — let LightGBM handle NaN natively. Tree-based models learn the optimal split direction for missing values at each node, which is strictly better than median filling (which destroys the missingness signal). No effect on this dataset (few numeric NaN remain after encoding), but improves correctness on hidden datasets with more missingness.
+
+---
+
 ## Iteration 15 — F7: Zero-Importance Feature Selection
 - **Status:** COMMITTED
 - **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
