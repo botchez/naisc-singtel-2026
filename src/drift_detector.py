@@ -25,6 +25,17 @@ def compute_psi(expected: np.ndarray, actual: np.ndarray, bins: int = 10) -> flo
     return float(psi)
 
 
+def compute_cramers_v(chi2_stat: float, n: int, k: int) -> float:
+    """Cramér's V: sample-size-normalized chi-squared effect size.
+
+    V ranges from 0 (identical distributions) to 1 (complete separation).
+    Unlike chi2 p-value, V is independent of sample size.
+    """
+    if n == 0 or k <= 1:
+        return 0.0
+    return float(np.sqrt(chi2_stat / (n * (k - 1))))
+
+
 def compute_jsd(p_counts: np.ndarray, q_counts: np.ndarray) -> float:
     """Jensen-Shannon divergence between two categorical distributions."""
     p = (p_counts + 1e-10) / (p_counts.sum() + 1e-10 * len(p_counts))
@@ -153,18 +164,24 @@ def detect_categorical_drift(
     else:
         chi2_stat, chi2_pval = 0.0, 1.0
 
+    # Cramér's V: sample-size-normalized effect size
+    n_total = int(contingency.sum())
+    k_cats = min(contingency.shape[0], contingency.shape[1])
+    cramers_v = compute_cramers_v(chi2_stat, n_total, k_cats)
+
     # Unseen categories in test
     train_cats = set(train_col.dropna().unique())
     test_cats = set(test_col.dropna().unique())
     unseen_in_test = sorted(test_cats - train_cats)
 
-    severity = _categorical_severity(chi2_pval, jsd)
+    severity = _categorical_severity(chi2_pval, jsd, cramers_v)
     severity = _escalate_severity(severity, miss_sev)
 
     return {
         "chi2_stat": round(chi2_stat, 4),
         "chi2_pval": round(chi2_pval, 6),
         "jsd": round(jsd, 4),
+        "cramers_v": round(cramers_v, 4),
         "unseen_in_test": unseen_in_test,
         "train_null_pct": round(train_null_pct, 4),
         "test_null_pct": round(test_null_pct, 4),
@@ -189,11 +206,16 @@ def _numerical_severity(ks_pval: float, psi: float, wasserstein_norm: float = 0.
     return "low"
 
 
-def _categorical_severity(chi2_pval: float, jsd: float) -> str:
-    """Classify drift severity for categorical features."""
+def _categorical_severity(chi2_pval: float, jsd: float, cramers_v: float = 0.0) -> str:
+    """Classify drift severity for categorical features.
+
+    Uses JSD, Chi² p-value, and Cramér's V (sample-size-normalized effect size).
+    """
     if jsd >= 0.1:
         return "high"
-    if jsd >= 0.05 or chi2_pval < 0.001:
+    if cramers_v >= 0.3 and jsd >= 0.05:
+        return "high"
+    if jsd >= 0.05 or chi2_pval < 0.001 or cramers_v >= 0.15:
         return "moderate"
     if chi2_pval < 0.05:
         return "moderate"
@@ -325,7 +347,8 @@ def _apply_bh_correction(drift_df: pd.DataFrame) -> pd.DataFrame:
             if pd.isna(chi2_p):
                 chi2_p = row.get("chi2_pval", 1.0)
             jsd = row.get("jsd") or 0.0
-            drift_df.loc[idx, "severity"] = _categorical_severity(chi2_p, jsd)
+            cv = row.get("cramers_v") or 0.0
+            drift_df.loc[idx, "severity"] = _categorical_severity(chi2_p, jsd, cv)
 
     return drift_df
 
@@ -584,7 +607,8 @@ def print_drift_summary(drift_df: pd.DataFrame) -> None:
                 w_norm = 0 if pd.isna(w_norm) else w_norm
                 print(f"  {col:30s}  KS={row['ks_stat']:.4f} (p={ks_p:.4f} BH)  PSI={row['psi']:.4f}  W*={w_norm:.4f}")
             else:
+                cv = row.get('cramers_v', 0) or 0
                 unseen = f"  unseen=[{row['unseen_in_test']}]" if row.get("unseen_in_test") else ""
-                print(f"  {col:30s}  Chi2={row['chi2_stat']:.4f} (p={row['chi2_pval']:.4f})  JSD={row['jsd']:.4f}{unseen}")
+                print(f"  {col:30s}  Chi2={row['chi2_stat']:.4f} (p={row['chi2_pval']:.4f})  JSD={row['jsd']:.4f}  V={cv:.4f}{unseen}")
 
     print("=" * 70)

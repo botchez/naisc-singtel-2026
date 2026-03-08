@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 1 — A2: Cramér's V
+- **Status:** COMMITTED
+- **BEFORE:** Baseline train=0.8904 test=0.7317 | Mitigated train=0.8896 test=0.8571 | CV AU-PRC=0.8603
+- **AFTER:**  Baseline train=0.8904 test=0.7317 | Mitigated train=0.8896 test=0.8571 | CV AU-PRC=0.8603
+- **Delta:**  Mitigated train ±0.0000 | CV ±0.0000
+- **Summary:** Added Cramér's V as a sample-size-normalized effect size for categorical drift severity classification. On this dataset, existing JSD thresholds dominate, so no metric change. Improves generalization to hidden datasets where sample sizes differ.
+
+---
+
 ## [2026-03-06 23:55:02 SGT] Initial Pipeline
 
 **Branch:** `junwen` | **Commit:** `66ff7c9`
