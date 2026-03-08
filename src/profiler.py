@@ -18,12 +18,15 @@ def _normalize_col_name(name: str) -> str:
 
 _ID_PATTERNS = [
     "customerid", "custid", "userid", "accountid", "subscriberid",
-    "clientid", "memberid",
+    "clientid", "memberid", "patientid", "transactionid", "orderid",
+    "recordid", "sampleid", "subjectid", "caseid",
 ]
 
 _TARGET_PATTERNS = [
     "churnstatus", "churn", "target", "label", "class", "y",
-    "ischurn", "churned", "outcome",
+    "ischurn", "churned", "outcome", "result", "status",
+    "default", "fraud", "isfraud", "fraudulent",
+    "diagnosis", "response", "flag",
 ]
 
 
@@ -54,8 +57,9 @@ def _auto_detect_target_column(df: pd.DataFrame) -> str | None:
         if pattern in norm_map:
             return norm_map[pattern]
 
+    # Fallback: look for binary columns (exactly 2 unique values) with suggestive names
     for norm, orig in norm_map.items():
-        if "churn" in norm or "target" in norm:
+        if any(kw in norm for kw in ("target", "label", "class", "outcome", "status", "flag", "response")):
             return orig
 
     return None
@@ -188,12 +192,7 @@ def detect_feature_types(
             continue
 
         if pd.api.types.is_numeric_dtype(df[col]):
-            # High-cardinality numeric is truly numerical; low-cardinality might be categorical
-            nunique = df[col].nunique()
-            if nunique <= 2 and set(df[col].dropna().unique()).issubset({0, 1}):
-                types["categorical"].append(col)
-            else:
-                types["numerical"].append(col)
+            types["numerical"].append(col)
         else:
             types["categorical"].append(col)
 
@@ -205,7 +204,8 @@ def _looks_temporal(series: pd.Series, sample_size: int = 50) -> bool:
     sample = series.dropna().head(sample_size)
     if len(sample) == 0:
         return False
-    formats = ["%y-%b", "%b-%y", "%Y-%m", "%m-%Y", "%b %Y", "%Y-%b"]
+    formats = ["%y-%b", "%b-%y", "%Y-%m", "%m-%Y", "%b %Y", "%Y-%b",
+               "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"]
     for fmt in formats:
         try:
             pd.to_datetime(sample, format=fmt)

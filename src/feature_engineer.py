@@ -7,7 +7,7 @@ def engineer_features(
     train: pd.DataFrame,
     test: pd.DataFrame,
     feature_types: dict[str, list[str]],
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     """Generate dynamic features. No hardcoded column names.
 
     Features added:
@@ -15,7 +15,7 @@ def engineer_features(
     2. Frequency encoding for high-cardinality categoricals (>10 unique)
     3. Ratio features between correlated numerical pairs
 
-    Returns (train_enriched, test_enriched) with aligned columns.
+    Returns (train_enriched, test_enriched, new_feature_names) with aligned columns.
     """
     train = train.copy()
     test = test.copy()
@@ -57,6 +57,7 @@ def engineer_features(
     num_cols = [c for c in feature_types.get("numerical", [])
                 if c not in skip_cols and c in train.columns and c in test.columns]
 
+    ratio_features = []
     if len(num_cols) >= 2:
         # Compute correlation matrix on training data (numeric only)
         num_train = train[num_cols].apply(pd.to_numeric, errors="coerce")
@@ -72,7 +73,6 @@ def engineer_features(
 
         # Sort by correlation, take top 5
         pairs.sort(key=lambda x: x[2], reverse=True)
-        ratio_features = []
         for col_a, col_b, _ in pairs[:5]:
             fname = f"{col_a}_div_{col_b}"
             a_train = pd.to_numeric(train[col_a], errors="coerce").fillna(0)
@@ -86,9 +86,37 @@ def engineer_features(
         if ratio_features:
             logger.info(f"Added {len(ratio_features)} ratio features: {ratio_features}")
 
+    # 4. Aggregation features: group-level stats (mean) per categorical
+    agg_cat_cols = [c for c in cat_cols if 3 <= train[c].nunique() <= 50]
+    agg_num_cols = num_cols[:10]  # limit to avoid feature explosion
+
+    agg_features = []
+    if agg_cat_cols and agg_num_cols:
+        for cat_col in agg_cat_cols[:3]:  # top 3 categoricals by cardinality
+            for num_col in agg_num_cols[:5]:  # top 5 numerical
+                fname = f"{num_col}_mean_by_{cat_col}"
+                num_train = pd.to_numeric(train[num_col], errors="coerce")
+                group_means = num_train.groupby(train[cat_col]).transform("mean")
+                train[fname] = group_means.fillna(num_train.mean())
+
+                num_test = pd.to_numeric(test[num_col], errors="coerce")
+                # Map test using training group means
+                train_group_map = num_train.groupby(train[cat_col]).mean().to_dict()
+                test[fname] = test[cat_col].map(train_group_map).fillna(num_train.mean())
+                agg_features.append(fname)
+
+    if agg_features:
+        logger.info(f"Added {len(agg_features)} aggregation features")
+
+    # Collect all new feature names
+    all_new_features = new_features + freq_features + ratio_features + agg_features
+
     # Ensure train and test have identical columns
     common_cols = sorted(set(train.columns) & set(test.columns))
     train = train[common_cols]
     test = test[common_cols]
 
-    return train, test
+    # Filter to only new features that survived column alignment
+    all_new_features = [f for f in all_new_features if f in common_cols]
+
+    return train, test, all_new_features

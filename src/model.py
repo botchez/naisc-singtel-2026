@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from lightgbm import LGBMClassifier
 from sklearn.metrics import average_precision_score
-from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import KFold
 import joblib
 from utils import logger
 
@@ -49,7 +49,8 @@ def _parse_temporal_month(series: pd.Series) -> pd.Series:
     """Parse temporal column to month number, trying multiple formats."""
     # Title-case to restore month abbreviations after lowercase normalization
     s_title = series.astype(str).str.title()
-    for fmt in ["%y-%b", "%b-%y", "%Y-%m", "%m-%Y", "%b %Y", "%Y-%b"]:
+    for fmt in ["%y-%b", "%b-%y", "%Y-%m", "%m-%Y", "%b %Y", "%Y-%b",
+                "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"]:
         parsed = pd.to_datetime(s_title, format=fmt, errors="coerce")
         if parsed.notna().sum() > len(series) * 0.5:
             return parsed.dt.month.fillna(0).astype(int)
@@ -105,17 +106,28 @@ def prepare_features(
             X_train[col] = _parse_temporal_month(X_train[col])
             X_test[col] = _parse_temporal_month(X_test[col])
 
-    # Encode all object columns with label encoding (fitted on train+test combined)
-    # Uses dtype check to catch columns not explicitly in feature_types (e.g. zero-variance)
+    # Target encoding for categorical columns (k-fold to avoid leakage)
     cat_cols = [c for c in feature_cols if X_train[c].dtype == object]
-    encoders = {}
+    global_mean = y_train.mean()
+    from utils import safe_n_splits
+    kf = KFold(n_splits=safe_n_splits(len(X_train)), shuffle=True, random_state=42)
+
     for col in cat_cols:
-        le = LabelEncoder()
-        combined = pd.concat([X_train[col].astype(str), X_test[col].astype(str)], ignore_index=True)
-        le.fit(combined)
-        X_train[col] = le.transform(X_train[col].astype(str))
-        X_test[col] = le.transform(X_test[col].astype(str))
-        encoders[col] = le
+        raw_train = X_train[col].astype(str)
+        raw_test = X_test[col].astype(str)
+
+        # Full training set means (for test encoding)
+        col_means = y_train.groupby(raw_train).mean()
+
+        # K-fold target encoding for train (avoids leakage)
+        train_encoded = pd.Series(np.full(len(X_train), np.nan), index=X_train.index)
+        for train_idx, val_idx in kf.split(X_train):
+            fold_means = y_train.iloc[train_idx].groupby(raw_train.iloc[train_idx]).mean()
+            train_encoded.iloc[val_idx] = raw_train.iloc[val_idx].map(fold_means)
+        X_train[col] = train_encoded.fillna(global_mean)
+
+        # Test: use full training set means
+        X_test[col] = raw_test.map(col_means).fillna(global_mean)
 
     # Fill remaining NaN with median (numerical) or mode (categorical)
     for col in X_train.columns:
@@ -179,7 +191,7 @@ def evaluate_and_save(
         test_auprc = average_precision_score(y_test, test_proba)
 
     # Save prediction and model
-    id_col = feature_types["id"][0] if feature_types["id"] else "CustomerID"
+    id_col = feature_types["id"][0] if feature_types["id"] else "ID"
     pred_df = pd.DataFrame({id_col: customer_ids, "probability_score": test_proba})
     pred_df.to_csv(f"prediction{suffix}.csv", index=False)
     logger.info(f"Saved prediction{suffix}.csv")

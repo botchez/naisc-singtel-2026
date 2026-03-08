@@ -9,6 +9,11 @@ logging.basicConfig(
 logger = logging.getLogger("naisc")
 
 
+def safe_n_splits(n_samples: int, desired: int = 5, min_per_fold: int = 20) -> int:
+    """Compute a safe number of CV splits given sample size."""
+    return max(2, min(desired, n_samples // min_per_fold))
+
+
 class Timer:
     """Simple context-manager timer that prints elapsed seconds."""
 

@@ -119,19 +119,36 @@ def normalize_data_quality(
             logger.info(f"Auto-detected abbreviation mappings in '{col}': {abbreviation_map}")
             norm_log.setdefault(col, []).append("Abbreviations standardized")
 
-    # Lowercase + hyphen removal on all object columns
+    # Conditional lowercase + hyphen removal: only apply if it reduces drift
+    from drift_detector import detect_categorical_drift
     normalized = []
+    skipped_norm = []
     for col in train_clean.columns:
         if col in skip_cols:
             continue
         if train_clean[col].dtype == object:
-            for df in [train_clean, test_clean]:
-                df[col] = df[col].astype(str).str.lower().str.replace("-", " ", regex=False)
-            normalized.append(col)
-            norm_log.setdefault(col, []).extend(["Lowercased", "Hyphens removed"])
+            # Compute drift before normalization
+            before = detect_categorical_drift(train_clean[col], test_clean[col])
+            before_jsd = before.get("jsd", 0) or 0
+
+            # Trial normalization
+            tr_trial = train_clean[col].astype(str).str.lower().str.replace("-", " ", regex=False)
+            te_trial = test_clean[col].astype(str).str.lower().str.replace("-", " ", regex=False)
+            after = detect_categorical_drift(tr_trial, te_trial)
+            after_jsd = after.get("jsd", 0) or 0
+
+            if after_jsd <= before_jsd:
+                train_clean[col] = tr_trial
+                test_clean[col] = te_trial
+                normalized.append(col)
+                norm_log.setdefault(col, []).extend(["Lowercased", "Hyphens removed"])
+            else:
+                skipped_norm.append(col)
 
     if normalized:
         logger.info(f"Normalized {len(normalized)} columns: {normalized}")
+    if skipped_norm:
+        logger.info(f"Skipped normalization for {len(skipped_norm)} columns (would increase drift): {skipped_norm}")
     return train_clean, test_clean, norm_log
 
 
@@ -161,6 +178,8 @@ def quantile_bin(
 ) -> tuple[pd.Series, pd.Series]:
     """Discretize into quantile bins defined by train edges."""
     vals = train_col.dropna().values.astype(float)
+    # Adapt bins to sample size
+    n_bins = min(n_bins, max(2, len(vals) // 20))
     percentiles = np.linspace(0, 100, n_bins + 1)[1:-1]
     edges = np.percentile(vals, percentiles)
     edges = np.unique(edges)
@@ -191,7 +210,8 @@ def encode_temporal_cyclical(
     def _to_month(s: pd.Series) -> pd.Series:
         # Title-case to restore month abbreviations after lowercase normalization
         s_title = s.astype(str).str.title()
-        for fmt in ["%y-%b", "%b-%y", "%Y-%m", "%m-%Y", "%b %Y", "%Y-%b"]:
+        for fmt in ["%y-%b", "%b-%y", "%Y-%m", "%m-%Y", "%b %Y", "%Y-%b",
+                    "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"]:
             parsed = pd.to_datetime(s_title, format=fmt, errors="coerce")
             if parsed.notna().sum() > len(s) * 0.5:
                 return parsed.dt.month.fillna(1).astype(float)
@@ -214,9 +234,52 @@ def encode_temporal_cyclical(
     )
 
 
+def frequency_encode_mitigation(
+    train_col: pd.Series, test_col: pd.Series
+) -> tuple[pd.Series, pd.Series]:
+    """Replace categories with their training-set frequency (0-1).
+
+    Converts categorical to numerical, making it amenable to numerical strategies.
+    """
+    freq_map = train_col.value_counts(normalize=True).to_dict()
+    tr_encoded = train_col.map(freq_map).fillna(0.0)
+    te_encoded = test_col.map(freq_map).fillna(0.0)
+    return (
+        pd.Series(tr_encoded.values, index=train_col.index, name=train_col.name),
+        pd.Series(te_encoded.values, index=test_col.index, name=test_col.name),
+    )
+
+
 def _clip_then_log(train_col, test_col):
     tr_c, te_c = clip_outliers(train_col, test_col)
+    # Shift to ensure non-negative before log
+    min_val = min(tr_c.min(), te_c.min())
+    if pd.isna(min_val):
+        return None
+    if min_val < 0:
+        shift = abs(min_val) + 1e-6
+        tr_c = tr_c + shift
+        te_c = te_c + shift
     return log_transform(tr_c, te_c)
+
+
+def rank_transform(
+    train_col: pd.Series, test_col: pd.Series
+) -> tuple[pd.Series, pd.Series]:
+    """Convert values to their percentile rank (0-1) based on training distribution.
+
+    Distribution-agnostic: eliminates drift while preserving ordering.
+    """
+    train_vals = train_col.dropna().values.astype(float)
+    sorted_vals = np.sort(train_vals)
+    n = len(sorted_vals)
+
+    def _to_rank(s):
+        arr = s.values.astype(float)
+        ranks = np.searchsorted(sorted_vals, arr, side="right") / n
+        return pd.Series(np.clip(ranks, 0, 1), index=s.index, name=s.name)
+
+    return _to_rank(train_col.fillna(train_col.median())), _to_rank(test_col.fillna(train_col.median()))
 
 
 # ── Progressive mitigation loop ──────────────────────────────────────────
@@ -271,6 +334,7 @@ def mitigate_feature_progressive(
             ("Feature Scaling (Log)", lambda tc, sc: log_transform(tc, sc)),
             ("Feature Scaling (Clip+Log)", lambda tc, sc: _clip_then_log(tc, sc)),
             ("Discretization", lambda tc, sc: quantile_bin(tc, sc)),
+            ("Rank Transform", lambda tc, sc: rank_transform(tc, sc)),
         ]
         for name, fn in strategies:
             result = fn(train[col], test[col])
@@ -288,6 +352,7 @@ def mitigate_feature_progressive(
         return train, test, log_entry
 
     if feature_type == "categorical":
+        # Strategy 1: Group rare categories
         tr_col, te_col = group_rare_categories(train[col], test[col])
         drift = detect_categorical_drift(tr_col, te_col)
         if drift["severity"] != "high":
@@ -296,7 +361,37 @@ def mitigate_feature_progressive(
             log_entry["strategy_applied"] = "Category Consolidation"
             log_entry["final_severity"] = drift["severity"]
             return train, test, log_entry
-        # Rare grouping failed -> drop
+
+        # Strategy 2: Frequency encode (converts to numerical)
+        tr_freq, te_freq = frequency_encode_mitigation(train[col], test[col])
+        drift = detect_numerical_drift(tr_freq, te_freq)
+        if drift["severity"] != "high":
+            train[col] = tr_freq.values
+            test[col] = te_freq.values
+            log_entry["strategy_applied"] = "Frequency Encoding"
+            log_entry["final_severity"] = drift["severity"]
+            return train, test, log_entry
+
+        # Strategy 3: Frequency encode + numerical strategies
+        num_strategies = [
+            ("Freq+Clip", lambda tc, sc: clip_outliers(tc, sc)),
+            ("Freq+Rank", lambda tc, sc: rank_transform(tc, sc)),
+            ("Freq+Quantile", lambda tc, sc: quantile_bin(tc, sc)),
+        ]
+        for name, fn in num_strategies:
+            result = fn(tr_freq, te_freq)
+            if result is None:
+                continue
+            tr_num, te_num = result
+            drift = detect_numerical_drift(tr_num, te_num)
+            if drift["severity"] != "high":
+                train[col] = tr_num.values
+                test[col] = te_num.values
+                log_entry["strategy_applied"] = name
+                log_entry["final_severity"] = drift["severity"]
+                return train, test, log_entry
+
+        # All categorical strategies failed -> drop
         return train, test, log_entry
 
     return train, test, log_entry
@@ -353,6 +448,79 @@ def apply_all_mitigations(
 
     if drop_cols:
         logger.info(f"Dropping {len(drop_cols)} features after all strategies exhausted: {drop_cols}")
+
+    # Stage 3b: Progressive mitigation for moderate-drift features
+    from drift_detector import detect_numerical_drift, detect_categorical_drift
+
+    moderate_features = []
+    if not drift_df_norm.empty:
+        for _, row in drift_df_norm[drift_df_norm["severity"] == "moderate"].iterrows():
+            col = row["column"]
+            if col not in drop_cols and col in train_m.columns:
+                moderate_features.append((col, row["feature_type"], row.get("psi", 0) or 0, row.get("jsd", 0) or 0))
+
+    for col, ftype, orig_psi, orig_jsd in moderate_features:
+        if ftype == "numerical":
+            strategies = [
+                ("Gentle clipping", lambda tc, sc: clip_outliers(tc, sc)),
+                ("Log transform", lambda tc, sc: log_transform(tc, sc)),
+                ("Clip+Log", lambda tc, sc: _clip_then_log(tc, sc)),
+                ("Rank transform", lambda tc, sc: rank_transform(tc, sc)),
+            ]
+            best_strategy = None
+            best_psi = orig_psi
+            best_result = None
+            for name, fn in strategies:
+                result = fn(train_m[col], test_m[col])
+                if result is None:
+                    continue
+                tr_col, te_col = result
+                drift = detect_numerical_drift(tr_col, te_col)
+                new_psi = drift.get("psi", orig_psi) or orig_psi
+                if drift["severity"] == "low":
+                    # Immediate accept if drops to low
+                    train_m[col] = tr_col.values
+                    test_m[col] = te_col.values
+                    logger.info(f"  {col}: {name} (moderate -> low)")
+                    mitigation_log.append({"column": col, "feature_type": ftype,
+                                           "original_severity": "moderate", "strategy_applied": name,
+                                           "final_severity": "low"})
+                    best_strategy = None  # already applied
+                    break
+                elif new_psi < best_psi:
+                    best_psi = new_psi
+                    best_strategy = name
+                    best_result = (tr_col, te_col, drift["severity"])
+            # Apply best improvement even if still moderate
+            if best_strategy and best_result:
+                tr_col, te_col, final_sev = best_result
+                train_m[col] = tr_col.values
+                test_m[col] = te_col.values
+                logger.info(f"  {col}: {best_strategy} (moderate, PSI {orig_psi:.4f} -> {best_psi:.4f})")
+                mitigation_log.append({"column": col, "feature_type": ftype,
+                                       "original_severity": "moderate", "strategy_applied": best_strategy,
+                                       "final_severity": final_sev})
+
+        elif ftype == "categorical":
+            # Try group_rare then frequency encoding
+            cat_strategies = [
+                ("Rare category grouping", lambda tc, sc: group_rare_categories(tc, sc), "cat"),
+                ("Frequency encoding", lambda tc, sc: frequency_encode_mitigation(tc, sc), "num"),
+            ]
+            for name, fn, detect_type in cat_strategies:
+                tr_col, te_col = fn(train_m[col], test_m[col])
+                if detect_type == "cat":
+                    drift = detect_categorical_drift(tr_col, te_col)
+                else:
+                    drift = detect_numerical_drift(tr_col, te_col)
+                if drift["severity"] == "low":
+                    train_m[col] = tr_col.values
+                    test_m[col] = te_col.values
+                    logger.info(f"  {col}: {name} (moderate -> low)")
+                    mitigation_log.append({"column": col, "feature_type": ftype,
+                                           "original_severity": "moderate", "strategy_applied": name,
+                                           "final_severity": "low"})
+                    break
 
     # Stage 4: Multivariate shift detection (diagnostic only, no weighting)
     from drift_detector import detect_multivariate_shift
