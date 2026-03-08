@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 11 — B3b: Quantile Matching (moderate-only)
+- **Status:** COMMITTED
+- **BEFORE:** Baseline train=0.8899 test=0.7378 | Mitigated train=0.8894 test=0.8561 | CV AU-PRC=0.8599
+- **AFTER:**  Baseline train=0.8899 test=0.7378 | Mitigated train=0.8894 test=0.8565 | CV AU-PRC=0.8599
+- **Delta:**  Mitigated train +0.0000 | CV +0.0000
+- **Summary:** Added quantile matching (CDF-to-CDF mapping) as a mitigation strategy for moderate-drift numerical features ONLY — high-drift progressive mitigation deliberately untouched (lesson from iteration 10's catastrophic revert). MonthlyCharge and TotalLongDistanceCharges successfully reduced from moderate to low. Domain classifier AUC dropped from 0.9244 to 0.8513, confirming significant reduction in overall distributional shift. Test AU-PRC improved +0.0004.
+
+---
+
 ## Iteration 10 — B3: Quantile Matching
 - **Status:** REVERTED
 - **BEFORE:** Baseline train=0.8899 test=0.7378 | Mitigated train=0.8894 test=0.8561 | CV AU-PRC=0.8599

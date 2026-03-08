@@ -263,6 +263,43 @@ def _clip_then_log(train_col, test_col):
     return log_transform(tr_c, te_c)
 
 
+def quantile_match(
+    train_col: pd.Series, test_col: pd.Series, n_quantiles: int = 100
+) -> tuple[pd.Series, pd.Series]:
+    """Align test distribution to train via CDF-to-CDF quantile mapping.
+
+    For each test value, finds its percentile rank in the test distribution,
+    then maps to the corresponding value from the training distribution.
+    Training data is unchanged; test rank ordering is preserved.
+    """
+    train_vals = train_col.dropna().values.astype(float)
+    test_numeric = pd.to_numeric(test_col, errors="coerce")
+    test_vals = test_numeric.dropna().values.astype(float)
+
+    if len(train_vals) < 10 or len(test_vals) < 10:
+        return train_col, test_col
+
+    n_q = min(n_quantiles, len(train_vals) // 2)
+    probs = np.linspace(0, 1, n_q + 1)
+    train_q = np.quantile(train_vals, probs)
+
+    # Vectorized: compute test CDF rank for all values
+    sorted_test = np.sort(test_vals)
+    all_test = test_numeric.values.astype(float)
+    ranks = np.searchsorted(sorted_test, all_test, side='right').astype(float) / len(sorted_test)
+    ranks = np.clip(ranks, 0, 1)
+
+    # Map ranks to training quantiles
+    mapped = np.interp(ranks, probs, train_q)
+
+    # Preserve NaN
+    nan_mask = test_numeric.isna()
+    mapped[nan_mask.values] = np.nan
+
+    result = pd.Series(mapped, index=test_col.index, name=test_col.name)
+    return train_col, result
+
+
 def rank_transform(
     train_col: pd.Series, test_col: pd.Series
 ) -> tuple[pd.Series, pd.Series]:
@@ -465,6 +502,7 @@ def apply_all_mitigations(
                 ("Gentle clipping", lambda tc, sc: clip_outliers(tc, sc)),
                 ("Log transform", lambda tc, sc: log_transform(tc, sc)),
                 ("Clip+Log", lambda tc, sc: _clip_then_log(tc, sc)),
+                ("Quantile matching", lambda tc, sc: quantile_match(tc, sc)),
                 ("Rank transform", lambda tc, sc: rank_transform(tc, sc)),
             ]
             best_strategy = None
