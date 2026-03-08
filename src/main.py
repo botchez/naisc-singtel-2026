@@ -1,6 +1,8 @@
 import argparse
+import shutil
 import sys
 import os
+import time
 
 # Ensure src/ is on the path so sibling imports work
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -126,11 +128,55 @@ def print_runtime_summary(
     print(h_line("╚", "╩", "╝"))
 
 
+def _animate_ascii_typewriter(lines: list[str], duration: float = 1.5) -> None:
+    """Animate ASCII art with a typewriter reveal effect, left-to-right."""
+    num_lines = len(lines)
+    max_width = max(len(line) for line in lines)
+    cols_per_frame = max(1, max_width // 30)
+    num_frames = (max_width + cols_per_frame - 1) // cols_per_frame
+    delay = duration / num_frames
+
+    # Print blank lines to reserve space
+    for _ in lines:
+        sys.stdout.write("\n")
+    sys.stdout.flush()
+
+    for frame in range(num_frames):
+        reveal_col = (frame + 1) * cols_per_frame
+        highlight_start = reveal_col - cols_per_frame
+        # Move cursor up to overwrite
+        sys.stdout.write(f"\033[{num_lines}A")
+        for line in lines:
+            settled = line[:highlight_start]
+            highlighted = line[highlight_start:reveal_col]
+            padding = " " * max(0, max_width - reveal_col)
+            sys.stdout.write(
+                f"\033[0m{settled}\033[32m{highlighted}\033[0m{padding}\n"
+            )
+        sys.stdout.flush()
+        time.sleep(delay)
+
+    # Final frame: full text, colors reset
+    sys.stdout.write(f"\033[{num_lines}A")
+    for line in lines:
+        sys.stdout.write(f"\033[0m{line}\n")
+    sys.stdout.flush()
+
+
 def main():
     parser = argparse.ArgumentParser(description="NAISC Singtel 2026 - Drift Detection & Churn Prediction")
     parser.add_argument("--train_data_filepath", required=True, help="Path to training CSV")
     parser.add_argument("--test_data_filepath", required=True, help="Path to test CSV")
     args = parser.parse_args()
+
+    # --- Splash banner ---
+    ascii_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "teamASCII.txt")
+    if os.path.exists(ascii_path):
+        with open(ascii_path) as f:
+            lines = f.read().splitlines()
+        print("\n")
+        _animate_ascii_typewriter(lines)
+        time.sleep(1)
 
     # --- Stage 1: Data Ingestion & Profiling ---
     train, test = load_data(args.train_data_filepath, args.test_data_filepath)
@@ -150,22 +196,33 @@ def main():
 
     # --- Stage 4: Model Training & Prediction ---
     with Timer("Model training") as model_timer:
-        X_train, y_train, X_test, customer_ids = prepare_features(
-            train_m, test_m, feature_types, extra_drop_cols=drop_cols
+        # Baseline model (no mitigation)
+        X_train_b, y_train_b, X_test_b, customer_ids = prepare_features(
+            train, test, feature_types
         )
-        lgbm = train_model(X_train, y_train, sample_weight=sample_weights)
-        metrics = evaluate_and_save(
-            lgbm, X_train, y_train, X_test, customer_ids, test_m, feature_types,
+        lgbm_b = train_model(X_train_b, y_train_b)
+        baseline_metrics = evaluate_and_save(
+            lgbm_b, X_train_b, y_train_b, X_test_b, customer_ids, test, feature_types,
+            tag="baseline",
         )
 
+        # Mitigated model
+        X_train_m, y_train_m, X_test_m, customer_ids = prepare_features(
+            train_m, test_m, feature_types, extra_drop_cols=drop_cols
+        )
+        lgbm_m = train_model(X_train_m, y_train_m, sample_weight=sample_weights)
+        mitigated_metrics = evaluate_and_save(
+            lgbm_m, X_train_m, y_train_m, X_test_m, customer_ids, test_m, feature_types,
+            tag="mitigated",
+        )
+
+        # Copy mitigated as primary output
+        shutil.copy("prediction_mitigated.csv", "prediction.csv")
+        shutil.copy("model_mitigated.joblib", "model.joblib")
+
     # --- All tables printed after all stages complete ---
-    ascii_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "teamASCII.txt")
-    if os.path.exists(ascii_path):
-        print("\n")
-        with open(ascii_path) as f:
-            print(f.read())
     print_drift_mitigation_summary(drift_df, drop_cols)
-    print_model_performance_summary(metrics)
+    print_model_performance_summary(baseline_metrics, mitigated_metrics)
     print_runtime_summary(drift_timer.elapsed, mitigation_timer.elapsed, model_timer.elapsed)
 
 

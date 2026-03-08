@@ -92,8 +92,11 @@ def evaluate_and_save(
     customer_ids: list[str],
     test: pd.DataFrame,
     feature_types: dict[str, list[str]],
+    tag: str = "",
 ) -> dict[str, float]:
     """Predict, compute AU-PRC, save model and predictions."""
+    suffix = f"_{tag}" if tag else ""
+
     # Train AU-PRC
     train_proba = model.predict_proba(X_train)[:, 1]
     train_auprc = average_precision_score(y_train, train_proba)
@@ -108,11 +111,11 @@ def evaluate_and_save(
 
     # Save prediction and model
     pred_df = pd.DataFrame({"CustomerID": customer_ids, "probability_score": test_proba})
-    pred_df.to_csv("prediction.csv", index=False)
-    logger.info("Saved prediction.csv")
+    pred_df.to_csv(f"prediction{suffix}.csv", index=False)
+    logger.info(f"Saved prediction{suffix}.csv")
 
-    joblib.dump(model, "model.joblib")
-    logger.info("Saved model.joblib")
+    joblib.dump(model, f"model{suffix}.joblib")
+    logger.info(f"Saved model{suffix}.joblib")
 
     metrics = {"train_auprc": train_auprc}
     if test_auprc is not None:
@@ -121,25 +124,30 @@ def evaluate_and_save(
     return metrics
 
 
-def print_model_performance_summary(metrics: dict[str, float]) -> None:
-    """Print model performance table (called separately after all logger output)."""
-    train_auprc = metrics["train_auprc"]
-    test_auprc = metrics.get("test_auprc")
-
-    CW = (24, 14)
-    total = CW[0] + CW[1] + 1  # +1 for middle border
+def print_model_performance_summary(
+    baseline_metrics: dict[str, float],
+    mitigated_metrics: dict[str, float],
+) -> None:
+    """Print model performance table comparing baseline vs mitigated."""
+    CW = (24, 14, 14)
+    total = sum(CW) + len(CW) - 1
     title = "MODEL PERFORMANCE SUMMARY"
+
+    def _fmt(metrics: dict[str, float], key: str) -> str:
+        v = metrics.get(key)
+        return f"{v:.4f}" if v is not None else "N/A"
+
     rows = [
-        ("AU-PRC (train)", f"{train_auprc:.4f}"),
-        ("AU-PRC (test)", f"{test_auprc:.4f}" if test_auprc is not None else "N/A"),
+        ("AU-PRC (train)", _fmt(baseline_metrics, "train_auprc"), _fmt(mitigated_metrics, "train_auprc")),
+        ("AU-PRC (test)", _fmt(baseline_metrics, "test_auprc"), _fmt(mitigated_metrics, "test_auprc")),
     ]
 
     print()
     print(f"╔{'═' * total}╗")
     print(f"║{title:^{total}}║")
-    print(f"╠{'═' * CW[0]}╦{'═' * CW[1]}╣")
-    print(f"║{'Metric':<{CW[0]}}║{'Value':^{CW[1]}}║")
-    print(f"╠{'═' * CW[0]}╬{'═' * CW[1]}╣")
-    for label, value in rows:
-        print(f"║ {label:<{CW[0] - 1}}║ {value:<{CW[1] - 1}}║")
-    print(f"╚{'═' * CW[0]}╩{'═' * CW[1]}╝")
+    print(f"╠{'═' * CW[0]}╦{'═' * CW[1]}╦{'═' * CW[2]}╣")
+    print(f"║{'Metric':<{CW[0]}}║{'Baseline':^{CW[1]}}║{'Mitigated':^{CW[2]}}║")
+    print(f"╠{'═' * CW[0]}╬{'═' * CW[1]}╬{'═' * CW[2]}╣")
+    for label, base_val, mit_val in rows:
+        print(f"║ {label:<{CW[0] - 1}}║ {base_val:<{CW[1] - 1}}║ {mit_val:<{CW[2] - 1}}║")
+    print(f"╚{'═' * CW[0]}╩{'═' * CW[1]}╩{'═' * CW[2]}╝")
