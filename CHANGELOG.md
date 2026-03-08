@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 25 — Bug Fix: BH Correction Drops Missingness Escalation
+- **Status:** COMMITTED
+- **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **AFTER:**  Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **Delta:**  Mitigated train +0.0000 | CV +0.0000
+- **Summary:** Fixed `_apply_bh_correction` to reapply `_escalate_severity` with missingness drift after re-classifying severity from BH-corrected p-values. Previously, BH reclassification overwrote severity without preserving missingness escalation, so a feature with low distributional drift but high missingness drift (e.g., 25% null in test vs 5% in train) could be incorrectly downgraded to "low" after BH correction. No metric change on this dataset (no features have missingness-driven escalation that differs from distributional drift severity).
+
+---
+
 ## Iteration 24 — Bug Fix: Feature Engineering Using Dropped Columns
 - **Status:** COMMITTED
 - **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595

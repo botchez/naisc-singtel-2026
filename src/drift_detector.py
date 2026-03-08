@@ -386,7 +386,13 @@ def _apply_bh_correction(drift_df: pd.DataFrame, ss_factor: float = 1.0) -> pd.D
         drift_df.loc[idx, f"{pval_col}_bh"] = round(corr_p, 6)
 
     # Re-classify severity using corrected p-values with consistent ss_factor
+    # Also reapply missingness escalation (which initial detection applied but
+    # would otherwise be lost when severity is overwritten here)
     for idx, row in drift_df.iterrows():
+        train_null = row.get("train_null_pct") or 0.0
+        test_null = row.get("test_null_pct") or 0.0
+        miss_sev = _missingness_severity(train_null, test_null)
+
         if row["feature_type"] == "numerical":
             ks_p = row.get("ks_pval_bh", row.get("ks_pval", 1.0))
             if pd.isna(ks_p):
@@ -396,14 +402,16 @@ def _apply_bh_correction(drift_df: pd.DataFrame, ss_factor: float = 1.0) -> pd.D
             ks_d = row.get("ks_stat") or 0.0
             iqr_r = row.get("iqr_ratio") or 1.0
             t_div = row.get("tail_divergence") or 0.0
-            drift_df.loc[idx, "severity"] = _numerical_severity(ks_p, psi, w_norm, ks_d, iqr_r, t_div, ss_factor)
+            sev = _numerical_severity(ks_p, psi, w_norm, ks_d, iqr_r, t_div, ss_factor)
+            drift_df.loc[idx, "severity"] = _escalate_severity(sev, miss_sev)
         elif row["feature_type"] in ("categorical", "temporal"):
             chi2_p = row.get("chi2_pval_bh", row.get("chi2_pval", 1.0))
             if pd.isna(chi2_p):
                 chi2_p = row.get("chi2_pval", 1.0)
             jsd = row.get("jsd") or 0.0
             cv = row.get("cramers_v") or 0.0
-            drift_df.loc[idx, "severity"] = _categorical_severity(chi2_p, jsd, cv, ss_factor)
+            sev = _categorical_severity(chi2_p, jsd, cv, ss_factor)
+            drift_df.loc[idx, "severity"] = _escalate_severity(sev, miss_sev)
 
     return drift_df
 
