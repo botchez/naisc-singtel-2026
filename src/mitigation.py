@@ -198,7 +198,7 @@ def group_rare_categories(
     train_cats = set(train_col.dropna().unique())
 
     def _remap(s: pd.Series) -> pd.Series:
-        return s.map(lambda v: "_other" if v in rare_cats or v not in train_cats else v)
+        return s.map(lambda v: v if pd.isna(v) else ("_other" if v in rare_cats or v not in train_cats else v))
 
     return _remap(train_col), _remap(test_col)
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 27 — Bug Fix: group_rare_categories Maps NaN to "_other"
+- **Status:** COMMITTED
+- **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **AFTER:**  Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **Delta:**  Mitigated train +0.0000 | CV +0.0000
+- **Summary:** Fixed `group_rare_categories` `_remap` lambda to preserve NaN values. Previously, NaN was treated as "not in train_cats" (since NaN != NaN in Python), incorrectly mapping it to "_other". This fills missing values rather than preserving them for LightGBM's native NaN handling. No metric change on this dataset (no categorical columns with NaN go through rare grouping), but prevents incorrect missing value imputation on hidden datasets where categorical columns have NaN.
+
+---
+
 ## Iteration 26 — Bug Fix: Normalization Converts NaN to "nan" String
 - **Status:** REVERTED
 - **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
