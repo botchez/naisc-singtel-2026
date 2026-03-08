@@ -357,7 +357,7 @@ def generate_drift_description(
     return desc[0].upper() + desc[1:]
 
 
-def _apply_bh_correction(drift_df: pd.DataFrame) -> pd.DataFrame:
+def _apply_bh_correction(drift_df: pd.DataFrame, ss_factor: float = 1.0) -> pd.DataFrame:
     """Apply Benjamini-Hochberg FDR correction across all p-values and re-classify severity."""
     # Collect all p-values (KS and Chi2) for joint correction
     all_pvals = []
@@ -385,8 +385,7 @@ def _apply_bh_correction(drift_df: pd.DataFrame) -> pd.DataFrame:
     for (idx, pval_col), corr_p in zip(pval_info, corrected):
         drift_df.loc[idx, f"{pval_col}_bh"] = round(corr_p, 6)
 
-    # Re-classify severity using corrected p-values
-    # Note: ss_factor was already applied during initial detection; BH only adjusts p-values
+    # Re-classify severity using corrected p-values with consistent ss_factor
     for idx, row in drift_df.iterrows():
         if row["feature_type"] == "numerical":
             ks_p = row.get("ks_pval_bh", row.get("ks_pval", 1.0))
@@ -397,14 +396,14 @@ def _apply_bh_correction(drift_df: pd.DataFrame) -> pd.DataFrame:
             ks_d = row.get("ks_stat") or 0.0
             iqr_r = row.get("iqr_ratio") or 1.0
             t_div = row.get("tail_divergence") or 0.0
-            drift_df.loc[idx, "severity"] = _numerical_severity(ks_p, psi, w_norm, ks_d, iqr_r, t_div)
+            drift_df.loc[idx, "severity"] = _numerical_severity(ks_p, psi, w_norm, ks_d, iqr_r, t_div, ss_factor)
         elif row["feature_type"] in ("categorical", "temporal"):
             chi2_p = row.get("chi2_pval_bh", row.get("chi2_pval", 1.0))
             if pd.isna(chi2_p):
                 chi2_p = row.get("chi2_pval", 1.0)
             jsd = row.get("jsd") or 0.0
             cv = row.get("cramers_v") or 0.0
-            drift_df.loc[idx, "severity"] = _categorical_severity(chi2_p, jsd, cv)
+            drift_df.loc[idx, "severity"] = _categorical_severity(chi2_p, jsd, cv, ss_factor)
 
     return drift_df
 
@@ -449,8 +448,11 @@ def run_drift_analysis(
     if drift_df.empty:
         return drift_df
 
+    # Compute dataset-level ss_factor for consistent threshold scaling
+    ss_factor = _small_sample_factor(len(train), len(test))
+
     # Apply BH FDR correction and re-classify severity
-    drift_df = _apply_bh_correction(drift_df)
+    drift_df = _apply_bh_correction(drift_df, ss_factor)
 
     drift_df = drift_df.sort_values("severity", key=lambda s: s.map({"high": 0, "moderate": 1, "low": 2, "unknown": 3}))
 

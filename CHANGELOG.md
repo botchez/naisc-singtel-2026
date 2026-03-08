@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 23 — Bug Fix: BH Correction Missing ss_factor
+- **Status:** COMMITTED
+- **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **AFTER:**  Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **Delta:**  Mitigated train +0.0000 | CV +0.0000
+- **Summary:** Fixed `_apply_bh_correction` to accept and pass `ss_factor` to `_numerical_severity` and `_categorical_severity` when re-classifying severity after BH p-value adjustment. Previously, BH reclassification always used `ss_factor=1.0` (default), creating inconsistency for small datasets where initial detection used the adaptive factor. Also updated `run_drift_analysis` to compute dataset-level `ss_factor` and pass it to BH correction. No metric change on this dataset (n_eff≈23500, factor=1.0), but fixes correctness for small hidden datasets.
+
+---
+
 ## Iteration 22 — E1: Adaptive PSI/JSD Thresholds
 - **Status:** COMMITTED
 - **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
