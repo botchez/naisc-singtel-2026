@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 17 — F6: Adaptive Bayesian Smoothing
+- **Status:** REVERTED
+- **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **AFTER:**  Baseline train=0.8892 test=0.7268 | Mitigated train=0.8880 test=0.8535 | CV AU-PRC=0.8589
+- **Delta:**  Mitigated train -0.0016 | CV -0.0006
+- **Reason:** Adaptive smoothing (m = max(5, min(50, n_unique*2))) over-regularized high-cardinality columns like LocationCity, losing important category-level signal. Test AU-PRC dropped -0.0046. The fixed m=10 is actually well-calibrated for this dataset.
+
+---
+
 ## Iteration 16 — F4: NaN-Native Handling
 - **Status:** COMMITTED
 - **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
