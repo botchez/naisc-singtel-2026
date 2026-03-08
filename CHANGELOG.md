@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 7 — F5: Duplicate Column Detection
+- **Status:** COMMITTED
+- **BEFORE:** Baseline train=0.8899 test=0.7378 | Mitigated train=0.8892 test=0.8569 | CV AU-PRC=0.8595
+- **AFTER:**  Baseline train=0.8899 test=0.7378 | Mitigated train=0.8894 test=0.8561 | CV AU-PRC=0.8599
+- **Delta:**  Mitigated train +0.0002 | CV +0.0004
+- **Summary:** Added near-duplicate column detection (|corr| > 0.98) to feature engineering. Dropped 4 redundant features (AreaCode_div_Latitude, Latitude_div_Longitude, Latitude_mean_by_Contract, NumberofDependents_mean_by_InternetType), reducing feature count from 65 to 61. Prefers dropping engineered features over originals. Improves robustness by preventing collinear features from inflating model complexity on hidden datasets.
+
+---
+
 ## Iteration 6 — C5: Missing Pattern Count
 - **Status:** REVERTED
 - **BEFORE:** Baseline train=0.8899 test=0.7378 | Mitigated train=0.8892 test=0.8569 | CV AU-PRC=0.8595

@@ -111,6 +111,38 @@ def engineer_features(
     # Collect all new feature names
     all_new_features = new_features + freq_features + ratio_features + agg_features
 
+    # 5. Duplicate column detection: remove near-duplicate features (|corr| > 0.98)
+    try:
+        num_feature_cols = [c for c in train.columns if c not in skip_cols
+                           and c in test.columns and pd.api.types.is_numeric_dtype(train[c])]
+        if len(num_feature_cols) >= 2:
+            corr = train[num_feature_cols].corr().abs()
+            # Find pairs with correlation > 0.98
+            drop_dupes = set()
+            engineered_set = set(all_new_features)
+            for i, col_a in enumerate(num_feature_cols):
+                if col_a in drop_dupes:
+                    continue
+                for col_b in num_feature_cols[i + 1:]:
+                    if col_b in drop_dupes:
+                        continue
+                    if corr.loc[col_a, col_b] > 0.98:
+                        # Prefer dropping the engineered feature over original
+                        if col_b in engineered_set and col_a not in engineered_set:
+                            drop_dupes.add(col_b)
+                        elif col_a in engineered_set and col_b not in engineered_set:
+                            drop_dupes.add(col_a)
+                        else:
+                            # Both engineered or both original — drop the second
+                            drop_dupes.add(col_b)
+            if drop_dupes:
+                train = train.drop(columns=[c for c in drop_dupes if c in train.columns])
+                test = test.drop(columns=[c for c in drop_dupes if c in test.columns])
+                all_new_features = [f for f in all_new_features if f not in drop_dupes]
+                logger.info(f"Dropped {len(drop_dupes)} near-duplicate features: {sorted(drop_dupes)}")
+    except Exception as e:
+        logger.warning(f"Duplicate column detection skipped: {e}")
+
     # Ensure train and test have identical columns
     common_cols = sorted(set(train.columns) & set(test.columns))
     train = train[common_cols]
