@@ -257,15 +257,16 @@ def apply_all_mitigations(
     test: pd.DataFrame,
     drift_df: pd.DataFrame,
     feature_types: dict[str, list[str]],
-) -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray, list[str], list[dict], dict[str, list[str]]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[dict], dict[str, list[str]], dict]:
     """Run all mitigation stages in order.
 
     Pipeline:
     1. Normalize data quality (city abbreviations, lowercase, hyphen removal)
     2. Re-run drift detection on normalized data
     3. Progressive mitigation: try graduated strategies before dropping
+    4. Multivariate shift detection (diagnostic only)
 
-    Returns (train_mitigated, test_mitigated, sample_weights, drop_cols, mitigation_log, norm_log).
+    Returns (train_mitigated, test_mitigated, drop_cols, mitigation_log, norm_log, shift_info).
     """
     from drift_detector import run_drift_analysis
 
@@ -300,24 +301,20 @@ def apply_all_mitigations(
     if drop_cols:
         logger.info(f"Dropping {len(drop_cols)} features after all strategies exhausted: {drop_cols}")
 
-    # Stage 4: Multivariate shift detection and density ratio weighting
-    from drift_detector import detect_multivariate_shift, compute_density_ratio_weights
+    # Stage 4: Multivariate shift detection (diagnostic only, no weighting)
+    from drift_detector import detect_multivariate_shift
 
     shift_info = detect_multivariate_shift(train_m, test_m, feature_types, extra_drop_cols=drop_cols)
 
     if shift_info["shift_detected"]:
-        sample_weights = compute_density_ratio_weights(shift_info["train_proba"])
         logger.info(
             f"Multivariate shift detected (AUC={shift_info['auc']:.4f}), "
-            f"applying density ratio weights "
-            f"(mean={sample_weights.mean():.2f}, std={sample_weights.std():.2f}, "
-            f"range=[{sample_weights.min():.2f}, {sample_weights.max():.2f}])"
+            f"diagnostic only — no sample reweighting applied"
         )
     else:
-        sample_weights = np.ones(len(train_m))
         logger.info(
             f"No significant multivariate shift (AUC={shift_info['auc']:.4f}), "
             f"using uniform weights"
         )
 
-    return train_m, test_m, sample_weights, drop_cols, mitigation_log, norm_log, shift_info
+    return train_m, test_m, drop_cols, mitigation_log, norm_log, shift_info
