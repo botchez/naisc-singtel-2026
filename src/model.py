@@ -7,6 +7,55 @@ import joblib
 from utils import logger
 
 
+def _encode_target(series: pd.Series) -> pd.Series:
+    """Auto-detect and encode binary target to 0/1.
+
+    Handles: "Yes"/"No", 1/0, True/False, "1"/"0", "yes"/"no", etc.
+    """
+    if series.isna().all():
+        return series.fillna(0).astype(int)
+
+    vals = series.dropna().unique()
+
+    # Already numeric 0/1
+    if pd.api.types.is_numeric_dtype(series):
+        if set(vals).issubset({0, 1, 0.0, 1.0}):
+            return series.fillna(0).astype(int)
+
+    # Boolean
+    if series.dtype == bool:
+        return series.astype(int)
+
+    # String/object: map common positive labels to 1
+    positive_labels = {"yes", "true", "1", "churn", "churned", "positive"}
+    str_vals = {str(v).lower().strip() for v in vals}
+
+    if str_vals & positive_labels:
+        pos = str_vals & positive_labels
+        return series.apply(lambda x: 1 if str(x).lower().strip() in pos else 0)
+
+    # Fallback for binary: assume minority class is positive
+    vc = series.value_counts()
+    if len(vc) == 2:
+        minority = vc.idxmin()
+        logger.warning(f"Auto-encoding target: '{minority}' -> 1 (minority class)")
+        return (series == minority).astype(int)
+
+    # Last resort: try numeric conversion
+    return pd.to_numeric(series, errors="coerce").fillna(0).astype(int)
+
+
+def _parse_temporal_month(series: pd.Series) -> pd.Series:
+    """Parse temporal column to month number, trying multiple formats."""
+    # Title-case to restore month abbreviations after lowercase normalization
+    s_title = series.astype(str).str.title()
+    for fmt in ["%y-%b", "%b-%y", "%Y-%m", "%m-%Y", "%b %Y", "%Y-%b"]:
+        parsed = pd.to_datetime(s_title, format=fmt, errors="coerce")
+        if parsed.notna().sum() > len(series) * 0.5:
+            return parsed.dt.month.fillna(0).astype(int)
+    return pd.Series(np.zeros(len(series), dtype=int), index=series.index)
+
+
 def prepare_features(
     train: pd.DataFrame,
     test: pd.DataFrame,
@@ -17,32 +66,48 @@ def prepare_features(
 
     Returns (X_train, y_train, X_test, customer_ids).
     """
-    target_col = feature_types["target"][0] if feature_types["target"] else "ChurnStatus"
-    id_col = feature_types["id"][0] if feature_types["id"] else "CustomerID"
+    target_col = feature_types["target"][0] if feature_types["target"] else None
+    id_col = feature_types["id"][0] if feature_types["id"] else None
 
-    customer_ids = test[id_col].tolist()
+    # Extract customer IDs from test
+    if id_col and id_col in test.columns:
+        customer_ids = test[id_col].tolist()
+    else:
+        customer_ids = list(range(len(test)))
+        logger.warning("ID column not found in test; using row indices")
 
     # Encode target
-    y_train = (train[target_col] == "Yes").astype(int)
+    if target_col and target_col in train.columns:
+        y_train = _encode_target(train[target_col])
+    else:
+        logger.warning("No target column found; using zeros")
+        y_train = pd.Series(np.zeros(len(train), dtype=int))
 
-    # Columns to use as features
+    # Columns to use as features (must be in both train and test)
     drop_cols = feature_types["id"] + feature_types["target"]
     if extra_drop_cols:
         drop_cols = drop_cols + [c for c in extra_drop_cols if c not in drop_cols]
-    feature_cols = [c for c in train.columns if c not in drop_cols]
+    feature_cols = [c for c in train.columns if c not in drop_cols and c in test.columns]
 
     X_train = train[feature_cols].copy()
     X_test = test[feature_cols].copy()
 
+    # Coerce mismatched dtypes between train and test
+    for col in feature_cols:
+        if X_train[col].dtype != X_test[col].dtype:
+            if pd.api.types.is_numeric_dtype(X_train[col]) or pd.api.types.is_numeric_dtype(X_test[col]):
+                X_train[col] = pd.to_numeric(X_train[col], errors="coerce")
+                X_test[col] = pd.to_numeric(X_test[col], errors="coerce")
+
     # Convert temporal columns to month number (1-12)
     for col in feature_types["temporal"]:
         if col in feature_cols:
-            for df in [X_train, X_test]:
-                df[col] = pd.to_datetime(df[col], format="%y-%b", errors="coerce").dt.month
-                df[col] = df[col].fillna(0).astype(int)
+            X_train[col] = _parse_temporal_month(X_train[col])
+            X_test[col] = _parse_temporal_month(X_test[col])
 
-    # Encode categoricals with label encoding (fitted on train+test combined)
-    cat_cols = [c for c in feature_types["categorical"] if c in feature_cols]
+    # Encode all object columns with label encoding (fitted on train+test combined)
+    # Uses dtype check to catch columns not explicitly in feature_types (e.g. zero-variance)
+    cat_cols = [c for c in feature_cols if X_train[c].dtype == object]
     encoders = {}
     for col in cat_cols:
         le = LabelEncoder()
@@ -57,8 +122,11 @@ def prepare_features(
         if X_train[col].isna().any() or X_test[col].isna().any():
             if pd.api.types.is_numeric_dtype(X_train[col]):
                 fill_val = X_train[col].median()
+                if pd.isna(fill_val):
+                    fill_val = 0
             else:
-                fill_val = X_train[col].mode().iloc[0] if not X_train[col].mode().empty else 0
+                mode = X_train[col].mode()
+                fill_val = mode.iloc[0] if not mode.empty else 0
             X_train[col] = X_train[col].fillna(fill_val)
             X_test[col] = X_test[col].fillna(fill_val)
 
@@ -102,15 +170,16 @@ def evaluate_and_save(
     train_auprc = average_precision_score(y_train, train_proba)
 
     # Test AU-PRC (only if target column exists in test)
-    target_col = feature_types["target"][0] if feature_types["target"] else "ChurnStatus"
+    target_col = feature_types["target"][0] if feature_types["target"] else None
     test_proba = model.predict_proba(X_test)[:, 1]
     test_auprc = None
-    if target_col in test.columns and test[target_col].notna().any():
-        y_test = (test[target_col] == "Yes").astype(int)
+    if target_col and target_col in test.columns and test[target_col].notna().any():
+        y_test = _encode_target(test[target_col])
         test_auprc = average_precision_score(y_test, test_proba)
 
     # Save prediction and model
-    pred_df = pd.DataFrame({"CustomerID": customer_ids, "probability_score": test_proba})
+    id_col = feature_types["id"][0] if feature_types["id"] else "CustomerID"
+    pred_df = pd.DataFrame({id_col: customer_ids, "probability_score": test_proba})
     pred_df.to_csv(f"prediction{suffix}.csv", index=False)
     logger.info(f"Saved prediction{suffix}.csv")
 
