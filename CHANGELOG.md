@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 6 — C5: Missing Pattern Count
+- **Status:** REVERTED
+- **BEFORE:** Baseline train=0.8899 test=0.7378 | Mitigated train=0.8892 test=0.8569 | CV AU-PRC=0.8595
+- **AFTER:**  Baseline train=0.8899 test=0.7378 | Mitigated train=0.8887 test=0.8548 | CV AU-PRC=0.8595
+- **Delta:**  Mitigated train -0.0005 | CV +0.0000
+- **Reason:** Test AU-PRC dropped by 0.0021 (exceeds 0.002 threshold). With only 2 nullable columns, the row-level missing count (values 0/1/2) is redundant with individual indicators and adds noise.
+
+---
+
 ## Iteration 5 — F6: Smoothed Target Encoding
 - **Status:** COMMITTED
 - **BEFORE:** Baseline train=0.8904 test=0.7317 | Mitigated train=0.8894 test=0.8580 | CV AU-PRC=0.8592
