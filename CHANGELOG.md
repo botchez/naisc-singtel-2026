@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 21 — C2: Polynomial Interactions
+- **Status:** REVERTED
+- **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **AFTER:**  Baseline train=0.8891 test=0.7352 | Mitigated train=0.8876 test=0.8542 | CV AU-PRC=0.8598
+- **Delta:**  Mitigated train -0.0020 | test -0.0039 | CV +0.0003
+- **Reason:** Added A×B product features for top 3 correlated numerical pairs. 2 of 3 products were dropped as near-duplicates, leaving only TotalCharges_x_TotalRevenue. This destabilized the weight tournament (Blend won instead of Uniform) and hurt generalization. Confirms the pattern: feature additions consistently hurt on this well-optimized dataset (C1 also reverted). Tree models already learn interactions through sequential splits.
+
+---
+
 ## Iteration 20 — A6: Label Shift Detection
 - **Status:** COMMITTED
 - **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
