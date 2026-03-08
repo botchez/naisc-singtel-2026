@@ -112,21 +112,29 @@ def prepare_features(
     from utils import safe_n_splits
     kf = KFold(n_splits=safe_n_splits(len(X_train)), shuffle=True, random_state=42)
 
+    smoothing_m = 10  # Bayesian smoothing: shrink low-count category means toward global mean
+
     for col in cat_cols:
         raw_train = X_train[col].astype(str)
         raw_test = X_test[col].astype(str)
 
-        # Full training set means (for test encoding)
-        col_means = y_train.groupby(raw_train).mean()
+        # Full training set smoothed means (for test encoding)
+        col_counts = y_train.groupby(raw_train).count()
+        col_means_raw = y_train.groupby(raw_train).mean()
+        col_means = (col_counts * col_means_raw + smoothing_m * global_mean) / (col_counts + smoothing_m)
 
         # K-fold target encoding for train (avoids leakage)
         train_encoded = pd.Series(np.full(len(X_train), np.nan), index=X_train.index)
         for train_idx, val_idx in kf.split(X_train):
-            fold_means = y_train.iloc[train_idx].groupby(raw_train.iloc[train_idx]).mean()
+            fold_y = y_train.iloc[train_idx]
+            fold_raw = raw_train.iloc[train_idx]
+            fold_counts = fold_y.groupby(fold_raw).count()
+            fold_means_raw = fold_y.groupby(fold_raw).mean()
+            fold_means = (fold_counts * fold_means_raw + smoothing_m * global_mean) / (fold_counts + smoothing_m)
             train_encoded.iloc[val_idx] = raw_train.iloc[val_idx].map(fold_means)
         X_train[col] = train_encoded.fillna(global_mean)
 
-        # Test: use full training set means
+        # Test: use full training set smoothed means
         X_test[col] = raw_test.map(col_means).fillna(global_mean)
 
     # Fill remaining NaN with median (numerical) or mode (categorical)

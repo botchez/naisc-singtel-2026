@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 5 — F6: Smoothed Target Encoding
+- **Status:** COMMITTED
+- **BEFORE:** Baseline train=0.8904 test=0.7317 | Mitigated train=0.8894 test=0.8580 | CV AU-PRC=0.8592
+- **AFTER:**  Baseline train=0.8899 test=0.7378 | Mitigated train=0.8892 test=0.8569 | CV AU-PRC=0.8595
+- **Delta:**  Mitigated train -0.0002 | CV +0.0003
+- **Summary:** Added Bayesian smoothing (m=10) to k-fold target encoding. Low-count categories now shrink toward global mean, reducing overfitting. Baseline test improved +0.0061, confirming smoothing helps generalization. Mitigated metrics within noise.
+
+---
+
 ## Iteration 4 — C1: Difference Features
 - **Status:** REVERTED
 - **BEFORE:** Baseline train=0.8904 test=0.7317 | Mitigated train=0.8894 test=0.8580 | CV AU-PRC=0.8592
