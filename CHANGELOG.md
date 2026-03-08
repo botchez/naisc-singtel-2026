@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 9 — A5: Domain Classifier Feature Importance
+- **Status:** COMMITTED
+- **BEFORE:** Baseline train=0.8899 test=0.7378 | Mitigated train=0.8894 test=0.8561 | CV AU-PRC=0.8599
+- **AFTER:**  Baseline train=0.8899 test=0.7378 | Mitigated train=0.8894 test=0.8561 | CV AU-PRC=0.8599
+- **Delta:**  Mitigated train +0.0000 | CV +0.0000
+- **Summary:** Added gain-based feature importance logging from domain classifier. Top shift features: DigitalInvoicing (91940), TotalLongDistanceCharges (67428), TotalRevenue (66405), TotalCharges (45651), Married (37107). Diagnostic-only — no metric change, but provides actionable insight into what drives distributional shift on any dataset.
+
+---
+
 ## Iteration 8 — F1: Constant Feature Detection
 - **Status:** COMMITTED
 - **BEFORE:** Baseline train=0.8899 test=0.7378 | Mitigated train=0.8894 test=0.8561 | CV AU-PRC=0.8599

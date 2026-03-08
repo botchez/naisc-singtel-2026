@@ -478,6 +478,7 @@ def detect_multivariate_shift(
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     oof_proba = np.zeros(len(X_all))
     fold_aucs = []
+    importance_acc = np.zeros(len(feature_cols))
 
     for fold_train_idx, fold_val_idx in skf.split(X_all, y_domain):
         clf = LGBMClassifier(
@@ -490,10 +491,18 @@ def detect_multivariate_shift(
         clf.fit(X_all.iloc[fold_train_idx], y_domain[fold_train_idx])
         oof_proba[fold_val_idx] = clf.predict_proba(X_all.iloc[fold_val_idx])[:, 1]
         fold_aucs.append(roc_auc_score(y_domain[fold_val_idx], oof_proba[fold_val_idx]))
+        importance_acc += clf.feature_importances_
 
     from utils import logger
     auc = roc_auc_score(y_domain, oof_proba)
     logger.info(f"Domain classifier fold AUCs: {[round(a, 4) for a in fold_aucs]}, overall={round(auc, 4)}")
+
+    # Log top features driving multivariate shift
+    avg_importance = importance_acc / n_splits
+    top_k = min(5, len(feature_cols))
+    top_idx = np.argsort(avg_importance)[-top_k:][::-1]
+    top_features = [(feature_cols[i], round(float(avg_importance[i]), 1)) for i in top_idx]
+    logger.info(f"Top domain-shift features (gain): {top_features}")
 
     # Extract per-training-row P(test) for sample weighting
     train_oof_proba = oof_proba[:len(X_tr)]
@@ -503,6 +512,7 @@ def detect_multivariate_shift(
         "fold_aucs": [round(a, 4) for a in fold_aucs],
         "shift_detected": auc > 0.65,
         "train_oof_proba": train_oof_proba,
+        "top_shift_features": top_features,
     }
 
 
