@@ -6,6 +6,7 @@ import time
 
 # Ensure src/ is on the path so sibling imports work
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import pandas as pd
 from profiler import load_data, detect_feature_types, profile_data
@@ -18,9 +19,11 @@ from utils import Timer
 def print_drift_mitigation_summary(
     drift_df: pd.DataFrame,
     drop_cols: list[str],
+    mitigation_log: list[dict] | None = None,
+    norm_log: dict[str, list[str]] | None = None,
 ) -> None:
     """Print combined drift detection & mitigation summary as a unified double-line table."""
-    CW = (24, 14, 34, 20)
+    CW = (24, 14, 34, 36)
     FULL_W = sum(CW) + len(CW) - 1  # 85
 
     def full_row(text):
@@ -28,6 +31,30 @@ def print_drift_mitigation_summary(
 
     def col_row(c1, c2, c3, c4):
         return f"║ {c1:<{CW[0]-2}} ║ {c2:<{CW[1]-2}} ║ {c3:<{CW[2]-2}} ║ {c4:<{CW[3]-2}} ║"
+
+    def col_row_wrap(c1, c2, c3, c4):
+        """Print a data row, wrapping c4 onto continuation lines if it overflows."""
+        max4 = CW[3] - 2
+        if len(c4) <= max4:
+            return col_row(c1, c2, c3, c4)
+        # Word-wrap c4
+        lines, cur = [], ""
+        for word in c4.split():
+            test = f"{cur} {word}".strip()
+            if len(test) <= max4:
+                cur = test
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = word
+        if cur:
+            lines.append(cur)
+        # First line has all columns; continuations blank the first 3
+        blank = f"║ {'':<{CW[0]-2}} ║ {'':<{CW[1]-2}} ║ {'':<{CW[2]-2}} ║ "
+        rows = [col_row(c1, c2, c3, lines[0])]
+        for extra in lines[1:]:
+            rows.append(f"{blank}{extra:<{max4}} ║")
+        return "\n".join(rows)
 
     def h_line(left, mid, right):
         return f"{left}{'═'*CW[0]}{mid}{'═'*CW[1]}{mid}{'═'*CW[2]}{mid}{'═'*CW[3]}{right}"
@@ -56,6 +83,12 @@ def print_drift_mitigation_summary(
         print(full_sep("╚", "╝"))
         return
 
+    # Build lookup from mitigation log for strategy names
+    strategy_map = {}
+    if mitigation_log:
+        for entry in mitigation_log:
+            strategy_map[entry["column"]] = entry["strategy_applied"]
+
     drop_set = set(drop_cols)
 
     # Title → header (introduces column dividers)
@@ -76,18 +109,23 @@ def print_drift_mitigation_summary(
             drift_desc = f"{sev}: JSD={r['jsd']:.2f}, Chi2 p={r['chi2_pval']:.3f}"
         drift_desc = drift_desc[:CW[2] - 2]
 
-        normalized = ftype in ("categorical", "temporal")
-        dropped = r["column"] in drop_set
-        if normalized and dropped:
-            mitigation = "Normalized+Dropped"
-        elif dropped:
-            mitigation = "Dropped"
-        elif normalized:
-            mitigation = "Normalized"
+        # Use strategy from mitigation_log if available
+        if r["column"] in strategy_map:
+            mitigation = strategy_map[r["column"]]
         else:
-            mitigation = "Retained"
+            dropped = r["column"] in drop_set
+            actions = norm_log.get(r["column"], []) if norm_log else []
+            if actions:
+                label = ", ".join(a.lower() for a in actions)
+                if dropped:
+                    label += ", dropped"
+                mitigation = label[0].upper() + label[1:]
+            elif dropped:
+                mitigation = "Dropped"
+            else:
+                mitigation = "Moderate drift, retained"
 
-        print(col_row(col_name, ftype, drift_desc, mitigation))
+        print(col_row_wrap(col_name, ftype, drift_desc, mitigation))
 
     # Close table
     print(h_line("╚", "╩", "╝"))
@@ -190,7 +228,7 @@ def main():
 
     # --- Stage 3: Drift Mitigation ---
     with Timer("Drift mitigation") as mitigation_timer:
-        train_m, test_m, sample_weights, drop_cols = apply_all_mitigations(
+        train_m, test_m, sample_weights, drop_cols, mitigation_log, norm_log = apply_all_mitigations(
             train, test, drift_df, feature_types
         )
 
@@ -221,7 +259,7 @@ def main():
         shutil.copy("model_mitigated.joblib", "model.joblib")
 
     # --- All tables printed after all stages complete ---
-    print_drift_mitigation_summary(drift_df, drop_cols)
+    print_drift_mitigation_summary(drift_df, drop_cols, mitigation_log, norm_log)
     print_model_performance_summary(baseline_metrics, mitigated_metrics)
     print_runtime_summary(drift_timer.elapsed, mitigation_timer.elapsed, model_timer.elapsed)
 

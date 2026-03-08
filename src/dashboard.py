@@ -75,7 +75,7 @@ def load_all_data(train_path: str, test_path: str):
     train, test = load_data(train_path, test_path)
     feature_types = detect_feature_types(train)
     drift_df = run_drift_analysis(train, test, feature_types)
-    train_m, test_m, sample_weights, drop_cols = apply_all_mitigations(
+    train_m, test_m, sample_weights, drop_cols, mitigation_log, norm_log = apply_all_mitigations(
         train, test, drift_df, feature_types
     )
 
@@ -124,6 +124,7 @@ def load_all_data(train_path: str, test_path: str):
         "feature_types": feature_types, "drift_df": drift_df,
         "train_m": train_m, "test_m": test_m,
         "sample_weights": sample_weights, "drop_cols": drop_cols,
+        "mitigation_log": mitigation_log, "norm_log": norm_log,
         "baseline_metrics": baseline_metrics, "mitigated_metrics": mitigated_metrics,
         "pred_baseline": pred_baseline, "pred_mitigated": pred_mitigated,
     }
@@ -142,6 +143,7 @@ train_m = data["train_m"]
 test_m = data["test_m"]
 sample_weights = data["sample_weights"]
 drop_cols = data["drop_cols"]
+mitigation_log = data["mitigation_log"]
 baseline_metrics = data["baseline_metrics"]
 mitigated_metrics = data["mitigated_metrics"]
 pred_baseline = data["pred_baseline"]
@@ -490,9 +492,10 @@ with tab_mitigation:
         </div>""", unsafe_allow_html=True)
     with p3:
         n_dropped = len(drop_cols) if drop_cols else 0
+        n_mitigated = len([e for e in mitigation_log if e["strategy_applied"] != "Dropped"]) if mitigation_log else 0
         st.markdown(f"""<div class="pipeline-card">
-            <h4>3. Drop High-Drift</h4>
-            <p>Remove {n_dropped} features with high drift severity to prevent concept drift from hurting generalization</p>
+            <h4>3. Progressive Mitigation</h4>
+            <p>Graduated strategies (clip, log, bin, rare-group, cyclical-encode) saved {n_mitigated} features; {n_dropped} dropped as last resort</p>
         </div>""", unsafe_allow_html=True)
 
     st.divider()
@@ -566,54 +569,57 @@ with tab_mitigation:
 
     st.divider()
 
-    # ── Dropped features summary ──
-    st.subheader("Drift-Informed Feature Selection")
+    # ── Progressive mitigation summary ──
+    st.subheader("Progressive Drift Mitigation")
 
-    if drop_cols:
-        # Show which features were dropped and why
-        drop_info = []
-        for col in drop_cols:
-            row = drift_df[drift_df["column"] == col]
-            if not row.empty:
-                r = row.iloc[0]
-                ftype = r["feature_type"]
-                if ftype == "numerical":
-                    reason = f"PSI={r.get('psi', 'N/A')}, KS={r.get('ks_stat', 'N/A')}"
-                else:
-                    reason = f"JSD={r.get('jsd', 'N/A')}, Chi2 p={r.get('chi2_pval', 'N/A')}"
-                drop_info.append({"Feature": col, "Type": ftype, "Drift Evidence": reason})
-            else:
-                drop_info.append({"Feature": col, "Type": "temporal", "Drift Evidence": "100% train/test separation"})
+    if mitigation_log:
+        # Build mitigation actions table
+        action_rows = []
+        for entry in mitigation_log:
+            action_rows.append({
+                "Feature": entry["column"],
+                "Type": entry["feature_type"],
+                "Original Severity": entry["original_severity"].capitalize(),
+                "Strategy": entry["strategy_applied"],
+                "Final Severity": entry["final_severity"].capitalize(),
+            })
 
-        drop_table, drop_chart = st.columns([1, 1])
-        with drop_table:
-            st.dataframe(pd.DataFrame(drop_info), use_container_width=True, hide_index=True)
+        action_table, action_chart = st.columns([1, 1])
+        with action_table:
+            st.dataframe(pd.DataFrame(action_rows), use_container_width=True, hide_index=True)
 
-        with drop_chart:
-            # Show feature count: kept vs dropped
-            n_kept = len([c for c in train.columns if c not in set(drop_cols + feature_types.get("id", []) + feature_types.get("target", []))])
+        with action_chart:
+            n_all_features = len([c for c in train.columns if c not in set(feature_types.get("id", []) + feature_types.get("target", []))])
+            n_dropped = len(drop_cols)
+            n_mitigated = len([e for e in mitigation_log if e["strategy_applied"] != "Dropped"])
+            n_kept = n_all_features - n_dropped - n_mitigated
+            labels = ["Untouched", "Mitigated", "Dropped"]
+            values = [n_kept, n_mitigated, n_dropped]
+            colors = ["#636EFA", "#00CC96", "#EF553B"]
             fig = go.Figure(go.Pie(
-                labels=["Kept", "Dropped"],
-                values=[n_kept, len(drop_cols)],
-                hole=0.45,
-                marker_colors=["#636EFA", "#EF553B"],
+                labels=labels, values=values, hole=0.45,
+                marker_colors=colors,
             ))
             fig.update_layout(
                 template=PLOTLY_TEMPLATE, height=300,
-                title=f"Features: {n_kept} kept, {len(drop_cols)} dropped",
+                title=f"Features: {n_kept} untouched, {n_mitigated} mitigated, {n_dropped} dropped",
                 margin=dict(t=40, b=20, l=20, r=20),
             )
             st.plotly_chart(fig, use_container_width=True)
 
         st.markdown(
-            "Features with **high drift severity** are dropped from the mitigated model. "
-            "These features have distributions that shifted substantially between train and test, "
-            "risking concept drift where learned relationships no longer hold. "
-            "After dropping, the remaining features show negligible covariate shift "
-            "(adversarial AUC ~0.50)."
+            "High-drift features are progressively mitigated using graduated strategies "
+            "(clipping, log transform, binning, rare-category grouping, cyclical encoding). "
+            "Features are only **dropped as a last resort** when all strategies fail to reduce "
+            "drift below the high-severity threshold."
+        )
+    elif drop_cols:
+        st.dataframe(
+            pd.DataFrame({"Dropped Features": drop_cols}),
+            use_container_width=True, hide_index=True,
         )
     else:
-        st.info("No features were dropped.")
+        st.info("No high-drift features detected — no mitigation needed.")
 
     st.divider()
 
