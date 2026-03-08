@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from lightgbm import LGBMClassifier
 from sklearn.metrics import average_precision_score
-from sklearn.model_selection import KFold
+from sklearn.model_selection import StratifiedKFold
 import joblib
 from utils import logger
 
@@ -110,7 +110,7 @@ def prepare_features(
     cat_cols = [c for c in feature_cols if X_train[c].dtype == object]
     global_mean = y_train.mean()
     from utils import safe_n_splits
-    kf = KFold(n_splits=safe_n_splits(len(X_train)), shuffle=True, random_state=42)
+    kf = StratifiedKFold(n_splits=safe_n_splits(len(X_train)), shuffle=True, random_state=42)
 
     smoothing_m = 10  # Bayesian smoothing: shrink low-count category means toward global mean
 
@@ -125,7 +125,7 @@ def prepare_features(
 
         # K-fold target encoding for train (avoids leakage)
         train_encoded = pd.Series(np.full(len(X_train), np.nan), index=X_train.index)
-        for train_idx, val_idx in kf.split(X_train):
+        for train_idx, val_idx in kf.split(X_train, y_train):
             fold_y = y_train.iloc[train_idx]
             fold_raw = raw_train.iloc[train_idx]
             fold_counts = fold_y.groupby(fold_raw).count()

@@ -326,7 +326,7 @@ def main():
         # --- Sample weight tournament with cross-validation ---
         import numpy as np
         from sklearn.metrics import average_precision_score
-        from sklearn.model_selection import KFold as KFoldWeight
+        from sklearn.model_selection import StratifiedKFold as SKFoldWeight
         from utils import safe_n_splits
 
         train_oof_proba = shift_info.get("train_oof_proba")
@@ -379,8 +379,8 @@ def main():
             best_cv_score = 0.0
         else:
             logger.info(f"Weight tournament: {len(candidates)} candidates, {n_cv_folds}-fold CV")
-            kf_w = KFoldWeight(n_splits=n_cv_folds, shuffle=True, random_state=42)
-            cv_splits = list(kf_w.split(X_train_m))
+            kf_w = SKFoldWeight(n_splits=n_cv_folds, shuffle=True, random_state=42)
+            cv_splits = list(kf_w.split(X_train_m, y_train_m))
 
             best_cv_score = -1.0
             best_label = "Uniform"

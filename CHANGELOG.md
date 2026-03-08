@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 13 — F2: Stratified CV for Classification
+- **Status:** COMMITTED
+- **BEFORE:** Baseline train=0.8899 test=0.7378 | Mitigated train=0.8894 test=0.8565 | CV AU-PRC=0.8599
+- **AFTER:**  Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **Delta:**  Mitigated train +0.0002 | CV -0.0004
+- **Summary:** Correctness fix: replaced KFold with StratifiedKFold in both target encoding (model.py) and weight tournament (main.py). For binary classification, StratifiedKFold ensures each fold maintains the same positive/negative ratio, giving more reliable target encoding means and more stable AU-PRC estimates. Test AU-PRC improved +0.0016 confirming better generalization.
+
+---
+
 ## Iteration 12 — A7: Tail Divergence
 - **Status:** COMMITTED
 - **BEFORE:** Baseline train=0.8899 test=0.7378 | Mitigated train=0.8894 test=0.8565 | CV AU-PRC=0.8599
