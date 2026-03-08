@@ -71,9 +71,6 @@ def get_drift_drop_columns(
             if col not in drops:
                 drops.append(col)
 
-    if drops:
-        logger.info(f"Drift-informed drops ({len(drops)} features): {drops}")
-
     return drops
 
 

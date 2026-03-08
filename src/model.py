@@ -116,15 +116,25 @@ def evaluate_and_save(
 
     # Print metrics
     metrics = {"train_auprc": train_auprc}
-    print("\n" + "=" * 70)
-    print("MODEL PERFORMANCE")
-    print("=" * 70)
-    print(f"  AU-PRC (train): {train_auprc:.4f}")
     if test_auprc is not None:
-        print(f"  AU-PRC (test):  {test_auprc:.4f}")
         metrics["test_auprc"] = test_auprc
-    else:
-        print("  AU-PRC (test):  N/A (no labels in test set)")
-    print("=" * 70)
+
+    CW = (24, 14)
+    total = CW[0] + CW[1] + 1  # +1 for middle border
+    title = "MODEL PERFORMANCE SUMMARY"
+    rows = [
+        ("AU-PRC (train)", f"{train_auprc:.4f}"),
+        ("AU-PRC (test)", f"{test_auprc:.4f}" if test_auprc is not None else "N/A"),
+    ]
+
+    print()
+    print(f"╔{'═' * total}╗")
+    print(f"║{title:^{total}}║")
+    print(f"╠{'═' * CW[0]}╦{'═' * CW[1]}╣")
+    print(f"║{'Metric':<{CW[0]}}║{'Value':^{CW[1]}}║")
+    print(f"╠{'═' * CW[0]}╬{'═' * CW[1]}╣")
+    for label, value in rows:
+        print(f"║ {label:<{CW[0] - 1}}║ {value:<{CW[1] - 1}}║")
+    print(f"╚{'═' * CW[0]}╩{'═' * CW[1]}╝")
 
     return metrics

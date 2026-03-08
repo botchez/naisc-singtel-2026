@@ -1,8 +1,6 @@
 import pandas as pd
 import numpy as np
 from scipy import stats
-from utils import logger
-
 
 def compute_psi(expected: np.ndarray, actual: np.ndarray, bins: int = 10) -> float:
     """Population Stability Index between two distributions."""
@@ -147,11 +145,6 @@ def run_drift_analysis(
     drift_df = pd.DataFrame(results)
     if not drift_df.empty:
         drift_df = drift_df.sort_values("severity", key=lambda s: s.map({"high": 0, "moderate": 1, "low": 2, "unknown": 3}))
-
-    n_high = (drift_df["severity"] == "high").sum() if not drift_df.empty else 0
-    n_mod = (drift_df["severity"] == "moderate").sum() if not drift_df.empty else 0
-    n_low = (drift_df["severity"] == "low").sum() if not drift_df.empty else 0
-    logger.info(f"Drift analysis complete: {n_high} high, {n_mod} moderate, {n_low} low severity features")
 
     return drift_df
 
