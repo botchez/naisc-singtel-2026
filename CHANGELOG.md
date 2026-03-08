@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 10 — B3: Quantile Matching
+- **Status:** REVERTED
+- **BEFORE:** Baseline train=0.8899 test=0.7378 | Mitigated train=0.8894 test=0.8561 | CV AU-PRC=0.8599
+- **AFTER:**  Baseline train=0.8899 test=0.7378 | Mitigated train=0.8915 test=0.7893 | CV AU-PRC=0.8615
+- **Delta:**  Mitigated train +0.0021 | CV +0.0016
+- **Reason:** Test AU-PRC dropped by 0.0668 (catastrophic). Quantile matching successfully reduced drift metrics (domain AUC 0.9244→0.8957, moderate features resolved to low) but had a critical side effect: NumberofReferrals and AvgMonthlyLongDistanceCharges were no longer dropped (high→moderate/low), retaining features where marginal distributions were artificially aligned but feature-target relationships still diverged. Also enabled non-uniform weights (Blend won tournament) calibrated to transformed data. Lesson: reducing drift statistics does not guarantee improved generalization when the drift is informative of changed feature-target relationships.
+
+---
+
 ## Iteration 9 — A5: Domain Classifier Feature Importance
 - **Status:** COMMITTED
 - **BEFORE:** Baseline train=0.8899 test=0.7378 | Mitigated train=0.8894 test=0.8561 | CV AU-PRC=0.8599
