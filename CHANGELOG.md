@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 4 — C1: Difference Features
+- **Status:** REVERTED
+- **BEFORE:** Baseline train=0.8904 test=0.7317 | Mitigated train=0.8894 test=0.8580 | CV AU-PRC=0.8592
+- **AFTER:**  Baseline train=0.8904 test=0.7317 | Mitigated train=0.8890 test=0.8540 | CV AU-PRC=0.8600
+- **Delta:**  Mitigated train -0.0004 | CV +0.0008
+- **Reason:** Test AU-PRC dropped by 0.0040 (exceeds 0.002 revert threshold). The 5 difference features (A-B for top correlated pairs) added noise that hurt test generalization despite slight CV improvement. Winner changed from Blend(a=0.5,p=0.5) to Uniform.
+
+---
+
 ## Iteration 3 — A3: IQR Shift Detection
 - **Status:** COMMITTED
 - **BEFORE:** Baseline train=0.8904 test=0.7317 | Mitigated train=0.8894 test=0.8580 | CV AU-PRC=0.8592
