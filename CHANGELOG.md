@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 26 — Bug Fix: Normalization Converts NaN to "nan" String
+- **Status:** REVERTED
+- **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **AFTER:**  Baseline train=0.8891 test=0.7352 | Mitigated train=0.8891 test=0.8540 | CV AU-PRC=0.8600
+- **Delta:**  Mitigated train -0.0005 | test -0.0041 | CV +0.0005
+- **Reason:** Fixed `normalize_data_quality` to preserve NaN values through `.astype(str)` conversion (which turns NaN into literal "nan" string, losing missing value information for downstream `isna()` checks and missing indicators). Correct for hidden datasets with NaN categoricals, but on this dataset the fix subtly changed feature values, causing the weight tournament to pick Blend(a=0.5,p=0.5) over Uniform, which hurt test generalization (-0.0041). Same instability pattern as iterations 18 and 21.
+
+---
+
 ## Iteration 25 — Bug Fix: BH Correction Drops Missingness Escalation
 - **Status:** COMMITTED
 - **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
