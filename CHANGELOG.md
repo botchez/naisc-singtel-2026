@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 12 — A7: Tail Divergence
+- **Status:** COMMITTED
+- **BEFORE:** Baseline train=0.8899 test=0.7378 | Mitigated train=0.8894 test=0.8565 | CV AU-PRC=0.8599
+- **AFTER:**  Baseline train=0.8899 test=0.7378 | Mitigated train=0.8894 test=0.8565 | CV AU-PRC=0.8599
+- **Delta:**  Mitigated train +0.0000 | CV +0.0000
+- **Summary:** Added tail divergence detection: measures max shift in 1st/99th percentiles normalized by training std. If tail_div > 2.0 with PSI >= 0.05, escalates to high; if > 1.0 with PSI >= 0.03, escalates to moderate. No effect on this dataset (no extreme tail shifts exist), but catches hidden-dataset scenarios where distribution tails diverge while the bulk looks similar — a gap not covered by histogram-based PSI.
+
+---
+
 ## Iteration 11 — B3b: Quantile Matching (moderate-only)
 - **Status:** COMMITTED
 - **BEFORE:** Baseline train=0.8899 test=0.7378 | Mitigated train=0.8894 test=0.8561 | CV AU-PRC=0.8599

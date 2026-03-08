@@ -113,7 +113,14 @@ def detect_numerical_drift(
     test_iqr = test_q3 - test_q1
     iqr_ratio = test_iqr / (train_iqr + 1e-8)
 
-    severity = _numerical_severity(ks_pval, psi, wasserstein_norm, ks_stat, iqr_ratio)
+    # Tail divergence: extreme percentile shifts not captured by histogram-based PSI
+    train_p1, train_p99 = np.percentile(train_vals, [1, 99])
+    test_p1, test_p99 = np.percentile(test_vals, [1, 99])
+    tail_low = abs(test_p1 - train_p1) / (std_train + 1e-8)
+    tail_high = abs(test_p99 - train_p99) / (std_train + 1e-8)
+    tail_div = max(tail_low, tail_high)
+
+    severity = _numerical_severity(ks_pval, psi, wasserstein_norm, ks_stat, iqr_ratio, tail_div)
     severity = _escalate_severity(severity, miss_sev)
 
     return {
@@ -123,6 +130,7 @@ def detect_numerical_drift(
         "wasserstein": round(wasserstein, 4),
         "wasserstein_norm": round(wasserstein_norm, 4),
         "iqr_ratio": round(iqr_ratio, 4),
+        "tail_divergence": round(tail_div, 4),
         "train_null_pct": round(train_null_pct, 4),
         "test_null_pct": round(test_null_pct, 4),
         "severity": severity,
@@ -198,11 +206,13 @@ def detect_categorical_drift(
 
 
 def _numerical_severity(ks_pval: float, psi: float, wasserstein_norm: float = 0.0,
-                        ks_stat: float = 0.0, iqr_ratio: float = 1.0) -> str:
+                        ks_stat: float = 0.0, iqr_ratio: float = 1.0,
+                        tail_div: float = 0.0) -> str:
     """Classify drift severity for numerical features.
 
     Uses PSI, KS p-value, KS D-statistic (effect size), normalized Wasserstein
-    distance, and IQR ratio (test_iqr / train_iqr) for spread shift detection.
+    distance, IQR ratio (test_iqr / train_iqr), and tail divergence (max shift
+    in 1st/99th percentiles normalized by training std).
     """
     if psi >= 0.25:
         return "high"
@@ -217,7 +227,12 @@ def _numerical_severity(ks_pval: float, psi: float, wasserstein_norm: float = 0.
     # IQR spread change > 2x (or < 0.5x) combined with moderate PSI
     if (iqr_ratio > 2.0 or iqr_ratio < 0.5) and psi >= 0.1:
         return "high"
+    # Tail divergence: extreme percentile shift (>2 std) with any PSI signal
+    if tail_div > 2.0 and psi >= 0.05:
+        return "high"
     if psi >= 0.1 or (ks_pval < 0.05 and ks_stat >= 0.05) or (wasserstein_norm >= 0.3 and psi >= 0.05):
+        return "moderate"
+    if tail_div > 1.0 and psi >= 0.03:
         return "moderate"
     return "low"
 
@@ -359,7 +374,8 @@ def _apply_bh_correction(drift_df: pd.DataFrame) -> pd.DataFrame:
             w_norm = row.get("wasserstein_norm") or 0.0
             ks_d = row.get("ks_stat") or 0.0
             iqr_r = row.get("iqr_ratio") or 1.0
-            drift_df.loc[idx, "severity"] = _numerical_severity(ks_p, psi, w_norm, ks_d, iqr_r)
+            t_div = row.get("tail_divergence") or 0.0
+            drift_df.loc[idx, "severity"] = _numerical_severity(ks_p, psi, w_norm, ks_d, iqr_r, t_div)
         elif row["feature_type"] in ("categorical", "temporal"):
             chi2_p = row.get("chi2_pval_bh", row.get("chi2_pval", 1.0))
             if pd.isna(chi2_p):
