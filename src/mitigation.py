@@ -53,15 +53,18 @@ def normalize_data_quality(
     test_clean = test.copy()
     norm_log: dict[str, list[str]] = {}
 
-    # City abbreviation mapping (before lowercasing)
-    city_col = "LocationCity"
-    if city_col in train_clean.columns:
-        abbreviation_map = detect_abbreviation_mappings(train_clean, test_clean, city_col)
+    # Auto-detect abbreviation mappings on all categorical object columns
+    for col in feature_types.get("categorical", []) + feature_types.get("temporal", []):
+        if col in skip_cols or col not in train_clean.columns or col not in test_clean.columns:
+            continue
+        if train_clean[col].dtype != object:
+            continue
+        abbreviation_map = detect_abbreviation_mappings(train_clean, test_clean, col)
         if abbreviation_map:
             for df in [train_clean, test_clean]:
-                df[city_col] = df[city_col].replace(abbreviation_map)
-            logger.info(f"Auto-detected city abbreviation mappings: {abbreviation_map}")
-            norm_log.setdefault(city_col, []).append("City names standardized")
+                df[col] = df[col].replace(abbreviation_map)
+            logger.info(f"Auto-detected abbreviation mappings in '{col}': {abbreviation_map}")
+            norm_log.setdefault(col, []).append("Abbreviations standardized")
 
     # Lowercase + hyphen removal on all object columns
     normalized = []
@@ -131,9 +134,15 @@ def group_rare_categories(
 def encode_temporal_cyclical(
     train_col: pd.Series, test_col: pd.Series
 ) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
-    """Parse %y-%b -> month -> sin/cos pair. Returns (train_sin, train_cos, test_sin, test_cos)."""
+    """Parse temporal -> month -> sin/cos pair. Returns (train_sin, train_cos, test_sin, test_cos)."""
     def _to_month(s: pd.Series) -> pd.Series:
-        return pd.to_datetime(s, format="%y-%b", errors="coerce").dt.month.fillna(1).astype(float)
+        # Title-case to restore month abbreviations after lowercase normalization
+        s_title = s.astype(str).str.title()
+        for fmt in ["%y-%b", "%b-%y", "%Y-%m", "%m-%Y", "%b %Y", "%Y-%b"]:
+            parsed = pd.to_datetime(s_title, format=fmt, errors="coerce")
+            if parsed.notna().sum() > len(s) * 0.5:
+                return parsed.dt.month.fillna(1).astype(float)
+        return pd.Series(np.ones(len(s)), index=s.index)
 
     train_month = _to_month(train_col)
     test_month = _to_month(test_col)

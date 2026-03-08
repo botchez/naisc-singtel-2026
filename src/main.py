@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import pandas as pd
-from profiler import load_data, detect_feature_types, profile_data
+from profiler import load_data, detect_feature_types, profile_data, align_train_test_columns
 from drift_detector import run_drift_analysis
 from model import prepare_features, train_model, evaluate_and_save, print_model_performance_summary
 from mitigation import apply_all_mitigations
@@ -218,7 +218,8 @@ def main():
 
     # --- Stage 1: Data Ingestion & Profiling ---
     train, test = load_data(args.train_data_filepath, args.test_data_filepath)
-    feature_types = detect_feature_types(train)
+    train, test = align_train_test_columns(train, test)
+    feature_types = detect_feature_types(train, test_df=test)
     profile_data(train, feature_types, label="train")
     profile_data(test, feature_types, label="test")
 
