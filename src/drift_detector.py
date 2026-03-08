@@ -532,6 +532,69 @@ def detect_multivariate_shift(
     }
 
 
+def detect_label_shift(
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    feature_types: dict[str, list[str]],
+) -> dict | None:
+    """Detect prior probability shift in the target between train and test.
+
+    Compares target class distribution (churn rate) between datasets.
+    Returns None if test target is not available.
+    """
+    from utils import logger
+
+    target_cols = feature_types.get("target", [])
+    target_col = target_cols[0] if target_cols else None
+    if target_col is None or target_col not in train.columns:
+        return None
+    if target_col not in test.columns or test[target_col].isna().all():
+        logger.info("Label shift detection skipped: no target in test")
+        return None
+
+    try:
+        from model import _encode_target
+        y_train = _encode_target(train[target_col])
+        y_test = _encode_target(test[target_col])
+
+        train_rate = float(y_train.mean())
+        test_rate = float(y_test.mean())
+        rate_diff = abs(test_rate - train_rate)
+
+        # Proportion test (chi-squared)
+        n_train, n_test = len(y_train), len(y_test)
+        contingency = np.array([
+            [int(y_train.sum()), n_train - int(y_train.sum())],
+            [int(y_test.sum()), n_test - int(y_test.sum())],
+        ])
+        chi2_stat, chi2_pval, _, _ = stats.chi2_contingency(contingency)
+
+        # Classify severity
+        if rate_diff > 0.10 and chi2_pval < 0.001:
+            severity = "high"
+        elif rate_diff > 0.03 or chi2_pval < 0.05:
+            severity = "moderate"
+        else:
+            severity = "low"
+
+        logger.info(
+            f"Label shift: train churn={train_rate:.4f}, test churn={test_rate:.4f}, "
+            f"diff={rate_diff:.4f}, severity={severity}"
+        )
+
+        return {
+            "train_rate": round(train_rate, 4),
+            "test_rate": round(test_rate, 4),
+            "rate_diff": round(rate_diff, 4),
+            "chi2_stat": round(chi2_stat, 4),
+            "chi2_pval": round(chi2_pval, 6),
+            "severity": severity,
+        }
+    except Exception as e:
+        logger.warning(f"Label shift detection failed: {e}")
+        return None
+
+
 def detect_intra_training_drift(
     train: pd.DataFrame,
     feature_types: dict[str, list[str]],

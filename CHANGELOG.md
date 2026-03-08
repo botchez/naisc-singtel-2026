@@ -1,5 +1,23 @@
 # Changelog
 
+## Iteration 20 — A6: Label Shift Detection
+- **Status:** COMMITTED
+- **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **AFTER:**  Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **Delta:**  Mitigated train +0.0000 | CV +0.0000
+- **Summary:** Added label shift detection to compare target class distribution (churn rate) between train and test. Uses chi-squared proportion test for significance. On this dataset: train churn=0.2879, test churn=0.2874, diff=0.0004 — no label shift. Diagnostic only, but catches hidden-dataset scenarios where prior probability has shifted, which would require calibration or threshold adjustment.
+
+---
+
+## Iteration 19 — Post-Engineering Quantile Match for Moderate Drift
+- **Status:** REVERTED
+- **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **AFTER:**  Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8583 | CV AU-PRC=0.8595
+- **Delta:**  Mitigated train 0.0000 | test +0.0002 | CV 0.0000
+- **Reason:** Extended post-engineering drift check to try clip_outliers then quantile_match for moderate-drift engineered features. Completely neutral — no engineered features had moderate drift in practice (all were either high or low). The code added complexity with zero benefit.
+
+---
+
 ## Iteration 18 — Target Encoding 10-Fold CV
 - **Status:** REVERTED
 - **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595

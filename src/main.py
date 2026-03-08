@@ -10,7 +10,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import pandas as pd
 from profiler import load_data, detect_feature_types, profile_data, align_train_test_columns
-from drift_detector import run_drift_analysis, detect_intra_training_drift
+from drift_detector import run_drift_analysis, detect_intra_training_drift, detect_label_shift
 from model import prepare_features, train_model, evaluate_and_save, print_model_performance_summary
 from mitigation import apply_all_mitigations, compute_domain_weights, compute_recency_weights
 from feature_engineer import engineer_features
@@ -271,6 +271,8 @@ def main():
     # --- Stage 2: Drift Detection (train vs test) ---
     with Timer("Drift detection") as drift_timer:
         drift_df = run_drift_analysis(train, test, feature_types)
+        # Label shift detection (prior probability shift)
+        label_shift_info = detect_label_shift(train, test, feature_types)
         # Intra-training temporal drift detection
         intra_drift_df, month_rank = detect_intra_training_drift(train, feature_types)
 
@@ -297,12 +299,6 @@ def main():
                 test_m = test_m.drop(columns=[col])
                 eng_dropped.append(col)
                 drop_cols.append(col)
-            elif drift["severity"] == "moderate":
-                tr_clipped, te_clipped = clip_outliers(train_m[col], test_m[col])
-                d2 = detect_numerical_drift(tr_clipped, te_clipped)
-                if d2["severity"] == "low":
-                    train_m[col] = tr_clipped.values
-                    test_m[col] = te_clipped.values
         if eng_dropped:
             logger.info(f"Dropped {len(eng_dropped)} high-drift engineered features: {eng_dropped}")
 
