@@ -4,6 +4,9 @@ from scipy import stats
 
 def compute_psi(expected: np.ndarray, actual: np.ndarray, bins: int = 10) -> float:
     """Population Stability Index between two distributions."""
+    # Adapt bins to sample size to avoid sparse bins
+    n_valid = len(expected[~np.isnan(expected)])
+    bins = min(bins, max(2, n_valid // 20))
     # Use shared bin edges from expected
     breakpoints = np.linspace(0, 100, bins + 1)
     edges = np.percentile(expected[~np.isnan(expected)], breakpoints)
@@ -47,15 +50,42 @@ def _bh_correct(pvals: np.ndarray) -> np.ndarray:
     return result
 
 
+def _missingness_severity(train_null_pct: float, test_null_pct: float) -> str:
+    """Classify severity of missingness drift between train and test."""
+    null_diff = abs(test_null_pct - train_null_pct)
+    null_ratio = test_null_pct / max(train_null_pct, 0.001)
+    if null_diff > 0.20 or (null_ratio > 5 and test_null_pct > 0.05):
+        return "high"
+    if null_diff > 0.05 or (null_ratio > 2 and test_null_pct > 0.02):
+        return "moderate"
+    return "low"
+
+
+_SEVERITY_RANK = {"high": 2, "moderate": 1, "low": 0, "unknown": -1}
+
+
+def _escalate_severity(base: str, missingness: str) -> str:
+    """Return the worse of two severity levels."""
+    if _SEVERITY_RANK.get(missingness, -1) > _SEVERITY_RANK.get(base, -1):
+        return missingness
+    return base
+
+
 def detect_numerical_drift(
     train_col: pd.Series, test_col: pd.Series
 ) -> dict:
     """Run drift tests on a single numerical feature."""
+    train_null_pct = float(train_col.isna().mean())
+    test_null_pct = float(test_col.isna().mean())
+    miss_sev = _missingness_severity(train_null_pct, test_null_pct)
+
     train_vals = train_col.dropna().values.astype(float)
     test_vals = test_col.dropna().values.astype(float)
 
     if len(train_vals) == 0 or len(test_vals) == 0:
-        return {"ks_stat": None, "ks_pval": None, "psi": None, "wasserstein": None, "wasserstein_norm": None, "severity": "unknown"}
+        return {"ks_stat": None, "ks_pval": None, "psi": None, "wasserstein": None,
+                "wasserstein_norm": None, "train_null_pct": round(train_null_pct, 4),
+                "test_null_pct": round(test_null_pct, 4), "severity": _escalate_severity("unknown", miss_sev)}
 
     ks_stat, ks_pval = stats.ks_2samp(train_vals, test_vals)
     psi = compute_psi(train_vals, test_vals)
@@ -66,6 +96,7 @@ def detect_numerical_drift(
     wasserstein_norm = wasserstein / (std_train + 1e-8)
 
     severity = _numerical_severity(ks_pval, psi, wasserstein_norm)
+    severity = _escalate_severity(severity, miss_sev)
 
     return {
         "ks_stat": round(ks_stat, 4),
@@ -73,6 +104,8 @@ def detect_numerical_drift(
         "psi": round(psi, 4),
         "wasserstein": round(wasserstein, 4),
         "wasserstein_norm": round(wasserstein_norm, 4),
+        "train_null_pct": round(train_null_pct, 4),
+        "test_null_pct": round(test_null_pct, 4),
         "severity": severity,
     }
 
@@ -81,24 +114,44 @@ def detect_categorical_drift(
     train_col: pd.Series, test_col: pd.Series
 ) -> dict:
     """Run drift tests on a single categorical feature."""
+    train_null_pct = float(train_col.isna().mean())
+    test_null_pct = float(test_col.isna().mean())
+    miss_sev = _missingness_severity(train_null_pct, test_null_pct)
+
     all_categories = sorted(set(train_col.dropna().unique()) | set(test_col.dropna().unique()))
 
     if len(all_categories) == 0:
-        return {"chi2_stat": None, "chi2_pval": None, "jsd": None, "unseen_in_test": [], "severity": "unknown"}
+        return {"chi2_stat": None, "chi2_pval": None, "jsd": None, "unseen_in_test": [],
+                "train_null_pct": round(train_null_pct, 4), "test_null_pct": round(test_null_pct, 4),
+                "severity": _escalate_severity("unknown", miss_sev)}
 
     train_counts = train_col.value_counts().reindex(all_categories, fill_value=0).values.astype(float)
     test_counts = test_col.value_counts().reindex(all_categories, fill_value=0).values.astype(float)
 
-    # Chi-squared test on proportions
-    # Create contingency-style table
-    contingency = np.array([train_counts, test_counts])
+    # JSD on full distribution (always reliable)
+    jsd = compute_jsd(train_counts, test_counts)
+
+    # Chi-squared: for high-cardinality columns, group rare categories into _other
+    # to avoid sparse contingency tables inflating chi2
+    n_categories = len(all_categories)
+    if n_categories > 50:
+        # Keep top-K by combined frequency, merge rest into _other
+        combined = train_counts + test_counts
+        top_k = 30
+        top_idx = np.argsort(combined)[-top_k:]
+        other_train = train_counts.sum() - train_counts[top_idx].sum()
+        other_test = test_counts.sum() - test_counts[top_idx].sum()
+        chi2_train = np.append(train_counts[top_idx], other_train)
+        chi2_test = np.append(test_counts[top_idx], other_test)
+        contingency = np.array([chi2_train, chi2_test])
+    else:
+        contingency = np.array([train_counts, test_counts])
+
     # Only run chi2 if we have sufficient data
     if contingency.sum() > 0 and np.all(contingency.sum(axis=0) > 0):
         chi2_stat, chi2_pval, _, _ = stats.chi2_contingency(contingency)
     else:
         chi2_stat, chi2_pval = 0.0, 1.0
-
-    jsd = compute_jsd(train_counts, test_counts)
 
     # Unseen categories in test
     train_cats = set(train_col.dropna().unique())
@@ -106,12 +159,15 @@ def detect_categorical_drift(
     unseen_in_test = sorted(test_cats - train_cats)
 
     severity = _categorical_severity(chi2_pval, jsd)
+    severity = _escalate_severity(severity, miss_sev)
 
     return {
         "chi2_stat": round(chi2_stat, 4),
         "chi2_pval": round(chi2_pval, 6),
         "jsd": round(jsd, 4),
         "unseen_in_test": unseen_in_test,
+        "train_null_pct": round(train_null_pct, 4),
+        "test_null_pct": round(test_null_pct, 4),
         "severity": severity,
     }
 
@@ -373,6 +429,10 @@ def detect_multivariate_shift(
     X_all = pd.concat([X_tr, X_te], ignore_index=True)
     y_domain = np.array([0] * len(X_tr) + [1] * len(X_te))
 
+    # Adapt fold count for small datasets
+    from utils import safe_n_splits
+    n_splits = safe_n_splits(len(X_all), desired=n_splits, min_per_fold=20)
+
     # Stratified k-fold cross-validation
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     oof_proba = np.zeros(len(X_all))
@@ -433,7 +493,8 @@ def detect_intra_training_drift(
     # Parse temporal column to month ordering
     raw = train[temporal_col].astype(str).str.title()
     month_series = None
-    for fmt in ["%y-%b", "%b-%y", "%Y-%m", "%m-%Y", "%b %Y", "%Y-%b"]:
+    for fmt in ["%y-%b", "%b-%y", "%Y-%m", "%m-%Y", "%b %Y", "%Y-%b",
+                "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"]:
         parsed = pd.to_datetime(raw, format=fmt, errors="coerce")
         if parsed.notna().sum() > len(train) * 0.5:
             month_series = parsed.dt.to_period("M").astype(str)

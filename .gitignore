@@ -10,3 +10,5 @@ challenge_images/
 information/
 test_data/
 .claude/
+*.png
+CODEBASE_BREAKDOWN.md

@@ -14,7 +14,7 @@ from drift_detector import run_drift_analysis, detect_intra_training_drift
 from model import prepare_features, train_model, evaluate_and_save, print_model_performance_summary
 from mitigation import apply_all_mitigations, compute_domain_weights, compute_recency_weights
 from feature_engineer import engineer_features
-from utils import Timer
+from utils import Timer, logger
 
 
 def print_drift_mitigation_summary(
@@ -282,7 +282,29 @@ def main():
 
     # --- Stage 4: Feature Engineering ---
     with Timer("Feature engineering") as feat_timer:
-        train_m, test_m = engineer_features(train_m, test_m, feature_types)
+        train_m, test_m, new_feature_names = engineer_features(train_m, test_m, feature_types)
+
+        # Post-engineering drift check: drop high-drift engineered features
+        from drift_detector import detect_numerical_drift
+        from mitigation import clip_outliers
+        eng_dropped = []
+        for col in new_feature_names:
+            if col not in train_m.columns or col not in test_m.columns:
+                continue
+            drift = detect_numerical_drift(train_m[col], test_m[col])
+            if drift["severity"] == "high":
+                train_m = train_m.drop(columns=[col])
+                test_m = test_m.drop(columns=[col])
+                eng_dropped.append(col)
+                drop_cols.append(col)
+            elif drift["severity"] == "moderate":
+                tr_clipped, te_clipped = clip_outliers(train_m[col], test_m[col])
+                d2 = detect_numerical_drift(tr_clipped, te_clipped)
+                if d2["severity"] == "low":
+                    train_m[col] = tr_clipped.values
+                    test_m[col] = te_clipped.values
+        if eng_dropped:
+            logger.info(f"Dropped {len(eng_dropped)} high-drift engineered features: {eng_dropped}")
 
     # --- Stage 5: Model Training & Prediction ---
     with Timer("Model training") as model_timer:
@@ -301,66 +323,100 @@ def main():
             train_m, test_m, feature_types, extra_drop_cols=drop_cols
         )
 
-        # --- Sample weight selection: try domain, recency, and combined ---
+        # --- Sample weight tournament with cross-validation ---
         import numpy as np
         from sklearn.metrics import average_precision_score
+        from sklearn.model_selection import KFold as KFoldWeight
+        from utils import safe_n_splits
 
         train_oof_proba = shift_info.get("train_oof_proba")
-        recency_weights = compute_recency_weights(month_rank) if month_rank is not None else None
+        has_domain = train_oof_proba is not None and shift_info.get("shift_detected", False)
+        has_recency = month_rank is not None
 
-        # Baseline: unweighted mitigated model
-        lgbm_unweighted = train_model(X_train_m, y_train_m)
+        # Build reduced candidate weight vectors (Gap 9: pruned grid)
+        candidates = [("Uniform", None)]
 
-        # Check if test labels available for validation
-        target_col = feature_types["target"][0] if feature_types["target"] else None
-        has_test_labels = (target_col and target_col in test_m.columns
-                          and test_m[target_col].notna().any())
-
-        def _eval_model(model):
-            """Evaluate model: test AU-PRC if available, else train AU-PRC."""
-            if has_test_labels:
-                from model import _encode_target
-                y_test_v = _encode_target(test_m[target_col])
-                return average_precision_score(y_test_v, model.predict_proba(X_test_m)[:, 1])
-            return average_precision_score(y_train_m, model.predict_proba(X_train_m)[:, 1])
-
-        best_model = lgbm_unweighted
-        best_score = _eval_model(best_model)
-        weight_status = "Uniform (1.0)"
-
-        # Build candidate weight variants
-        candidates = []
-
-        # Domain weights at different power levels
-        if train_oof_proba is not None and shift_info.get("shift_detected", False):
-            for power in [0.3, 0.5, 0.7]:
+        if has_domain:
+            for power in [0.3, 0.5, 0.7, 1.0]:
                 w = compute_domain_weights(train_oof_proba, power=power)
                 if w is not None:
-                    candidates.append((f"Domain-weighted (p={power})", w))
+                    candidates.append((f"Domain(p={power})", w))
 
-        # Recency weights
-        if recency_weights is not None:
-            candidates.append(("Recency-weighted", recency_weights))
+        if has_recency:
+            for decay in [0.10, 0.20, 0.40]:
+                rw = compute_recency_weights(month_rank, decay=decay)
+                if rw is not None:
+                    candidates.append((f"Recency(d={decay})", rw))
 
-            # Combined: domain x recency (if both available)
-            if train_oof_proba is not None and shift_info.get("shift_detected", False):
-                for power in [0.3, 0.5]:
-                    dw = compute_domain_weights(train_oof_proba, power=power)
-                    if dw is not None:
-                        combined = dw * recency_weights
-                        combined = combined / combined.mean()  # re-normalize
-                        candidates.append((f"Domain(p={power})+Recency", combined))
+        # Multiplicative: domain x recency (reduced combos)
+        if has_domain and has_recency:
+            for power, decay in [(0.3, 0.15), (0.5, 0.15), (0.5, 0.20), (0.7, 0.20)]:
+                dw = compute_domain_weights(train_oof_proba, power=power)
+                rw = compute_recency_weights(month_rank, decay=decay)
+                if dw is not None and rw is not None:
+                    combined = dw * rw
+                    combined = combined / combined.mean()
+                    candidates.append((f"Domain(p={power})xRecency(d={decay})", combined))
 
-        # Evaluate all candidates
-        for label, weights in candidates:
-            candidate = train_model(X_train_m, y_train_m, sample_weight=weights)
-            score = _eval_model(candidate)
-            if score > best_score:
-                best_model = candidate
-                best_score = score
-                weight_status = label
+        # Additive blends (reduced)
+        if has_domain and has_recency:
+            for alpha, power in [(0.3, 0.5), (0.5, 0.5), (0.7, 0.5), (0.5, 0.7)]:
+                dw = compute_domain_weights(train_oof_proba, power=power)
+                rw = compute_recency_weights(month_rank, decay=0.15)
+                if dw is not None and rw is not None:
+                    blended = alpha * dw + (1 - alpha) * rw
+                    blended = blended / blended.mean()
+                    candidates.append((f"Blend(a={alpha},p={power})", blended))
 
-        lgbm_m = best_model
+        # --- Cross-validation evaluation with early stopping ---
+        n_cv_folds = safe_n_splits(len(X_train_m))
+
+        # Skip tournament for very small datasets
+        if len(X_train_m) < 50:
+            logger.info("Dataset too small for weight tournament; using uniform weights")
+            best_label = "Uniform"
+            best_weights = None
+            best_cv_score = 0.0
+        else:
+            logger.info(f"Weight tournament: {len(candidates)} candidates, {n_cv_folds}-fold CV")
+            kf_w = KFoldWeight(n_splits=n_cv_folds, shuffle=True, random_state=42)
+            cv_splits = list(kf_w.split(X_train_m))
+
+            best_cv_score = -1.0
+            best_label = "Uniform"
+            best_weights = None
+
+            for label, weights in candidates:
+                fold_scores = []
+                early_stop = False
+                for fold_i, (tr_idx, val_idx) in enumerate(cv_splits):
+                    X_tr = X_train_m.iloc[tr_idx]
+                    y_tr = y_train_m.iloc[tr_idx]
+                    X_val = X_train_m.iloc[val_idx]
+                    y_val = y_train_m.iloc[val_idx]
+                    w_tr = weights[tr_idx] if weights is not None else None
+                    fold_model = train_model(X_tr, y_tr, sample_weight=w_tr)
+                    proba = fold_model.predict_proba(X_val)[:, 1]
+                    fold_scores.append(average_precision_score(y_val, proba))
+                    # Early stopping: if after 2 folds, mean is 0.02+ below best, skip
+                    if fold_i >= 1 and best_cv_score > 0 and np.mean(fold_scores) < best_cv_score - 0.02:
+                        early_stop = True
+                        break
+                if early_stop:
+                    continue
+                mean_score = np.mean(fold_scores)
+                std_score = np.std(fold_scores)
+                logger.info(f"  {label} -> CV AU-PRC={mean_score:.4f} (+/-{std_score:.4f})")
+                if mean_score > best_cv_score:
+                    best_cv_score = mean_score
+                    best_label = label
+                    best_weights = weights
+
+        logger.info(f"Winner: {best_label} (CV AU-PRC={best_cv_score:.4f})")
+        weight_status = best_label
+
+        # Train final model on full training data with winning weights
+        lgbm_m = train_model(X_train_m, y_train_m, sample_weight=best_weights)
 
         mitigated_metrics = evaluate_and_save(
             lgbm_m, X_train_m, y_train_m, X_test_m, customer_ids, test_m, feature_types,
