@@ -284,11 +284,10 @@ def main():
 
     # --- Stage 4: Feature Engineering ---
     with Timer("Feature engineering") as feat_timer:
-        train_m, test_m, new_feature_names = engineer_features(train_m, test_m, feature_types)
+        train_m, test_m, new_feature_names = engineer_features(train_m, test_m, feature_types, drop_cols=drop_cols)
 
         # Post-engineering drift check: drop high-drift engineered features
         from drift_detector import detect_numerical_drift
-        from mitigation import clip_outliers
         eng_dropped = []
         for col in new_feature_names:
             if col not in train_m.columns or col not in test_m.columns:

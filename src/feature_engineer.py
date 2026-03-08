@@ -7,6 +7,7 @@ def engineer_features(
     train: pd.DataFrame,
     test: pd.DataFrame,
     feature_types: dict[str, list[str]],
+    drop_cols: list[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     """Generate dynamic features. No hardcoded column names.
 
@@ -20,6 +21,8 @@ def engineer_features(
     train = train.copy()
     test = test.copy()
     skip_cols = set(feature_types.get("id", []) + feature_types.get("target", []))
+    if drop_cols:
+        skip_cols.update(drop_cols)
     new_features = []
 
     # 1. Missing value indicators

@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 24 — Bug Fix: Feature Engineering Using Dropped Columns
+- **Status:** COMMITTED
+- **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **AFTER:**  Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **Delta:**  Mitigated train +0.0000 | CV +0.0000
+- **Summary:** Fixed `engineer_features` to accept `drop_cols` and exclude high-drift columns from feature creation. Previously, columns marked for dropping (e.g., NumberofReferrals, AvgMonthlyLongDistanceCharges) were still used to generate ratio, aggregation, and missing indicator features, leaking drifted signal into derived features. Also removed dead `clip_outliers` import in main.py. No metric change on this dataset (dropped columns weren't in top-5 numericals for aggregation), but prevents drift leakage on hidden datasets with different column orders.
+
+---
+
 ## Iteration 23 — Bug Fix: BH Correction Missing ss_factor
 - **Status:** COMMITTED
 - **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
