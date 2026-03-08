@@ -6,3 +6,7 @@ __pycache__/
 CLAUDE.md
 !prediction.csv
 !model.joblib
+challenge_images/
+information/
+test_data/
+.claude/

@@ -144,6 +144,89 @@ def _categorical_severity(chi2_pval: float, jsd: float) -> str:
     return "low"
 
 
+def generate_drift_description(
+    train_col: pd.Series, test_col: pd.Series, feature_type: str, drift_metrics: dict
+) -> str:
+    """Generate a qualitative natural-language description of the drift observed."""
+    parts = []
+
+    if feature_type == "numerical":
+        train_vals = train_col.dropna().values.astype(float)
+        test_vals = test_col.dropna().values.astype(float)
+        if len(train_vals) == 0 or len(test_vals) == 0:
+            return "Insufficient data for drift characterization"
+
+        # Skewness comparison
+        train_skew = stats.skew(train_vals)
+        test_skew = stats.skew(test_vals)
+        skew_diff = test_skew - train_skew
+        if abs(skew_diff) > 0.3:
+            direction = "left" if skew_diff < 0 else "right"
+            parts.append(f"greater {direction}-skewness in test set compared to training set")
+
+        # Mean shift
+        train_mean, test_mean = np.mean(train_vals), np.mean(test_vals)
+        train_std = np.std(train_vals)
+        if train_std > 0:
+            mean_shift = (test_mean - train_mean) / train_std
+            if abs(mean_shift) > 0.15:
+                direction = "higher" if mean_shift > 0 else "lower"
+                parts.append(f"mean shifts {direction} in test set")
+
+        # Range expansion / contraction
+        train_range = np.ptp(train_vals)
+        test_range = np.ptp(test_vals)
+        if train_range > 0:
+            range_ratio = test_range / train_range
+            if range_ratio > 1.3:
+                parts.append("feature ranges explode in test set")
+            elif range_ratio < 0.7:
+                parts.append("feature range contracts in test set")
+
+        # Variance change
+        test_std = np.std(test_vals)
+        if train_std > 0:
+            var_ratio = test_std / train_std
+            if var_ratio > 1.3 and "range" not in " ".join(parts):
+                parts.append("variance increases in test set")
+            elif var_ratio < 0.7:
+                parts.append("variance decreases in test set")
+
+    elif feature_type in ("categorical", "temporal"):
+        unseen = drift_metrics.get("unseen_in_test", "")
+        if unseen:
+            parts.append("new set of categorical values in test set not seen in training set")
+
+        # Dominant category shift
+        train_mode = train_col.mode()
+        test_mode = test_col.mode()
+        if len(train_mode) > 0 and len(test_mode) > 0 and train_mode.iloc[0] != test_mode.iloc[0]:
+            parts.append(f"dominant category changes from '{train_mode.iloc[0]}' to '{test_mode.iloc[0]}'")
+
+        jsd = drift_metrics.get("jsd", 0) or 0
+        if jsd >= 0.05 and not parts:
+            parts.append("category proportions shift between train and test")
+
+        if feature_type == "temporal":
+            # Check if temporal distribution shifts
+            if parts:
+                parts = [p.replace("categorical values", "time periods") for p in parts]
+            elif jsd >= 0.01:
+                parts.append("temporal distribution shifts between train and test")
+
+    if not parts:
+        severity = drift_metrics.get("severity", "low")
+        if severity == "high":
+            parts.append("significant distributional shift detected")
+        elif severity == "moderate":
+            parts.append("moderate distributional shift detected")
+        else:
+            parts.append("minor distributional difference")
+
+    desc = "Feature demonstrates " + "; ".join(parts)
+    return desc[0].upper() + desc[1:]
+
+
 def _apply_bh_correction(drift_df: pd.DataFrame) -> pd.DataFrame:
     """Apply Benjamini-Hochberg FDR correction across all p-values and re-classify severity."""
     # Collect all p-values (KS and Chi2) for joint correction
@@ -207,22 +290,25 @@ def run_drift_analysis(
         if col not in train.columns or col not in test.columns:
             continue
         drift = detect_numerical_drift(train[col], test[col])
-        results.append({"column": col, "feature_type": "numerical", **drift})
+        desc = generate_drift_description(train[col], test[col], "numerical", drift)
+        results.append({"column": col, "feature_type": "numerical", "drift_description": desc, **drift})
 
     for col in feature_types["categorical"]:
         if col not in train.columns or col not in test.columns:
             continue
         drift = detect_categorical_drift(train[col], test[col])
+        desc = generate_drift_description(train[col], test[col], "categorical", drift)
         # Convert list to string for display
         drift["unseen_in_test"] = ", ".join(drift["unseen_in_test"]) if drift["unseen_in_test"] else ""
-        results.append({"column": col, "feature_type": "categorical", **drift})
+        results.append({"column": col, "feature_type": "categorical", "drift_description": desc, **drift})
 
     for col in feature_types["temporal"]:
         if col not in train.columns or col not in test.columns:
             continue
         drift = detect_categorical_drift(train[col], test[col])
+        desc = generate_drift_description(train[col], test[col], "temporal", drift)
         drift["unseen_in_test"] = ", ".join(drift["unseen_in_test"]) if drift["unseen_in_test"] else ""
-        results.append({"column": col, "feature_type": "temporal", **drift})
+        results.append({"column": col, "feature_type": "temporal", "drift_description": desc, **drift})
 
     drift_df = pd.DataFrame(results)
     if drift_df.empty:
@@ -261,7 +347,7 @@ def detect_multivariate_shift(
     feature_cols = [c for c in train.columns if c not in drop_cols and c in test.columns]
 
     if not feature_cols:
-        return {"auc": 0.5, "fold_aucs": [], "shift_detected": False}
+        return {"auc": 0.5, "fold_aucs": [], "shift_detected": False, "train_oof_proba": None}
 
     X_tr = train[feature_cols].copy()
     X_te = test[feature_cols].copy()
@@ -308,11 +394,108 @@ def detect_multivariate_shift(
     auc = roc_auc_score(y_domain, oof_proba)
     logger.info(f"Domain classifier fold AUCs: {[round(a, 4) for a in fold_aucs]}, overall={round(auc, 4)}")
 
+    # Extract per-training-row P(test) for sample weighting
+    train_oof_proba = oof_proba[:len(X_tr)]
+
     return {
         "auc": round(auc, 4),
         "fold_aucs": [round(a, 4) for a in fold_aucs],
         "shift_detected": auc > 0.65,
+        "train_oof_proba": train_oof_proba,
     }
+
+
+def detect_intra_training_drift(
+    train: pd.DataFrame,
+    feature_types: dict[str, list[str]],
+) -> tuple[pd.DataFrame, pd.Series | None]:
+    """Detect temporal drift within training data by comparing early vs late months.
+
+    Splits training data into early (first half of months) and late (second half)
+    based on the temporal column, then runs drift detection between the two halves.
+
+    Returns (intra_drift_df, month_series) where month_series is the parsed month
+    ordering per row (or None if no temporal column).
+    """
+    from utils import logger
+
+    temporal_cols = feature_types.get("temporal", [])
+    temporal_col = None
+    for col in temporal_cols:
+        if col in train.columns:
+            temporal_col = col
+            break
+
+    if temporal_col is None:
+        logger.info("No temporal column found; skipping intra-training drift detection")
+        return pd.DataFrame(), None
+
+    # Parse temporal column to month ordering
+    raw = train[temporal_col].astype(str).str.title()
+    month_series = None
+    for fmt in ["%y-%b", "%b-%y", "%Y-%m", "%m-%Y", "%b %Y", "%Y-%b"]:
+        parsed = pd.to_datetime(raw, format=fmt, errors="coerce")
+        if parsed.notna().sum() > len(train) * 0.5:
+            month_series = parsed.dt.to_period("M").astype(str)
+            break
+
+    if month_series is None:
+        logger.info(f"Could not parse temporal column '{temporal_col}'; skipping intra-training drift")
+        return pd.DataFrame(), None
+
+    # Sort unique months and split into early vs late halves
+    unique_months = sorted(month_series.dropna().unique())
+    if len(unique_months) < 2:
+        logger.info("Only one month in training data; skipping intra-training drift")
+        return pd.DataFrame(), None
+
+    mid = len(unique_months) // 2
+    early_months = set(unique_months[:mid])
+    late_months = set(unique_months[mid:])
+
+    early_mask = month_series.isin(early_months)
+    late_mask = month_series.isin(late_months)
+    train_early = train[early_mask]
+    train_late = train[late_mask]
+
+    logger.info(
+        f"Intra-training split: early={len(train_early)} rows ({len(early_months)} months), "
+        f"late={len(train_late)} rows ({len(late_months)} months)"
+    )
+
+    # Run drift detection between early and late halves
+    results = []
+    skip_cols = set(feature_types.get("id", []) + feature_types.get("target", []) + temporal_cols)
+
+    for col in feature_types["numerical"]:
+        if col in skip_cols or col not in train.columns:
+            continue
+        drift = detect_numerical_drift(train_early[col], train_late[col])
+        if drift["severity"] in ("high", "moderate"):
+            desc = generate_drift_description(train_early[col], train_late[col], "numerical", drift)
+            results.append({"column": col, "feature_type": "numerical", "drift_description": desc, **drift})
+
+    for col in feature_types["categorical"]:
+        if col in skip_cols or col not in train.columns:
+            continue
+        drift = detect_categorical_drift(train_early[col], train_late[col])
+        if drift["severity"] in ("high", "moderate"):
+            desc = generate_drift_description(train_early[col], train_late[col], "categorical", drift)
+            drift["unseen_in_test"] = ", ".join(drift["unseen_in_test"]) if drift["unseen_in_test"] else ""
+            results.append({"column": col, "feature_type": "categorical", "drift_description": desc, **drift})
+
+    intra_drift_df = pd.DataFrame(results)
+    if not intra_drift_df.empty:
+        logger.info(f"Intra-training drift: {len(intra_drift_df)} features with high/moderate temporal drift")
+    else:
+        logger.info("No significant intra-training drift detected")
+
+    # Return month_series as parsed month rank for recency weighting
+    month_rank = pd.Series(0, index=train.index)
+    month_to_rank = {m: i for i, m in enumerate(unique_months)}
+    month_rank = month_series.map(month_to_rank).fillna(0).astype(int)
+
+    return intra_drift_df, month_rank
 
 
 def print_drift_summary(drift_df: pd.DataFrame) -> None:
