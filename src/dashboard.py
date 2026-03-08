@@ -75,7 +75,7 @@ def load_all_data(train_path: str, test_path: str):
     train, test = load_data(train_path, test_path)
     feature_types = detect_feature_types(train)
     drift_df = run_drift_analysis(train, test, feature_types)
-    train_m, test_m, sample_weights, drop_cols, mitigation_log, norm_log, shift_info = apply_all_mitigations(
+    train_m, test_m, drop_cols, mitigation_log, norm_log = apply_all_mitigations(
         train, test, drift_df, feature_types
     )
 
@@ -123,7 +123,7 @@ def load_all_data(train_path: str, test_path: str):
         "train": train, "test": test,
         "feature_types": feature_types, "drift_df": drift_df,
         "train_m": train_m, "test_m": test_m,
-        "sample_weights": sample_weights, "drop_cols": drop_cols,
+        "drop_cols": drop_cols,
         "mitigation_log": mitigation_log, "norm_log": norm_log,
         "baseline_metrics": baseline_metrics, "mitigated_metrics": mitigated_metrics,
         "pred_baseline": pred_baseline, "pred_mitigated": pred_mitigated,
@@ -141,7 +141,6 @@ feature_types = data["feature_types"]
 drift_df = data["drift_df"]
 train_m = data["train_m"]
 test_m = data["test_m"]
-sample_weights = data["sample_weights"]
 drop_cols = data["drop_cols"]
 mitigation_log = data["mitigation_log"]
 baseline_metrics = data["baseline_metrics"]

@@ -248,7 +248,7 @@ def detect_multivariate_shift(
     Trains a LightGBM domain classifier to distinguish train vs test samples.
     AUC near 0.5 means no shift; AUC near 1.0 means strong shift.
 
-    Returns dict with 'auc', 'train_proba', 'shift_detected'.
+    Returns dict with 'auc', 'fold_aucs', 'shift_detected'.
     """
     from lightgbm import LGBMClassifier
     from sklearn.model_selection import StratifiedKFold
@@ -261,7 +261,7 @@ def detect_multivariate_shift(
     feature_cols = [c for c in train.columns if c not in drop_cols and c in test.columns]
 
     if not feature_cols:
-        return {"auc": 0.5, "train_proba": np.ones(len(train)) * 0.5, "shift_detected": False}
+        return {"auc": 0.5, "fold_aucs": [], "shift_detected": False}
 
     X_tr = train[feature_cols].copy()
     X_te = test[feature_cols].copy()
@@ -306,31 +306,13 @@ def detect_multivariate_shift(
 
     from utils import logger
     auc = roc_auc_score(y_domain, oof_proba)
-    train_proba = oof_proba[:len(X_tr)]
     logger.info(f"Domain classifier fold AUCs: {[round(a, 4) for a in fold_aucs]}, overall={round(auc, 4)}")
 
     return {
         "auc": round(auc, 4),
         "fold_aucs": [round(a, 4) for a in fold_aucs],
-        "train_proba": train_proba,
         "shift_detected": auc > 0.65,
     }
-
-
-def compute_density_ratio_weights(
-    train_proba: np.ndarray,
-    clip_bounds: tuple[float, float] = (0.1, 10.0),
-) -> np.ndarray:
-    """Compute importance weights from domain classifier probabilities.
-
-    w(x) = p(test|x) / p(train|x) = p / (1-p), clipped and normalized
-    so weights sum to n_train.
-    """
-    p = np.clip(train_proba, 0.01, 0.99)
-    weights = p / (1.0 - p)
-    weights = np.clip(weights, clip_bounds[0], clip_bounds[1])
-    weights = weights * len(weights) / weights.sum()
-    return weights
 
 
 def print_drift_summary(drift_df: pd.DataFrame) -> None:

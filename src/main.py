@@ -131,10 +131,7 @@ def print_drift_mitigation_summary(
     print(h_line("╚", "╩", "╝"))
 
 
-def print_multivariate_shift_summary(
-    shift_info: dict,
-    sample_weights,
-) -> None:
+def print_multivariate_shift_summary(shift_info: dict) -> None:
     """Print multivariate covariate shift detection results."""
     import numpy as np
     CW = (24, 22)
@@ -160,13 +157,7 @@ def print_multivariate_shift_summary(
         print(col_row("Fold AUC Std", f"{fold_std:.4f}"))
     status = "Yes" if shift_info["shift_detected"] else "No"
     print(col_row("Shift Detected", status))
-    if shift_info["shift_detected"]:
-        w = np.array(sample_weights)
-        print(col_row("Weight Mean", f"{w.mean():.4f}"))
-        print(col_row("Weight Std", f"{w.std():.4f}"))
-        print(col_row("Weight Range", f"[{w.min():.2f}, {w.max():.2f}]"))
-    else:
-        print(col_row("Sample Weights", "Uniform (1.0)"))
+    print(col_row("Sample Weights", "Uniform (1.0)"))
     print(h("╚", "╩", "╝"))
 
 
@@ -268,7 +259,7 @@ def main():
 
     # --- Stage 3: Drift Mitigation ---
     with Timer("Drift mitigation") as mitigation_timer:
-        train_m, test_m, sample_weights, drop_cols, mitigation_log, norm_log, shift_info = apply_all_mitigations(
+        train_m, test_m, drop_cols, mitigation_log, norm_log, shift_info = apply_all_mitigations(
             train, test, drift_df, feature_types
         )
 
@@ -284,7 +275,7 @@ def main():
             tag="baseline",
         )
 
-        # Mitigated model (uniform weights)
+        # Mitigated model
         X_train_m, y_train_m, X_test_m, customer_ids = prepare_features(
             train_m, test_m, feature_types, extra_drop_cols=drop_cols
         )
@@ -294,39 +285,18 @@ def main():
             tag="mitigated",
         )
 
-        # Mitigated model with density ratio weights (only if shift detected)
-        weighted_metrics = None
-        if shift_info["shift_detected"]:
-            lgbm_w = train_model(X_train_m, y_train_m, sample_weight=sample_weights)
-            weighted_metrics = evaluate_and_save(
-                lgbm_w, X_train_m, y_train_m, X_test_m, customer_ids, test_m, feature_types,
-                tag="mitigated_weighted",
-            )
-
-        # Auto-select best mitigated model for primary output
-        def _select_score(m):
-            return m.get("test_auprc") if m.get("test_auprc") is not None else m.get("train_auprc", 0)
-
-        candidates = [("mitigated", mitigated_metrics)]
-        if weighted_metrics:
-            candidates.append(("mitigated_weighted", weighted_metrics))
-        best_tag, _ = max(candidates, key=lambda x: _select_score(x[1]))
-
-        shutil.copy(f"prediction_{best_tag}.csv", "prediction.csv")
-        shutil.copy(f"model_{best_tag}.joblib", "model.joblib")
+        shutil.copy("prediction_mitigated.csv", "prediction.csv")
+        shutil.copy("model_mitigated.joblib", "model.joblib")
 
     # --- All tables printed after all stages complete ---
     print_drift_mitigation_summary(drift_df, drop_cols, mitigation_log, norm_log)
-    print_multivariate_shift_summary(shift_info, sample_weights)
+    print_multivariate_shift_summary(shift_info)
 
     model_results = [
         ("Baseline", baseline_metrics),
         ("Mitigated", mitigated_metrics),
     ]
-    if weighted_metrics:
-        model_results.append(("Mitigated+Weighted", weighted_metrics))
-    selected_name = {"mitigated": "Mitigated", "mitigated_weighted": "Mitigated+Weighted"}[best_tag]
-    print_model_performance_summary(model_results, selected=selected_name)
+    print_model_performance_summary(model_results)
     print_runtime_summary(drift_timer.elapsed, mitigation_timer.elapsed, model_timer.elapsed)
 
 
