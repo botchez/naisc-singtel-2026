@@ -114,10 +114,17 @@ def evaluate_and_save(
     joblib.dump(model, "model.joblib")
     logger.info("Saved model.joblib")
 
-    # Print metrics
     metrics = {"train_auprc": train_auprc}
     if test_auprc is not None:
         metrics["test_auprc"] = test_auprc
+
+    return metrics
+
+
+def print_model_performance_summary(metrics: dict[str, float]) -> None:
+    """Print model performance table (called separately after all logger output)."""
+    train_auprc = metrics["train_auprc"]
+    test_auprc = metrics.get("test_auprc")
 
     CW = (24, 14)
     total = CW[0] + CW[1] + 1  # +1 for middle border
@@ -136,5 +143,3 @@ def evaluate_and_save(
     for label, value in rows:
         print(f"║ {label:<{CW[0] - 1}}║ {value:<{CW[1] - 1}}║")
     print(f"╚{'═' * CW[0]}╩{'═' * CW[1]}╝")
-
-    return metrics
