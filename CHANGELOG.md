@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 33 — G14: Importance-Weighted Cross-Validation (IWCV)
+- **Status:** REVERTED
+- **BEFORE:** Baseline train=0.9259 test=0.7576 | Mitigated train=0.9227 test=0.8685 | CV AU-PRC=0.8672
+- **AFTER:**  Baseline train=0.9259 test=0.7576 | Mitigated train=0.9227 test=0.8685 | CV AU-PRC=0.8218 (IWCV-weighted)
+- **Delta:**  Mitigated train +0.0000 | CV N/A (different scale)
+- **Reason:** Re-weighted CV evaluation by density ratio P(test)/P(train) per Sugiyama et al. 2007. Tournament still picked Blend(a=0.3,p=0.5) and final model output was identical. However, extreme weight range (0.01-62.70) made CV metric 2.3x noisier (std ±0.0029→±0.0068) and the IWCV scores were further from actual test performance than unweighted scores. The extreme density ratio variance means a few outlier samples dominate the evaluation. Would need more aggressive clipping (e.g., p∈[0.1, 0.9]) to be practical.
+
+---
+
 ## Iteration 32 — C4: Group-Level Std/Count Aggregation Features
 - **Status:** REVERTED
 - **BEFORE:** Baseline train=0.9259 test=0.7576 | Mitigated train=0.9227 test=0.8685 | CV AU-PRC=0.8672
