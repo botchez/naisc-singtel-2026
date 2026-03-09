@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 29 — G8: MI-Based Feature Selection
+- **Status:** REVERTED
+- **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **AFTER:**  Baseline train=0.8891 test=0.7352 | Mitigated train=0.8860 test=0.8529 | CV AU-PRC=0.8586
+- **Delta:**  Mitigated train -0.0036 | CV -0.0009
+- **Reason:** Added MI-based feature selection (drop features with MI < 0.001) after zero-importance pruning. Dropped `AdditionalLines` and `VideoSvc_A` which had near-zero MI but still carried predictive signal through LightGBM's tree splits. Mitigated train AU-PRC dropped -0.0036 and test dropped -0.0052, well past revert threshold. Also destabilized weight tournament (Blend won instead of Uniform). Lesson: MI computed on target-encoded features is unreliable — low MI doesn't mean low predictive value for tree models that exploit non-linear interactions.
+
+---
+
 ## Iteration 28 — B1: Winsorization
 - **Status:** REVERTED
 - **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595

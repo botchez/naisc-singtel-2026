@@ -174,7 +174,7 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 
 ---
 
-## Current Baseline (Iteration 28)
+## Current Baseline (Iteration 29)
 
 - Baseline train=0.8891 test=0.7352
 - Mitigated train=0.8896 test=0.8581
@@ -264,7 +264,7 @@ Legend: ✅ COMMITTED | ❌ REVERTED | ⬜ AVAILABLE
 | G5 | ⬜ | ADWIN concept drift alarm | Use ADWIN sliding-window detector on per-fold CV AU-PRC to trigger a warning when concept drift is detected across time segments |
 | G6 | ⬜ | Platt scaling / isotonic calibration | Post-hoc probability calibration to correct for class-prior shift between train and test |
 | G7 | ⬜ | Selective prediction (abstain on high-uncertainty) | Identify test samples where model is uncertain (low max probability) and flag rather than predict — reduces error on shifted test regions |
-| G8 | ⬜ | MI-based feature selection | Use `mutual_info_classif` to score features' nonlinear dependency with target, drop low-MI features — more aggressive than zero-importance filtering |
+| G8 | ❌ | MI-based feature selection | Use `mutual_info_classif` to score features' nonlinear dependency with target, drop low-MI features — more aggressive than zero-importance filtering |
 | G9 | ⬜ | Native categorical handling | Use LightGBM's built-in Fisher-based categorical splits (`category` dtype) instead of target encoding — groups categories by gradient statistics at each node |
 | G10 | ⬜ | Drift-aware MI hybrid gating | Combine drift severity with MI score in a 2D decision: keep high-MI features despite moderate drift, drop low-MI features even at moderate drift |
 
