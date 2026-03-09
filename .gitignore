@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.csv
+*.joblib
+.env
+CLAUDE.md
+!prediction.csv
+!model.joblib
+challenge_images/
+information/
+test_data/
+.claude/
+*.png
+CODEBASE_BREAKDOWN.md
