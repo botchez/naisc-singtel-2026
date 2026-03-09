@@ -267,11 +267,15 @@ Legend: ✅ COMMITTED | ❌ REVERTED | ⬜ AVAILABLE
 | G8 | ❌ | MI-based feature selection | Use `mutual_info_classif` to score features' nonlinear dependency with target, drop low-MI features — more aggressive than zero-importance filtering |
 | G9 | ✅ | Native categorical handling | Use LightGBM's built-in Fisher-based categorical splits (`category` dtype) instead of target encoding — groups categories by gradient statistics at each node |
 | G10 | ⬜ | Drift-aware MI hybrid gating | Combine drift severity with MI score in a 2D decision: keep high-MI features despite moderate drift, drop low-MI features even at moderate drift |
+| G11 | ⬜ | Adversarial feature soft-weighting | Scale feature values by (1 - normalized_domain_importance) before model training, reducing drift-heavy feature influence without dropping them |
+| G12 | ⬜ | CV permutation importance pruning | Use cross-validated permutation importance (shuffle-and-measure) to identify truly non-predictive features — more robust than single-model gain importance |
 
 > Sources: Sugiyama et al. 2012 (KLIEP/uLSIF), Lipton et al. 2018 (BBSE), Villani 2009 (Wasserstein), Bifet & Gavaldà 2007 (ADWIN), Platt 1999, Geifman & El-Yaniv 2017 (selective prediction).
 > G8: scikit-learn `mutual_info_classif` docs; Zaffalon 2002 (robust MI feature selection).
 > G9: LightGBM Advanced Topics docs; Fisher 1958 optimal categorical splits.
 > G10: Feature-based concept drift analysis (Neurocomputing 2024).
+> G11: Kaggle adversarial validation notebooks; Carlmcbrideellis 2023; Analytics Vidhya 2023.
+> G12: Altmann et al. 2010 (permutation importance); scikit-learn `permutation_importance` docs.
 
 ---
 
