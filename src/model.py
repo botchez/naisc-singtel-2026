@@ -107,6 +107,7 @@ def prepare_features(
             X_test[col] = _parse_temporal_month(X_test[col])
 
     # Target encoding for categorical columns (k-fold to avoid leakage)
+    # High-cardinality categoricals (>10 unique) use LightGBM native categorical splits
     cat_cols = [c for c in feature_cols if X_train[c].dtype == object]
     global_mean = y_train.mean()
     from utils import safe_n_splits
@@ -114,7 +115,37 @@ def prepare_features(
 
     smoothing_m = 10  # Bayesian smoothing: shrink low-count category means toward global mean
 
+    # Split categoricals by cardinality
+    native_cat_cols = []  # high-cardinality → LightGBM native
+    te_cat_cols = []      # low-cardinality → target encoding
     for col in cat_cols:
+        n_unique = X_train[col].nunique()
+        if n_unique > 10:
+            native_cat_cols.append(col)
+        else:
+            te_cat_cols.append(col)
+
+    if native_cat_cols:
+        logger.info(f"Native categorical encoding for {len(native_cat_cols)} high-cardinality cols: {native_cat_cols}")
+
+    # Native categorical: integer label encode + category dtype
+    for col in native_cat_cols:
+        try:
+            raw_train = X_train[col].astype(str)
+            raw_test = X_test[col].astype(str)
+            # Build label mapping from train categories
+            train_cats = raw_train.unique().tolist()
+            cat_to_int = {cat: i for i, cat in enumerate(train_cats)}
+            # Encode train
+            X_train[col] = raw_train.map(cat_to_int).astype(int).astype("category")
+            # Encode test — unseen categories get a new sentinel code
+            sentinel = len(cat_to_int)
+            X_test[col] = raw_test.map(cat_to_int).fillna(sentinel).astype(int).astype("category")
+        except Exception as e:
+            logger.warning(f"Native categorical encoding failed for {col}, falling back to target encoding: {e}")
+            te_cat_cols.append(col)
+
+    for col in te_cat_cols:
         raw_train = X_train[col].astype(str)
         raw_test = X_test[col].astype(str)
 
