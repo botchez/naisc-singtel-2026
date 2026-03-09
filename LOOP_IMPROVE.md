@@ -264,8 +264,14 @@ Legend: ✅ COMMITTED | ❌ REVERTED | ⬜ AVAILABLE
 | G5 | ⬜ | ADWIN concept drift alarm | Use ADWIN sliding-window detector on per-fold CV AU-PRC to trigger a warning when concept drift is detected across time segments |
 | G6 | ⬜ | Platt scaling / isotonic calibration | Post-hoc probability calibration to correct for class-prior shift between train and test |
 | G7 | ⬜ | Selective prediction (abstain on high-uncertainty) | Identify test samples where model is uncertain (low max probability) and flag rather than predict — reduces error on shifted test regions |
+| G8 | ⬜ | MI-based feature selection | Use `mutual_info_classif` to score features' nonlinear dependency with target, drop low-MI features — more aggressive than zero-importance filtering |
+| G9 | ⬜ | Native categorical handling | Use LightGBM's built-in Fisher-based categorical splits (`category` dtype) instead of target encoding — groups categories by gradient statistics at each node |
+| G10 | ⬜ | Drift-aware MI hybrid gating | Combine drift severity with MI score in a 2D decision: keep high-MI features despite moderate drift, drop low-MI features even at moderate drift |
 
 > Sources: Sugiyama et al. 2012 (KLIEP/uLSIF), Lipton et al. 2018 (BBSE), Villani 2009 (Wasserstein), Bifet & Gavaldà 2007 (ADWIN), Platt 1999, Geifman & El-Yaniv 2017 (selective prediction).
+> G8: scikit-learn `mutual_info_classif` docs; Zaffalon 2002 (robust MI feature selection).
+> G9: LightGBM Advanced Topics docs; Fisher 1958 optimal categorical splits.
+> G10: Feature-based concept drift analysis (Neurocomputing 2024).
 
 ---
 
