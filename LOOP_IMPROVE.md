@@ -174,7 +174,7 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 
 ---
 
-## Current Baseline (Iteration 29)
+## Current Baseline (Iteration 30)
 
 - Baseline train=0.8891 test=0.7352
 - Mitigated train=0.8896 test=0.8581

@@ -540,25 +540,45 @@ def apply_all_mitigations(
                                        "final_severity": final_sev})
 
         elif ftype == "categorical":
-            # Try group_rare then frequency encoding
+            # Try group_rare then frequency encoding (with best-improvement fallback)
             cat_strategies = [
                 ("Rare category grouping", lambda tc, sc: group_rare_categories(tc, sc), "cat"),
                 ("Frequency encoding", lambda tc, sc: frequency_encode_mitigation(tc, sc), "num"),
             ]
+            best_strategy = None
+            best_jsd = orig_jsd
+            best_result = None
             for name, fn, detect_type in cat_strategies:
                 tr_col, te_col = fn(train_m[col], test_m[col])
                 if detect_type == "cat":
                     drift = detect_categorical_drift(tr_col, te_col)
+                    new_jsd = drift.get("jsd", orig_jsd) or orig_jsd
                 else:
                     drift = detect_numerical_drift(tr_col, te_col)
+                    new_jsd = drift.get("psi", orig_jsd) or orig_jsd
                 if drift["severity"] == "low":
+                    # Immediate accept if drops to low
                     train_m[col] = tr_col.values
                     test_m[col] = te_col.values
                     logger.info(f"  {col}: {name} (moderate -> low)")
                     mitigation_log.append({"column": col, "feature_type": ftype,
                                            "original_severity": "moderate", "strategy_applied": name,
                                            "final_severity": "low"})
+                    best_strategy = None  # already applied
                     break
+                elif new_jsd < best_jsd:
+                    best_jsd = new_jsd
+                    best_strategy = name
+                    best_result = (tr_col, te_col, drift["severity"])
+            # Apply best improvement even if still moderate
+            if best_strategy and best_result:
+                tr_col, te_col, final_sev = best_result
+                train_m[col] = tr_col.values
+                test_m[col] = te_col.values
+                logger.info(f"  {col}: {best_strategy} (moderate, JSD {orig_jsd:.4f} -> {best_jsd:.4f})")
+                mitigation_log.append({"column": col, "feature_type": ftype,
+                                       "original_severity": "moderate", "strategy_applied": best_strategy,
+                                       "final_severity": final_sev})
 
     # Stage 4: Multivariate shift detection (diagnostic only, no weighting)
     from drift_detector import detect_multivariate_shift
