@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 28 — B1: Winsorization
+- **Status:** REVERTED
+- **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **AFTER:**  Baseline train=0.8912 test=0.7349 | Mitigated train=0.8879 test=0.8578 | CV AU-PRC=0.8601
+- **Delta:**  Mitigated train -0.0017 | CV +0.0006
+- **Reason:** Added global Winsorization (clip all numerical features to [P1, P99] of training distribution) in `prepare_features`. Clipping training features lost tail information, dropping mitigated train AU-PRC by -0.0017. Also destabilized the weight tournament — Blend(a=0.5,p=0.5) won instead of Uniform, repeating the instability pattern from iterations 18, 21, 26. LightGBM's tree splits are scale-invariant, so outlier clipping provides no benefit for tree-based models and only removes signal.
+
+---
+
 ## Iteration 27 — Bug Fix: group_rare_categories Maps NaN to "_other"
 - **Status:** COMMITTED
 - **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595

@@ -174,7 +174,7 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 
 ---
 
-## Current Baseline (Iteration 27)
+## Current Baseline (Iteration 28)
 
 - Baseline train=0.8891 test=0.7352
 - Mitigated train=0.8896 test=0.8581
@@ -202,7 +202,7 @@ Legend: ✅ COMMITTED | ❌ REVERTED | ⬜ AVAILABLE
 
 | # | Status | Candidate | Description |
 |---|--------|-----------|-------------|
-| B1 | ⬜ | Winsorization | Clip extreme values to configurable percentiles (e.g., 1st/99th) before other transforms |
+| B1 | ❌ | Winsorization | Clip extreme values to configurable percentiles (e.g., 1st/99th) before other transforms |
 | B2 | ⬜ | Z-score normalization | Standardize numerical features using train mean/std, apply same transform to test |
 | B3 | ✅ | Quantile matching (moderate-only) | Align test quantiles to train quantiles via CDF-to-CDF mapping — moderate drift only (high-drift: catastrophic loss on full apply) |
 | B4 | ⬜ | Adaptive clip percentiles | Instead of fixed clip bounds, choose percentiles based on drift severity |
