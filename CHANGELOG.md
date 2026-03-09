@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 32 — C4: Group-Level Std/Count Aggregation Features
+- **Status:** REVERTED
+- **BEFORE:** Baseline train=0.9259 test=0.7576 | Mitigated train=0.9227 test=0.8685 | CV AU-PRC=0.8672
+- **AFTER:**  Baseline train=0.9259 test=0.7576 | Mitigated train=0.9222 test=0.8683 | CV AU-PRC=0.8668
+- **Delta:**  Mitigated train -0.0005 | CV -0.0004
+- **Reason:** Added 15 std aggregation and 3 group count features alongside existing means. Of the 18 new features, 14 were pruned (9 near-duplicate, 5 zero-importance). The 4 surviving features added noise without improving any metric. Consistent with the pattern that C-section feature additions hurt or don't help (C1, C2, C5 also reverted).
+
+---
+
 ## Iteration 31 — G9: Native Categorical Handling for High-Cardinality Features
 - **Status:** COMMITTED
 - **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
