@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 31 — G9: Native Categorical Handling for High-Cardinality Features
+- **Status:** COMMITTED
+- **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **AFTER:**  Baseline train=0.9259 test=0.7576 | Mitigated train=0.9227 test=0.8685 | CV AU-PRC=0.8672
+- **Delta:**  Mitigated train +0.0331 | CV +0.0077
+- **Summary:** For high-cardinality categoricals (>10 unique values, i.e. LocationCity), use LightGBM's native Fisher-based categorical splits via integer label encoding + `category` dtype instead of target encoding. This lets LightGBM find optimal category groupings at each tree node rather than collapsing all categories into a single smoothed mean. Substantial improvement across all metrics: train +0.0331, test +0.0104, CV +0.0077. Tournament winner changed to Blend(a=0.3,p=0.5) but test also improved, indicating genuine signal recovery.
+
+---
+
 ## Iteration 30 — Bug Fix: Moderate Categorical Mitigation Missing Best-Improvement Fallback
 - **Status:** COMMITTED
 - **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
