@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 30 — Bug Fix: Moderate Categorical Mitigation Missing Best-Improvement Fallback
+- **Status:** COMMITTED
+- **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **AFTER:**  Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
+- **Delta:**  Mitigated train +0.0000 | CV +0.0000
+- **Summary:** Fixed moderate categorical mitigation to have a "best improvement" fallback path, matching the existing numerical moderate mitigation pattern. Previously, categorical strategies were only accepted if they dropped severity to "low" — unlike numericals which track the best strategy and apply it even if severity stays moderate. No metric change on this dataset (moderate categoricals are binary, so rare grouping cannot reduce their JSD), but fixes an inconsistency that would leave multi-level moderate-drift categoricals unmitigated on hidden datasets.
+
+---
+
 ## Iteration 29 — G8: MI-Based Feature Selection
 - **Status:** REVERTED
 - **BEFORE:** Baseline train=0.8891 test=0.7352 | Mitigated train=0.8896 test=0.8581 | CV AU-PRC=0.8595
