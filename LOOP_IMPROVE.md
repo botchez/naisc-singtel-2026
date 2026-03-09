@@ -217,7 +217,7 @@ Legend: ✅ COMMITTED | ❌ REVERTED | ⬜ AVAILABLE
 | C1 | ❌ | Difference features | For top correlated pairs, add (A − B) alongside existing ratio features — hurts generalization |
 | C2 | ❌ | Polynomial interactions | Add A×B for top correlated pairs — destabilizes weight tournament, hurts generalization |
 | C3 | ⬜ | Binned numericals | Discretize high-drift numericals into quantile bins to reduce sensitivity to exact values |
-| C4 | ⬜ | Group-level std/count | Add std and count aggregation features alongside existing group-level means |
+| C4 | ❌ | Group-level std/count | Add std and count aggregation features alongside existing group-level means |
 | C5 | ❌ | Missing pattern count | Feature counting total number of missing values per row — redundant, hurts generalization |
 | C6 | ⬜ | Drift magnitude features | Encode per-feature drift severity as a meta-feature for the model |
 
