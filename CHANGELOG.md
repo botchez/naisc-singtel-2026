@@ -1,5 +1,14 @@
 # Changelog
 
+## Iteration 34 — G15: Recency Truncation
+- **Status:** REVERTED
+- **BEFORE:** Baseline train=0.9259 test=0.7576 | Mitigated train=0.9210 test=0.8727
+- **AFTER:**  Baseline train=0.9259 test=0.7576 | Mitigated train=0.9210 test=0.8727 (unchanged — truncation lost tournament)
+- **Delta:**  Mitigated train +0.0000 | test +0.0000
+- **Reason:** Added recency truncation candidates to weight tournament: hard-drop old training months (keep last 40%/60%/80%) instead of soft-weighting them. Also tested truncation + domain weight combinations. Results: Truncate(keep=0.4)=0.8610, Truncate(keep=0.6)=0.8664, Truncate(keep=0.8)=0.8677 — all below Blend(a=0.6,p=0.8,d=0.2)=0.8727. Clear monotonic pattern: more data dropped → worse score. Soft weighting strictly dominates hard cutoffs — retaining all training data with exponential decay preserves information that outweighs the noise from older months. Combined truncation+domain candidates performed even worse (0.8608-0.8677). Confirms solution map assessment that recency weights already capture temporal signal optimally.
+
+---
+
 ## Iteration 33 — G14: Importance-Weighted Cross-Validation (IWCV)
 - **Status:** REVERTED
 - **BEFORE:** Baseline train=0.9259 test=0.7576 | Mitigated train=0.9227 test=0.8685 | CV AU-PRC=0.8672
