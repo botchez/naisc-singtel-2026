@@ -123,8 +123,9 @@ def normalize_data_quality(
     from drift_detector import detect_categorical_drift
     normalized = []
     skipped_norm = []
+    cat_cols = set(feature_types.get("categorical", []) + feature_types.get("temporal", []))
     for col in train_clean.columns:
-        if col in skip_cols:
+        if col in skip_cols or col not in cat_cols:
             continue
         if train_clean[col].dtype == object:
             # Compute drift before normalization
@@ -149,10 +150,48 @@ def normalize_data_quality(
         logger.info(f"Normalized {len(normalized)} columns: {normalized}")
     if skipped_norm:
         logger.info(f"Skipped normalization for {len(skipped_norm)} columns (would increase drift): {skipped_norm}")
+
+    # Fuzzy match: map unseen test categories to closest train category
+    import difflib
+    for col in cat_cols:
+        if col in skip_cols or col not in train_clean.columns or col not in test_clean.columns:
+            continue
+        if train_clean[col].dtype != object:
+            continue
+        train_cats = set(train_clean[col].dropna().unique())
+        test_cats = set(test_clean[col].dropna().unique())
+        unseen = test_cats - train_cats
+        if not unseen:
+            continue
+        fuzzy_map = {}
+        for cat in unseen:
+            matches = difflib.get_close_matches(cat, list(train_cats), n=1, cutoff=0.6)
+            if matches:
+                fuzzy_map[cat] = matches[0]
+        if fuzzy_map:
+            test_clean[col] = test_clean[col].replace(fuzzy_map)
+            logger.info(f"Fuzzy matched '{col}': {fuzzy_map}")
+            norm_log.setdefault(col, []).append(f"Fuzzy matched: {fuzzy_map}")
     return train_clean, test_clean, norm_log
 
 
 # ── Strategy functions ────────────────────────────────────────────────────
+
+
+def median_align(
+    train_col: pd.Series, test_col: pd.Series
+) -> tuple[pd.Series, pd.Series]:
+    """Shift test values so that test median matches train median."""
+    train_vals = pd.to_numeric(train_col, errors="coerce").dropna()
+    test_vals = pd.to_numeric(test_col, errors="coerce").dropna()
+    if len(train_vals) == 0 or len(test_vals) == 0:
+        return train_col, test_col
+    shift = train_vals.median() - test_vals.median()
+    if abs(shift) < 1e-10:
+        return train_col, test_col  # no shift needed
+    test_aligned = test_col.copy()
+    test_aligned = pd.to_numeric(test_aligned, errors="coerce") + shift
+    return train_col, test_aligned
 
 
 def clip_outliers(

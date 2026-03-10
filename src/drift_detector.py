@@ -146,7 +146,7 @@ def detect_categorical_drift(
     test_null_pct = float(test_col.isna().mean())
     miss_sev = _missingness_severity(train_null_pct, test_null_pct)
 
-    all_categories = sorted(set(train_col.dropna().unique()) | set(test_col.dropna().unique()))
+    all_categories = sorted(set(train_col.dropna().unique()) | set(test_col.dropna().unique()), key=str)
 
     if len(all_categories) == 0:
         return {"chi2_stat": None, "chi2_pval": None, "jsd": None, "unseen_in_test": [],
