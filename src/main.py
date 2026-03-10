@@ -268,6 +268,12 @@ def main():
     profile_data(train, feature_types, label="train")
     profile_data(test, feature_types, label="test")
 
+    # Coerce columns classified as numerical but still stored as object dtype
+    for col in feature_types.get("numerical", []):
+        if col in train.columns and not pd.api.types.is_numeric_dtype(train[col]):
+            train[col] = pd.to_numeric(train[col], errors="coerce")
+            test[col] = pd.to_numeric(test[col], errors="coerce")
+
     # --- Stage 2: Drift Detection (train vs test) ---
     with Timer("Drift detection") as drift_timer:
         drift_df = run_drift_analysis(train, test, feature_types)
