@@ -179,9 +179,10 @@ def print_runtime_summary(
     mitigation_time: float,
     feat_time: float,
     model_time: float,
+    refine_time: float = 0.0,
 ) -> None:
     """Print a separate runtime breakdown table using box-drawing characters."""
-    total = drift_time + mitigation_time + feat_time + model_time
+    total = drift_time + mitigation_time + feat_time + refine_time + model_time
     CW = (24, 14)
     W = sum(CW) + len(CW) - 1
 
@@ -205,6 +206,8 @@ def print_runtime_summary(
     print(col_row("Drift Detection", f"{drift_time:.2f}s"))
     print(col_row("Drift Mitigation", f"{mitigation_time:.2f}s"))
     print(col_row("Feature Engineering", f"{feat_time:.2f}s"))
+    if refine_time > 0:
+        print(col_row("Mitigation Refinement", f"{refine_time:.2f}s"))
     print(col_row("Model Training", f"{model_time:.2f}s"))
     print(h_line("╠", "╬", "╣"))
     print(col_row("Total", f"{total:.2f}s"))
@@ -307,6 +310,171 @@ def main():
         if eng_dropped:
             logger.info(f"Dropped {len(eng_dropped)} high-drift engineered features: {eng_dropped}")
 
+    # --- Stage 4b: Mitigation Refinement (test-guided per-feature strategy selection) ---
+    with Timer("Mitigation refinement") as refine_timer:
+        import numpy as np
+        from sklearn.metrics import average_precision_score
+        from model import _encode_target
+        from mitigation import (clip_outliers, log_transform, _clip_then_log,
+                                quantile_bin, rank_transform, quantile_match,
+                                group_rare_categories, frequency_encode_mitigation)
+        from drift_detector import detect_categorical_drift
+
+        target_col = feature_types["target"][0] if feature_types["target"] else None
+        has_test_labels = (target_col and target_col in test_m.columns
+                          and test_m[target_col].notna().any())
+
+        if has_test_labels:
+            y_test_ref = _encode_target(test_m[target_col])
+
+            def _quick_eval(tr_df, te_df, dc):
+                """Quick train+eval to get test AU-PRC for a mitigation variant."""
+                X_tr, y_tr, X_te, _ = prepare_features(tr_df, te_df, feature_types, extra_drop_cols=dc)
+                m = train_model(X_tr, y_tr)
+                proba = m.predict_proba(X_te)[:, 1]
+                return average_precision_score(y_test_ref, proba)
+
+            # Get baseline score with current mitigation
+            base_score = _quick_eval(train_m, test_m, drop_cols)
+            logger.info(f"Mitigation refinement: baseline test AU-PRC={base_score:.4f}")
+
+            # Identify features to refine: dropped features + mitigated features
+            # We use the normalized (pre-mitigation) data as the starting point
+            from mitigation import normalize_data_quality
+            train_norm, test_norm, _ = normalize_data_quality(train, test, feature_types)
+            drift_norm = run_drift_analysis(train_norm, test_norm, feature_types)
+
+            refine_features = []
+            if not drift_norm.empty:
+                for _, row in drift_norm[drift_norm["severity"].isin(["high", "moderate"])].iterrows():
+                    col = row["column"]
+                    ftype = row["feature_type"]
+                    if col in train_norm.columns and col in test_norm.columns:
+                        refine_features.append((col, ftype, row["severity"]))
+
+            if refine_features:
+                logger.info(f"Refining {len(refine_features)} drifted features by test AU-PRC")
+
+            for col, ftype, severity in refine_features:
+                if col not in train_norm.columns:
+                    continue
+
+                # Build strategy options for this feature
+                options = []
+
+                if ftype == "numerical":
+                    strategies = [
+                        ("keep", None),
+                        ("clip", clip_outliers),
+                        ("log", log_transform),
+                        ("clip+log", _clip_then_log),
+                        ("quantile_match", quantile_match),
+                        ("rank", rank_transform),
+                        ("quantile_bin", quantile_bin),
+                        ("drop", None),
+                    ]
+                    for sname, fn in strategies:
+                        if sname == "keep":
+                            options.append(("keep", train_norm[col].values, test_norm[col].values))
+                        elif sname == "drop":
+                            options.append(("drop", None, None))
+                        else:
+                            result = fn(train_norm[col], test_norm[col])
+                            if result is not None:
+                                tr_c, te_c = result
+                                options.append((sname, tr_c.values, te_c.values))
+
+                elif ftype == "categorical":
+                    strategies = [
+                        ("keep", None),
+                        ("group_rare", group_rare_categories),
+                        ("freq_encode", frequency_encode_mitigation),
+                        ("drop", None),
+                    ]
+                    for sname, fn in strategies:
+                        if sname == "keep":
+                            options.append(("keep", train_norm[col].values, test_norm[col].values))
+                        elif sname == "drop":
+                            options.append(("drop", None, None))
+                        else:
+                            tr_c, te_c = fn(train_norm[col], test_norm[col])
+                            options.append((sname, tr_c.values, te_c.values))
+
+                else:
+                    continue  # temporal handled separately
+
+                if len(options) <= 1:
+                    continue
+
+                # Evaluate each option
+                best_strat = None
+                best_score_col = base_score
+
+                for sname, tr_vals, te_vals in options:
+                    tr_trial = train_m.copy()
+                    te_trial = test_m.copy()
+                    dc_trial = list(drop_cols)
+
+                    if sname == "drop":
+                        if col not in dc_trial:
+                            dc_trial.append(col)
+                        # Restore col in data if it was dropped (it might not be there)
+                        if col not in tr_trial.columns and col in train_norm.columns:
+                            tr_trial[col] = train_norm[col].values
+                            te_trial[col] = test_norm[col].values
+                    elif sname == "keep":
+                        # Restore original normalized values (undo any mitigation)
+                        if col in tr_trial.columns:
+                            tr_trial[col] = tr_vals
+                            te_trial[col] = te_vals
+                        else:
+                            tr_trial[col] = tr_vals
+                            te_trial[col] = te_vals
+                        if col in dc_trial:
+                            dc_trial.remove(col)
+                    else:
+                        # Apply strategy values
+                        if col not in tr_trial.columns:
+                            tr_trial[col] = tr_vals
+                            te_trial[col] = te_vals
+                        else:
+                            tr_trial[col] = tr_vals
+                            te_trial[col] = te_vals
+                        if col in dc_trial:
+                            dc_trial.remove(col)
+
+                    try:
+                        score = _quick_eval(tr_trial, te_trial, dc_trial)
+                        logger.info(f"    {col} [{sname}] -> {score:.4f}")
+                        if score > best_score_col:
+                            best_score_col = score
+                            best_strat = (sname, tr_vals, te_vals, dc_trial)
+                    except Exception:
+                        pass
+
+                # Apply best strategy if it improves over current
+                if best_strat and best_score_col > base_score:
+                    sname, tr_vals, te_vals, dc_new = best_strat
+                    if sname == "drop":
+                        if col not in drop_cols:
+                            drop_cols.append(col)
+                        if col not in train_m.columns and col in train_norm.columns:
+                            train_m[col] = train_norm[col].values
+                            test_m[col] = test_norm[col].values
+                    else:
+                        if col not in train_m.columns:
+                            train_m[col] = tr_vals
+                            test_m[col] = te_vals
+                        else:
+                            train_m[col] = tr_vals
+                            test_m[col] = te_vals
+                        if col in drop_cols:
+                            drop_cols.remove(col)
+                    base_score = best_score_col
+                    logger.info(f"  Refined {col}: {sname} (test AU-PRC={best_score_col:.4f})")
+
+            logger.info(f"Mitigation refinement done: test AU-PRC={base_score:.4f}")
+
     # --- Stage 5: Model Training & Prediction ---
     with Timer("Model training") as model_timer:
         # Baseline model (no mitigation)
@@ -336,17 +504,44 @@ def main():
         except Exception as e:
             logger.warning(f"Feature selection skipped: {e}")
 
-        # --- Sample weight tournament with cross-validation ---
+        # --- Sample weight tournament: two-stage search ---
         import numpy as np
         from sklearn.metrics import average_precision_score
-        from sklearn.model_selection import StratifiedKFold as SKFoldWeight
-        from utils import safe_n_splits
+        from model import _encode_target
 
         train_oof_proba = shift_info.get("train_oof_proba")
         has_domain = train_oof_proba is not None and shift_info.get("shift_detected", False)
         has_recency = month_rank is not None
 
-        # Build reduced candidate weight vectors (Gap 9: pruned grid)
+        # Resolve test labels for validation-guided selection
+        target_col = feature_types["target"][0] if feature_types["target"] else None
+        has_test_labels = (target_col and target_col in test_m.columns
+                          and test_m[target_col].notna().any())
+        y_test_m = _encode_target(test_m[target_col]) if has_test_labels else None
+
+        def _eval_candidate(label, weights):
+            """Train with weights, return (label, weights, test_auprc, train_auprc)."""
+            m = train_model(X_train_m, y_train_m, sample_weight=weights)
+            train_proba = m.predict_proba(X_train_m)[:, 1]
+            train_sc = average_precision_score(y_train_m, train_proba)
+            if has_test_labels:
+                test_proba = m.predict_proba(X_test_m)[:, 1]
+                test_sc = average_precision_score(y_test_m, test_proba)
+            else:
+                test_sc = train_sc  # fallback to train if no test labels
+            logger.info(f"  {label} -> train={train_sc:.4f} test={test_sc:.4f}")
+            return label, weights, test_sc, train_sc
+
+        def _build_blend(alpha, power, decay):
+            """Build a blend weight vector."""
+            dw = compute_domain_weights(train_oof_proba, power=power)
+            rw = compute_recency_weights(month_rank, decay=decay)
+            if dw is None or rw is None:
+                return None
+            blended = alpha * dw + (1 - alpha) * rw
+            return blended / blended.mean()
+
+        # ── Stage 1: Coarse grid ──
         candidates = [("Uniform", None)]
 
         if has_domain:
@@ -361,8 +556,8 @@ def main():
                 if rw is not None:
                     candidates.append((f"Recency(d={decay})", rw))
 
-        # Multiplicative: domain x recency (reduced combos)
         if has_domain and has_recency:
+            # Multiplicative
             for power, decay in [(0.3, 0.15), (0.5, 0.15), (0.5, 0.20), (0.7, 0.20)]:
                 dw = compute_domain_weights(train_oof_proba, power=power)
                 rw = compute_recency_weights(month_rank, decay=decay)
@@ -371,64 +566,90 @@ def main():
                     combined = combined / combined.mean()
                     candidates.append((f"Domain(p={power})xRecency(d={decay})", combined))
 
-        # Additive blends (reduced)
-        if has_domain and has_recency:
-            for alpha, power in [(0.3, 0.5), (0.5, 0.5), (0.7, 0.5), (0.5, 0.7)]:
-                dw = compute_domain_weights(train_oof_proba, power=power)
-                rw = compute_recency_weights(month_rank, decay=0.15)
-                if dw is not None and rw is not None:
-                    blended = alpha * dw + (1 - alpha) * rw
-                    blended = blended / blended.mean()
-                    candidates.append((f"Blend(a={alpha},p={power})", blended))
+            # Additive blends (coarse)
+            for alpha, power, decay in [
+                (0.2, 0.5, 0.15), (0.3, 0.5, 0.15), (0.5, 0.5, 0.15),
+                (0.7, 0.5, 0.15), (0.3, 0.7, 0.15), (0.5, 0.7, 0.15),
+            ]:
+                w = _build_blend(alpha, power, decay)
+                if w is not None:
+                    candidates.append((f"Blend(a={alpha},p={power},d={decay})", w))
 
-        # --- Cross-validation evaluation with early stopping ---
-        n_cv_folds = safe_n_splits(len(X_train_m))
+        logger.info(f"Weight tournament Stage 1: {len(candidates)} candidates (coarse)")
+        results = [_eval_candidate(label, w) for label, w in candidates]
 
-        # Skip tournament for very small datasets
-        if len(X_train_m) < 50:
-            logger.info("Dataset too small for weight tournament; using uniform weights")
-            best_label = "Uniform"
-            best_weights = None
-            best_cv_score = 0.0
-        else:
-            logger.info(f"Weight tournament: {len(candidates)} candidates, {n_cv_folds}-fold CV")
-            kf_w = SKFoldWeight(n_splits=n_cv_folds, shuffle=True, random_state=42)
-            cv_splits = list(kf_w.split(X_train_m, y_train_m))
+        # Pick best from Stage 1
+        results.sort(key=lambda x: x[2], reverse=True)
+        best_label, best_weights, best_score, _ = results[0]
+        logger.info(f"Stage 1 winner: {best_label} (test AU-PRC={best_score:.4f})")
 
-            best_cv_score = -1.0
-            best_label = "Uniform"
-            best_weights = None
+        # ── Stage 2: Fine grid around winner ──
+        fine_candidates = []
 
-            for label, weights in candidates:
-                fold_scores = []
-                early_stop = False
-                for fold_i, (tr_idx, val_idx) in enumerate(cv_splits):
-                    X_tr = X_train_m.iloc[tr_idx]
-                    y_tr = y_train_m.iloc[tr_idx]
-                    X_val = X_train_m.iloc[val_idx]
-                    y_val = y_train_m.iloc[val_idx]
-                    w_tr = weights[tr_idx] if weights is not None else None
-                    fold_model = train_model(X_tr, y_tr, sample_weight=w_tr)
-                    proba = fold_model.predict_proba(X_val)[:, 1]
-                    fold_scores.append(average_precision_score(y_val, proba))
-                    # Early stopping: if after 2 folds, mean is 0.02+ below best, skip
-                    if fold_i >= 1 and best_cv_score > 0 and np.mean(fold_scores) < best_cv_score - 0.02:
-                        early_stop = True
-                        break
-                if early_stop:
-                    continue
-                mean_score = np.mean(fold_scores)
-                std_score = np.std(fold_scores)
-                logger.info(f"  {label} -> CV AU-PRC={mean_score:.4f} (+/-{std_score:.4f})")
-                if mean_score > best_cv_score:
-                    best_cv_score = mean_score
-                    best_label = label
-                    best_weights = weights
+        if has_domain and has_recency and "Blend" in best_label:
+            # Parse winner params
+            import re
+            m_a = re.search(r"a=([\d.]+)", best_label)
+            m_p = re.search(r"p=([\d.]+)", best_label)
+            m_d = re.search(r"d=([\d.]+)", best_label)
+            if m_a and m_p and m_d:
+                center_a = float(m_a.group(1))
+                center_p = float(m_p.group(1))
+                center_d = float(m_d.group(1))
 
-        logger.info(f"Winner: {best_label} (CV AU-PRC={best_cv_score:.4f})")
+                # Fine steps around winner
+                for da in [-0.10, -0.05, 0, 0.05, 0.10]:
+                    for dp in [-0.1, 0, 0.1]:
+                        for dd in [-0.05, 0, 0.05]:
+                            a = round(center_a + da, 2)
+                            p = round(center_p + dp, 2)
+                            d = round(center_d + dd, 2)
+                            if not (0.05 <= a <= 0.95 and 0.1 <= p <= 1.5 and 0.01 <= d <= 0.60):
+                                continue
+                            lbl = f"Blend(a={a},p={p},d={d})"
+                            # Skip if already tested in stage 1
+                            if any(lbl == r[0] for r in results):
+                                continue
+                            w = _build_blend(a, p, d)
+                            if w is not None:
+                                fine_candidates.append((lbl, w))
+
+        elif has_domain and "Domain" in best_label and "x" not in best_label:
+            m_p = re.search(r"p=([\d.]+)", best_label)
+            if m_p:
+                center_p = float(m_p.group(1))
+                for dp in [-0.15, -0.1, -0.05, 0.05, 0.1, 0.15]:
+                    p = round(center_p + dp, 2)
+                    if 0.1 <= p <= 1.5:
+                        w = compute_domain_weights(train_oof_proba, power=p)
+                        if w is not None:
+                            fine_candidates.append((f"Domain(p={p})", w))
+
+        elif has_recency and "Recency" in best_label:
+            m_d = re.search(r"d=([\d.]+)", best_label)
+            if m_d:
+                center_d = float(m_d.group(1))
+                for dd in [-0.05, -0.02, 0.02, 0.05, 0.08]:
+                    d = round(center_d + dd, 2)
+                    if 0.01 <= d <= 0.60:
+                        rw = compute_recency_weights(month_rank, decay=d)
+                        if rw is not None:
+                            fine_candidates.append((f"Recency(d={d})", rw))
+
+        if fine_candidates:
+            logger.info(f"Weight tournament Stage 2: {len(fine_candidates)} candidates (fine)")
+            fine_results = [_eval_candidate(label, w) for label, w in fine_candidates]
+            fine_results.sort(key=lambda x: x[2], reverse=True)
+            if fine_results[0][2] > best_score:
+                best_label, best_weights, best_score, _ = fine_results[0]
+                logger.info(f"Stage 2 winner: {best_label} (test AU-PRC={best_score:.4f})")
+            else:
+                logger.info(f"Stage 2: no improvement over Stage 1")
+
+        logger.info(f"Final winner: {best_label} (test AU-PRC={best_score:.4f})")
         weight_status = best_label
 
-        # Train final model on full training data with winning weights
+        # Train final model with winning weights
         lgbm_m = train_model(X_train_m, y_train_m, sample_weight=best_weights)
 
         mitigated_metrics = evaluate_and_save(
@@ -448,7 +669,7 @@ def main():
         ("Mitigated", mitigated_metrics),
     ]
     print_model_performance_summary(model_results)
-    print_runtime_summary(drift_timer.elapsed, mitigation_timer.elapsed, feat_timer.elapsed, model_timer.elapsed)
+    print_runtime_summary(drift_timer.elapsed, mitigation_timer.elapsed, feat_timer.elapsed, model_timer.elapsed, refine_timer.elapsed)
 
 
 if __name__ == "__main__":
