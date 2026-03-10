@@ -159,7 +159,7 @@ def clip_outliers(
     train_col: pd.Series, test_col: pd.Series
 ) -> tuple[pd.Series, pd.Series]:
     """Clip both columns to [1st, 99th] percentile of train."""
-    vals = train_col.dropna().values.astype(float)
+    vals = pd.to_numeric(train_col, errors="coerce").dropna().values.astype(float)
     lo, hi = np.percentile(vals, [1, 99])
     return train_col.clip(lo, hi), test_col.clip(lo, hi)
 
@@ -177,7 +177,7 @@ def quantile_bin(
     train_col: pd.Series, test_col: pd.Series, n_bins: int = 10
 ) -> tuple[pd.Series, pd.Series]:
     """Discretize into quantile bins defined by train edges."""
-    vals = train_col.dropna().values.astype(float)
+    vals = pd.to_numeric(train_col, errors="coerce").dropna().values.astype(float)
     # Adapt bins to sample size
     n_bins = min(n_bins, max(2, len(vals) // 20))
     percentiles = np.linspace(0, 100, n_bins + 1)[1:-1]
@@ -272,7 +272,7 @@ def quantile_match(
     then maps to the corresponding value from the training distribution.
     Training data is unchanged; test rank ordering is preserved.
     """
-    train_vals = train_col.dropna().values.astype(float)
+    train_vals = pd.to_numeric(train_col, errors="coerce").dropna().values.astype(float)
     test_numeric = pd.to_numeric(test_col, errors="coerce")
     test_vals = test_numeric.dropna().values.astype(float)
 
@@ -307,12 +307,12 @@ def rank_transform(
 
     Distribution-agnostic: eliminates drift while preserving ordering.
     """
-    train_vals = train_col.dropna().values.astype(float)
+    train_vals = pd.to_numeric(train_col, errors="coerce").dropna().values.astype(float)
     sorted_vals = np.sort(train_vals)
     n = len(sorted_vals)
 
     def _to_rank(s):
-        arr = s.values.astype(float)
+        arr = pd.to_numeric(s, errors="coerce").values.astype(float)
         ranks = np.searchsorted(sorted_vals, arr, side="right") / n
         return pd.Series(np.clip(ranks, 0, 1), index=s.index, name=s.name)
 
