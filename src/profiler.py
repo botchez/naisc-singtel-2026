@@ -200,12 +200,26 @@ def detect_feature_types(
             types["temporal"].append(col)
             continue
 
+        # Numeric coercion: if a non-numeric column is mostly parseable as numbers,
+        # treat it as numerical (e.g., TotalCharges with a few blank strings)
+        if not pd.api.types.is_numeric_dtype(df[col]) and _looks_numeric(df[col]):
+            logger.info(f"Coercing '{col}' to numeric (mostly numeric values with unparseable entries)")
+            types["numerical"].append(col)
+            continue
+
         if pd.api.types.is_numeric_dtype(df[col]):
             types["numerical"].append(col)
         else:
             types["categorical"].append(col)
 
     return types
+
+
+def _looks_numeric(series: pd.Series, threshold: float = 0.8) -> bool:
+    """Heuristic: check if a non-numeric column is mostly parseable as numbers."""
+    coerced = pd.to_numeric(series, errors="coerce")
+    parse_rate = coerced.notna().sum() / max(len(series), 1)
+    return parse_rate >= threshold
 
 
 def _looks_temporal(series: pd.Series, sample_size: int = 50) -> bool:

@@ -90,8 +90,8 @@ def detect_numerical_drift(
     test_null_pct = float(test_col.isna().mean())
     miss_sev = _missingness_severity(train_null_pct, test_null_pct)
 
-    train_vals = train_col.dropna().values.astype(float)
-    test_vals = test_col.dropna().values.astype(float)
+    train_vals = pd.to_numeric(train_col, errors="coerce").dropna().values.astype(float)
+    test_vals = pd.to_numeric(test_col, errors="coerce").dropna().values.astype(float)
 
     if len(train_vals) == 0 or len(test_vals) == 0:
         return {"ks_stat": None, "ks_pval": None, "psi": None, "wasserstein": None,
@@ -281,8 +281,8 @@ def generate_drift_description(
     parts = []
 
     if feature_type == "numerical":
-        train_vals = train_col.dropna().values.astype(float)
-        test_vals = test_col.dropna().values.astype(float)
+        train_vals = pd.to_numeric(train_col, errors="coerce").dropna().values.astype(float)
+        test_vals = pd.to_numeric(test_col, errors="coerce").dropna().values.astype(float)
         if len(train_vals) == 0 or len(test_vals) == 0:
             return "Insufficient data for drift characterization"
 

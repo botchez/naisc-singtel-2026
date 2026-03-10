@@ -93,6 +93,12 @@ def prepare_features(
     X_train = train[feature_cols].copy()
     X_test = test[feature_cols].copy()
 
+    # Coerce columns classified as numerical but stored as object (e.g., "TotalCharges" with blanks)
+    for col in feature_types["numerical"]:
+        if col in feature_cols and not pd.api.types.is_numeric_dtype(X_train[col]):
+            X_train[col] = pd.to_numeric(X_train[col], errors="coerce")
+            X_test[col] = pd.to_numeric(X_test[col], errors="coerce")
+
     # Coerce mismatched dtypes between train and test
     for col in feature_cols:
         if X_train[col].dtype != X_test[col].dtype:
