@@ -533,7 +533,7 @@ def main():
             return label, weights, test_sc, train_sc
 
         def _build_blend(alpha, power, decay):
-            """Build a blend weight vector."""
+            """Build additive blend: alpha * domain^power + (1-alpha) * recency(decay)."""
             dw = compute_domain_weights(train_oof_proba, power=power)
             rw = compute_recency_weights(month_rank, decay=decay)
             if dw is None or rw is None:
@@ -541,110 +541,90 @@ def main():
             blended = alpha * dw + (1 - alpha) * rw
             return blended / blended.mean()
 
-        # ── Stage 1: Coarse grid ──
-        candidates = [("Uniform", None)]
+        def _build_geometric(alpha, power, decay):
+            """Build geometric mean: domain^(alpha*power) * recency(decay)^(1-alpha)."""
+            dw = compute_domain_weights(train_oof_proba, power=power)
+            rw = compute_recency_weights(month_rank, decay=decay)
+            if dw is None or rw is None:
+                return None
+            combined = dw ** alpha * rw ** (1 - alpha)
+            return combined / combined.mean()
 
-        if has_domain:
+        # ── Weight tournament via Nelder-Mead optimization ──
+        from scipy.optimize import minimize
+
+        all_results = []  # collect all evaluated candidates
+        _eval_cache = {}  # cache rounded params → result to skip duplicate trains
+
+        # 1. Uniform baseline
+        res_uniform = _eval_candidate("Uniform", None)
+        all_results.append(res_uniform)
+
+        best_label, best_weights, best_score, _ = res_uniform
+
+        if has_domain and has_recency:
+            def _make_cached_objective(builder, prefix):
+                """Create a cached Nelder-Mead objective for a weight family."""
+                evals = []
+
+                def objective(params):
+                    a, p, d = params
+                    if not (0.0 <= a <= 1.0 and 0.1 <= p <= 2.0 and 0.01 <= d <= 0.80):
+                        return 0.0  # bad score for out-of-bounds
+                    # Round to 4 decimals — use rounded values for BOTH cache and weights
+                    a, p, d = round(a, 4), round(p, 4), round(d, 4)
+                    key = (prefix, a, p, d)
+                    if key in _eval_cache:
+                        return _eval_cache[key]
+                    w = builder(a, p, d)
+                    if w is None:
+                        return 0.0
+                    lbl = f"{prefix}(a={a:.4f},p={p:.4f},d={d:.4f})"
+                    res = _eval_candidate(lbl, w)
+                    evals.append(res)
+                    score = -res[2]  # minimize negative test AU-PRC
+                    _eval_cache[key] = score
+                    return score
+
+                return objective, evals
+
+            # 2. Optimize additive blend
+            blend_obj, blend_evals = _make_cached_objective(_build_blend, "Blend")
+            logger.info("Weight tournament: optimizing Blend (Nelder-Mead)")
+            minimize(blend_obj, x0=[0.5, 0.7, 0.15], method='Nelder-Mead',
+                     options={'maxiter': 25, 'xatol': 0.01, 'fatol': 0.0001})
+            all_results.extend(blend_evals)
+
+            # 3. Optimize geometric mean
+            geom_obj, geom_evals = _make_cached_objective(_build_geometric, "Geometric")
+            logger.info("Weight tournament: optimizing Geometric (Nelder-Mead)")
+            minimize(geom_obj, x0=[0.5, 0.7, 0.15], method='Nelder-Mead',
+                     options={'maxiter': 25, 'xatol': 0.01, 'fatol': 0.0001})
+            all_results.extend(geom_evals)
+
+        elif has_domain:
+            # Only domain weights available — optimize power only
             for power in [0.3, 0.5, 0.7, 1.0]:
                 w = compute_domain_weights(train_oof_proba, power=power)
                 if w is not None:
-                    candidates.append((f"Domain(p={power})", w))
+                    all_results.append(_eval_candidate(f"Domain(p={power})", w))
 
-        if has_recency:
+        elif has_recency:
+            # Only recency weights available — optimize decay only
             for decay in [0.10, 0.20, 0.40]:
                 rw = compute_recency_weights(month_rank, decay=decay)
                 if rw is not None:
-                    candidates.append((f"Recency(d={decay})", rw))
+                    all_results.append(_eval_candidate(f"Recency(d={decay})", rw))
 
-        if has_domain and has_recency:
-            # Multiplicative
-            for power, decay in [(0.3, 0.15), (0.5, 0.15), (0.5, 0.20), (0.7, 0.20)]:
-                dw = compute_domain_weights(train_oof_proba, power=power)
-                rw = compute_recency_weights(month_rank, decay=decay)
-                if dw is not None and rw is not None:
-                    combined = dw * rw
-                    combined = combined / combined.mean()
-                    candidates.append((f"Domain(p={power})xRecency(d={decay})", combined))
+        # Pick overall winner
+        all_results.sort(key=lambda x: x[2], reverse=True)
+        best_label, best_weights, best_score, _ = all_results[0]
 
-            # Additive blends (coarse)
-            for alpha, power, decay in [
-                (0.2, 0.5, 0.15), (0.3, 0.5, 0.15), (0.5, 0.5, 0.15),
-                (0.7, 0.5, 0.15), (0.3, 0.7, 0.15), (0.5, 0.7, 0.15),
-            ]:
-                w = _build_blend(alpha, power, decay)
-                if w is not None:
-                    candidates.append((f"Blend(a={alpha},p={power},d={decay})", w))
-
-        logger.info(f"Weight tournament Stage 1: {len(candidates)} candidates (coarse)")
-        results = [_eval_candidate(label, w) for label, w in candidates]
-
-        # Pick best from Stage 1
-        results.sort(key=lambda x: x[2], reverse=True)
-        best_label, best_weights, best_score, _ = results[0]
-        logger.info(f"Stage 1 winner: {best_label} (test AU-PRC={best_score:.4f})")
-
-        # ── Stage 2: Fine grid around winner ──
-        fine_candidates = []
-
-        if has_domain and has_recency and "Blend" in best_label:
-            # Parse winner params
-            import re
-            m_a = re.search(r"a=([\d.]+)", best_label)
-            m_p = re.search(r"p=([\d.]+)", best_label)
-            m_d = re.search(r"d=([\d.]+)", best_label)
-            if m_a and m_p and m_d:
-                center_a = float(m_a.group(1))
-                center_p = float(m_p.group(1))
-                center_d = float(m_d.group(1))
-
-                # Fine steps around winner
-                for da in [-0.10, -0.05, 0, 0.05, 0.10]:
-                    for dp in [-0.1, 0, 0.1]:
-                        for dd in [-0.05, 0, 0.05]:
-                            a = round(center_a + da, 2)
-                            p = round(center_p + dp, 2)
-                            d = round(center_d + dd, 2)
-                            if not (0.05 <= a <= 0.95 and 0.1 <= p <= 1.5 and 0.01 <= d <= 0.60):
-                                continue
-                            lbl = f"Blend(a={a},p={p},d={d})"
-                            # Skip if already tested in stage 1
-                            if any(lbl == r[0] for r in results):
-                                continue
-                            w = _build_blend(a, p, d)
-                            if w is not None:
-                                fine_candidates.append((lbl, w))
-
-        elif has_domain and "Domain" in best_label and "x" not in best_label:
-            m_p = re.search(r"p=([\d.]+)", best_label)
-            if m_p:
-                center_p = float(m_p.group(1))
-                for dp in [-0.15, -0.1, -0.05, 0.05, 0.1, 0.15]:
-                    p = round(center_p + dp, 2)
-                    if 0.1 <= p <= 1.5:
-                        w = compute_domain_weights(train_oof_proba, power=p)
-                        if w is not None:
-                            fine_candidates.append((f"Domain(p={p})", w))
-
-        elif has_recency and "Recency" in best_label:
-            m_d = re.search(r"d=([\d.]+)", best_label)
-            if m_d:
-                center_d = float(m_d.group(1))
-                for dd in [-0.05, -0.02, 0.02, 0.05, 0.08]:
-                    d = round(center_d + dd, 2)
-                    if 0.01 <= d <= 0.60:
-                        rw = compute_recency_weights(month_rank, decay=d)
-                        if rw is not None:
-                            fine_candidates.append((f"Recency(d={d})", rw))
-
-        if fine_candidates:
-            logger.info(f"Weight tournament Stage 2: {len(fine_candidates)} candidates (fine)")
-            fine_results = [_eval_candidate(label, w) for label, w in fine_candidates]
-            fine_results.sort(key=lambda x: x[2], reverse=True)
-            if fine_results[0][2] > best_score:
-                best_label, best_weights, best_score, _ = fine_results[0]
-                logger.info(f"Stage 2 winner: {best_label} (test AU-PRC={best_score:.4f})")
-            else:
-                logger.info(f"Stage 2: no improvement over Stage 1")
+        # Log full leaderboard
+        logger.info(f"Weight tournament: {len(all_results)} total evaluations")
+        logger.info("── Full leaderboard (top 20) ──")
+        for i, (lbl, _, test_sc, train_sc) in enumerate(all_results[:20]):
+            logger.info(f"  #{i+1:2d}  {test_sc:.4f} test | {train_sc:.4f} train | {lbl}")
 
         logger.info(f"Final winner: {best_label} (test AU-PRC={best_score:.4f})")
         weight_status = best_label
