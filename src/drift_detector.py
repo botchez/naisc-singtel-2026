@@ -448,6 +448,19 @@ def _apply_bh_correction(drift_df: pd.DataFrame, ss_factor: float = 1.0) -> pd.D
     return drift_df
 
 
+def _analyze_single_feature(train_col, test_col, col_name, feature_type):
+    """Analyze drift for a single feature (used for parallel execution)."""
+    if feature_type == "numerical":
+        drift = detect_numerical_drift(train_col, test_col)
+        desc = generate_drift_description(train_col, test_col, "numerical", drift)
+        return {"column": col_name, "feature_type": "numerical", "drift_description": desc, **drift}
+    else:
+        drift = detect_categorical_drift(train_col, test_col)
+        desc = generate_drift_description(train_col, test_col, feature_type, drift)
+        drift["unseen_in_test"] = ", ".join(drift["unseen_in_test"]) if drift["unseen_in_test"] else ""
+        return {"column": col_name, "feature_type": feature_type, "drift_description": desc, **drift}
+
+
 def run_drift_analysis(
     train: pd.DataFrame,
     test: pd.DataFrame,
@@ -457,32 +470,33 @@ def run_drift_analysis(
 
     Applies Benjamini-Hochberg FDR correction across all p-values to
     control for multiple testing, then re-classifies severity.
+    Uses parallel execution for datasets with many features.
     """
-    results = []
+    from joblib import Parallel, delayed
 
+    # Build list of (col, type) pairs to analyze
+    tasks = []
     for col in feature_types["numerical"]:
-        if col not in train.columns or col not in test.columns:
-            continue
-        drift = detect_numerical_drift(train[col], test[col])
-        desc = generate_drift_description(train[col], test[col], "numerical", drift)
-        results.append({"column": col, "feature_type": "numerical", "drift_description": desc, **drift})
-
+        if col in train.columns and col in test.columns:
+            tasks.append((col, "numerical"))
     for col in feature_types["categorical"]:
-        if col not in train.columns or col not in test.columns:
-            continue
-        drift = detect_categorical_drift(train[col], test[col])
-        desc = generate_drift_description(train[col], test[col], "categorical", drift)
-        # Convert list to string for display
-        drift["unseen_in_test"] = ", ".join(drift["unseen_in_test"]) if drift["unseen_in_test"] else ""
-        results.append({"column": col, "feature_type": "categorical", "drift_description": desc, **drift})
-
+        if col in train.columns and col in test.columns:
+            tasks.append((col, "categorical"))
     for col in feature_types["temporal"]:
-        if col not in train.columns or col not in test.columns:
-            continue
-        drift = detect_categorical_drift(train[col], test[col])
-        desc = generate_drift_description(train[col], test[col], "temporal", drift)
-        drift["unseen_in_test"] = ", ".join(drift["unseen_in_test"]) if drift["unseen_in_test"] else ""
-        results.append({"column": col, "feature_type": "temporal", "drift_description": desc, **drift})
+        if col in train.columns and col in test.columns:
+            tasks.append((col, "temporal"))
+
+    # Parallelize when there are many features (>20)
+    if len(tasks) > 20:
+        results = Parallel(n_jobs=-1, prefer="threads")(
+            delayed(_analyze_single_feature)(train[col], test[col], col, ftype)
+            for col, ftype in tasks
+        )
+    else:
+        results = [
+            _analyze_single_feature(train[col], test[col], col, ftype)
+            for col, ftype in tasks
+        ]
 
     drift_df = pd.DataFrame(results)
     if drift_df.empty:
