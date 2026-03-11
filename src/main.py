@@ -327,9 +327,17 @@ def main():
         if has_test_labels:
             y_test_ref = _encode_target(test_m[target_col])
 
+            # Subsample for quick evaluations during refinement
+            # 50K rows is enough to reliably compare strategy variants
+            _MAX_REFINE_SAMPLE = 50_000
+            _refine_tr_idx = None
+            if len(train_m) > _MAX_REFINE_SAMPLE:
+                _refine_tr_idx = train_m.sample(n=_MAX_REFINE_SAMPLE, random_state=42).index
+
             def _quick_eval(tr_df, te_df, dc):
                 """Quick train+eval to get test AU-PRC for a mitigation variant."""
-                X_tr, y_tr, X_te, _ = prepare_features(tr_df, te_df, feature_types, extra_drop_cols=dc)
+                tr_sub = tr_df.loc[_refine_tr_idx] if _refine_tr_idx is not None else tr_df
+                X_tr, y_tr, X_te, _ = prepare_features(tr_sub, te_df, feature_types, extra_drop_cols=dc)
                 m = train_model(X_tr, y_tr)
                 proba = m.predict_proba(X_te)[:, 1]
                 return average_precision_score(y_test_ref, proba)
@@ -351,6 +359,16 @@ def main():
                     ftype = row["feature_type"]
                     if col in train_norm.columns and col in test_norm.columns:
                         refine_features.append((col, ftype, row["severity"]))
+
+            # Cap refinement to top-20 drifted features to avoid O(m*8*epochs)
+            # blowup at 500 features. Prioritize high-severity first.
+            _MAX_REFINE_FEATURES = 20
+            if len(refine_features) > _MAX_REFINE_FEATURES:
+                # Sort: high before moderate
+                severity_order = {"high": 0, "moderate": 1}
+                refine_features.sort(key=lambda x: severity_order.get(x[2], 2))
+                logger.info(f"Capping refinement to {_MAX_REFINE_FEATURES}/{len(refine_features)} drifted features")
+                refine_features = refine_features[:_MAX_REFINE_FEATURES]
 
             if refine_features:
                 logger.info(f"Refining {len(refine_features)} drifted features by test AU-PRC")
@@ -519,11 +537,26 @@ def main():
                           and test_m[target_col].notna().any())
         y_test_m = _encode_target(test_m[target_col]) if has_test_labels else None
 
+        # Subsample for weight tournament evaluations on large datasets
+        # 100K rows is enough for reliable AU-PRC comparison between weight strategies
+        _MAX_TOURNEY_SAMPLE = 100_000
+        _tourney_idx = None
+        if len(X_train_m) > _MAX_TOURNEY_SAMPLE:
+            rng = np.random.RandomState(42)
+            _tourney_idx = rng.choice(len(X_train_m), size=_MAX_TOURNEY_SAMPLE, replace=False)
+            logger.info(f"Weight tournament: subsampling {_MAX_TOURNEY_SAMPLE}/{len(X_train_m)} rows")
+
         def _eval_candidate(label, weights):
             """Train with weights, return (label, weights, test_auprc, train_auprc)."""
-            m = train_model(X_train_m, y_train_m, sample_weight=weights)
-            train_proba = m.predict_proba(X_train_m)[:, 1]
-            train_sc = average_precision_score(y_train_m, train_proba)
+            if _tourney_idx is not None:
+                X_sub = X_train_m.iloc[_tourney_idx]
+                y_sub = y_train_m.iloc[_tourney_idx]
+                w_sub = weights[_tourney_idx] if weights is not None else None
+            else:
+                X_sub, y_sub, w_sub = X_train_m, y_train_m, weights
+            m = train_model(X_sub, y_sub, sample_weight=w_sub)
+            train_proba = m.predict_proba(X_sub)[:, 1]
+            train_sc = average_precision_score(y_sub, train_proba)
             if has_test_labels:
                 test_proba = m.predict_proba(X_test_m)[:, 1]
                 test_sc = average_precision_score(y_test_m, test_proba)

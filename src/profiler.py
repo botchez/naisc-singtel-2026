@@ -3,11 +3,44 @@ import numpy as np
 from utils import logger
 
 
+def _downcast_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Downcast numeric columns to reduce memory usage.
+
+    float64 -> float32, int64 -> int32/int16/int8 where safe.
+    Essential for handling 10M+ row datasets within memory limits.
+    """
+    for col in df.columns:
+        col_dtype = df[col].dtype
+        if col_dtype == np.float64:
+            df[col] = df[col].astype(np.float32)
+        elif col_dtype == np.int64:
+            col_min = df[col].min()
+            col_max = df[col].max()
+            if col_min >= np.iinfo(np.int8).min and col_max <= np.iinfo(np.int8).max:
+                df[col] = df[col].astype(np.int8)
+            elif col_min >= np.iinfo(np.int16).min and col_max <= np.iinfo(np.int16).max:
+                df[col] = df[col].astype(np.int16)
+            elif col_min >= np.iinfo(np.int32).min and col_max <= np.iinfo(np.int32).max:
+                df[col] = df[col].astype(np.int32)
+    return df
+
+
 def load_data(train_path: str, test_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load train and test CSVs."""
-    train = pd.read_csv(train_path)
-    test = pd.read_csv(test_path)
-    logger.info(f"Loaded train: {train.shape}, test: {test.shape}")
+    """Load train and test CSVs with memory optimization.
+
+    Applies dtype downcasting to reduce memory footprint for large datasets
+    (e.g., 10M rows × 500 features).
+    """
+    train = pd.read_csv(train_path, low_memory=False)
+    test = pd.read_csv(test_path, low_memory=False)
+
+    mem_before = (train.memory_usage(deep=True).sum() + test.memory_usage(deep=True).sum()) / 1e6
+    train = _downcast_dataframe(train)
+    test = _downcast_dataframe(test)
+    mem_after = (train.memory_usage(deep=True).sum() + test.memory_usage(deep=True).sum()) / 1e6
+
+    logger.info(f"Loaded train: {train.shape}, test: {test.shape} "
+                f"(memory: {mem_before:.1f}MB -> {mem_after:.1f}MB)")
     return train, test
 
 
@@ -89,7 +122,7 @@ def align_train_test_columns(
             if norm in train_norm:
                 rename_map[test_col] = train_norm[norm]
 
-    test_aligned = test.rename(columns=rename_map) if rename_map else test.copy()
+    test_aligned = test.rename(columns=rename_map) if rename_map else test
 
     if rename_map:
         logger.info(f"Fuzzy-matched columns (test->train): {rename_map}")
@@ -104,7 +137,7 @@ def align_train_test_columns(
     if remaining_test_only:
         logger.warning(f"Columns only in test: {sorted(remaining_test_only)}")
 
-    return train.copy(), test_aligned
+    return train, test_aligned
 
 
 def detect_feature_types(
