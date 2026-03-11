@@ -1,37 +1,19 @@
-# NAISC Singtel 2026 — Adaptive Drift Intelligence Challenge
+# Synthetic Dataset Generator
 
-**Team Name:** junyiding
+Generates a synthetic dataset with 10M rows and 500 features for ML benchmarking. Modeled after a telecom churn-prediction schema with a mix of numerical, categorical, time-based, and sparse columns. Writes in chunks to keep memory usage low.
 
 ## Setup
 
 ```bash
-pip install -r requirements.txt
+pip install numpy pandas pyarrow
 ```
 
 ## Run
 
 ```bash
-python ./src/main.py --train_data_filepath <train_data_filepath> --test_data_filepath <test_data_filepath>
+python generate_dataset.py
 ```
 
-Example with public data:
+## Config
 
-```bash
-python ./src/main.py --train_data_filepath public_data/train.csv --test_data_filepath public_data/test.csv
-```
-
-## Output
-
-- Console: drift detection summary, runtime, AU-PRC metrics
-- `prediction.csv`: CustomerID and probability scores
-- `model.joblib`: trained LightGBM model
-
-## Dashboard
-
-Interactive drift visualization dashboard:
-
-```bash
-streamlit run src/dashboard.py
-```
-
-Opens in browser at `http://localhost:8501`.
+Edit the top of `generate_dataset.py` to change row count, chunk size, output format (csv/parquet), or file path.
