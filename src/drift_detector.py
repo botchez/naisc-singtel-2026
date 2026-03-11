@@ -2,6 +2,28 @@ import pandas as pd
 import numpy as np
 from scipy import stats
 
+# Maximum sample size for statistical tests. Beyond this, additional rows
+# add negligible statistical power but cost O(n log n) compute.  50K is
+# enough for KS, PSI, Chi², and Wasserstein at any practical significance level.
+_MAX_DRIFT_SAMPLE = 50_000
+
+
+def _subsample_array(arr: np.ndarray, max_n: int = _MAX_DRIFT_SAMPLE, seed: int = 42) -> np.ndarray:
+    """Randomly subsample an array if it exceeds max_n."""
+    if len(arr) <= max_n:
+        return arr
+    rng = np.random.RandomState(seed)
+    idx = rng.choice(len(arr), size=max_n, replace=False)
+    return arr[idx]
+
+
+def _subsample_series(s: pd.Series, max_n: int = _MAX_DRIFT_SAMPLE, seed: int = 42) -> pd.Series:
+    """Randomly subsample a Series if it exceeds max_n."""
+    if len(s) <= max_n:
+        return s
+    return s.sample(n=max_n, random_state=seed)
+
+
 def compute_psi(expected: np.ndarray, actual: np.ndarray, bins: int = 10) -> float:
     """Population Stability Index between two distributions."""
     # Adapt bins to sample size to avoid sparse bins
@@ -98,28 +120,33 @@ def detect_numerical_drift(
                 "wasserstein_norm": None, "train_null_pct": round(train_null_pct, 4),
                 "test_null_pct": round(test_null_pct, 4), "severity": _escalate_severity("unknown", miss_sev)}
 
-    ks_stat, ks_pval = stats.ks_2samp(train_vals, test_vals)
-    psi = compute_psi(train_vals, test_vals)
-    wasserstein = stats.wasserstein_distance(train_vals, test_vals)
+    # Subsample for statistical tests — 50K rows gives equivalent power
+    train_sample = _subsample_array(train_vals)
+    test_sample = _subsample_array(test_vals)
+
+    ks_stat, ks_pval = stats.ks_2samp(train_sample, test_sample)
+    psi = compute_psi(train_sample, test_sample)
+    wasserstein = stats.wasserstein_distance(train_sample, test_sample)
 
     # Normalized Wasserstein (scale-invariant, similar to Cohen's d)
-    std_train = np.std(train_vals)
+    std_train = np.std(train_sample)
     wasserstein_norm = wasserstein / (std_train + 1e-8)
 
     # IQR shift detection: spread changes not captured by location-based tests
-    train_q1, train_q3 = np.percentile(train_vals, [25, 75])
-    test_q1, test_q3 = np.percentile(test_vals, [25, 75])
+    train_q1, train_q3 = np.percentile(train_sample, [25, 75])
+    test_q1, test_q3 = np.percentile(test_sample, [25, 75])
     train_iqr = train_q3 - train_q1
     test_iqr = test_q3 - test_q1
     iqr_ratio = test_iqr / (train_iqr + 1e-8)
 
     # Tail divergence: extreme percentile shifts not captured by histogram-based PSI
-    train_p1, train_p99 = np.percentile(train_vals, [1, 99])
-    test_p1, test_p99 = np.percentile(test_vals, [1, 99])
+    train_p1, train_p99 = np.percentile(train_sample, [1, 99])
+    test_p1, test_p99 = np.percentile(test_sample, [1, 99])
     tail_low = abs(test_p1 - train_p1) / (std_train + 1e-8)
     tail_high = abs(test_p99 - train_p99) / (std_train + 1e-8)
     tail_div = max(tail_low, tail_high)
 
+    # Use original full sizes for small-sample factor (not subsampled sizes)
     ss_factor = _small_sample_factor(len(train_vals), len(test_vals))
     severity = _numerical_severity(ks_pval, psi, wasserstein_norm, ks_stat, iqr_ratio, tail_div, ss_factor)
     severity = _escalate_severity(severity, miss_sev)
@@ -146,6 +173,10 @@ def detect_categorical_drift(
     test_null_pct = float(test_col.isna().mean())
     miss_sev = _missingness_severity(train_null_pct, test_null_pct)
 
+    # Subsample for chi-squared / JSD — preserves distribution proportions
+    train_sub = _subsample_series(train_col.dropna())
+    test_sub = _subsample_series(test_col.dropna())
+
     all_categories = sorted(set(train_col.dropna().unique()) | set(test_col.dropna().unique()), key=str)
 
     if len(all_categories) == 0:
@@ -153,8 +184,8 @@ def detect_categorical_drift(
                 "train_null_pct": round(train_null_pct, 4), "test_null_pct": round(test_null_pct, 4),
                 "severity": _escalate_severity("unknown", miss_sev)}
 
-    train_counts = train_col.value_counts().reindex(all_categories, fill_value=0).values.astype(float)
-    test_counts = test_col.value_counts().reindex(all_categories, fill_value=0).values.astype(float)
+    train_counts = train_sub.value_counts().reindex(all_categories, fill_value=0).values.astype(float)
+    test_counts = test_sub.value_counts().reindex(all_categories, fill_value=0).values.astype(float)
 
     # JSD on full distribution (always reliable)
     jsd = compute_jsd(train_counts, test_counts)
@@ -191,6 +222,7 @@ def detect_categorical_drift(
     test_cats = set(test_col.dropna().unique())
     unseen_in_test = sorted(test_cats - train_cats)
 
+    # Use original full sizes for small-sample factor
     n_tr = len(train_col.dropna())
     n_te = len(test_col.dropna())
     ss_factor = _small_sample_factor(n_tr, n_te)
@@ -281,8 +313,8 @@ def generate_drift_description(
     parts = []
 
     if feature_type == "numerical":
-        train_vals = pd.to_numeric(train_col, errors="coerce").dropna().values.astype(float)
-        test_vals = pd.to_numeric(test_col, errors="coerce").dropna().values.astype(float)
+        train_vals = _subsample_array(pd.to_numeric(train_col, errors="coerce").dropna().values.astype(float))
+        test_vals = _subsample_array(pd.to_numeric(test_col, errors="coerce").dropna().values.astype(float))
         if len(train_vals) == 0 or len(test_vals) == 0:
             return "Insufficient data for drift characterization"
 
@@ -497,6 +529,15 @@ def detect_multivariate_shift(
     X_tr = train[feature_cols].copy()
     X_te = test[feature_cols].copy()
 
+    # Subsample for domain classifier when datasets are large
+    # 100K per split is sufficient for shift detection
+    _MAX_DOMAIN_SAMPLE = 100_000
+    full_train_n = len(X_tr)
+    if len(X_tr) > _MAX_DOMAIN_SAMPLE:
+        X_tr = X_tr.sample(n=_MAX_DOMAIN_SAMPLE, random_state=42).reset_index(drop=True)
+    if len(X_te) > _MAX_DOMAIN_SAMPLE:
+        X_te = X_te.sample(n=_MAX_DOMAIN_SAMPLE, random_state=42).reset_index(drop=True)
+
     # Simple preprocessing: label encode objects, fill NaN
     for col in feature_cols:
         if X_tr[col].dtype == object:
@@ -553,7 +594,26 @@ def detect_multivariate_shift(
     logger.info(f"Top domain-shift features (gain): {top_features}")
 
     # Extract per-training-row P(test) for sample weighting
-    train_oof_proba = oof_proba[:len(X_tr)]
+    # If training data was subsampled for the domain classifier, we need
+    # propensity scores for ALL training rows (used for sample weighting).
+    # Use the last fold's classifier to score the full training set.
+    if full_train_n > _MAX_DOMAIN_SAMPLE:
+        X_tr_full = train[feature_cols].copy()
+        for col in feature_cols:
+            if X_tr_full[col].dtype == object:
+                # Use same encoding: fit on full train+test unique values
+                le_full = LabelEncoder()
+                all_vals = list(set(X_tr_full[col].astype(str).unique()) | set(test[col].astype(str).unique()))
+                le_full.fit(all_vals)
+                X_tr_full[col] = le_full.transform(X_tr_full[col].astype(str))
+            if pd.api.types.is_numeric_dtype(X_tr_full[col]):
+                fill = X_tr_full[col].median()
+                X_tr_full[col] = X_tr_full[col].fillna(fill if not pd.isna(fill) else 0)
+            else:
+                X_tr_full[col] = pd.to_numeric(X_tr_full[col], errors="coerce").fillna(0)
+        train_oof_proba = clf.predict_proba(X_tr_full)[:, 1]
+    else:
+        train_oof_proba = oof_proba[:len(X_tr)]
 
     return {
         "auc": round(auc, 4),
@@ -680,6 +740,13 @@ def detect_intra_training_drift(
     late_mask = month_series.isin(late_months)
     train_early = train[early_mask]
     train_late = train[late_mask]
+
+    # Subsample for intra-training drift when dataset is large
+    _MAX_INTRA_SAMPLE = 100_000
+    if len(train_early) > _MAX_INTRA_SAMPLE:
+        train_early = train_early.sample(n=_MAX_INTRA_SAMPLE, random_state=42)
+    if len(train_late) > _MAX_INTRA_SAMPLE:
+        train_late = train_late.sample(n=_MAX_INTRA_SAMPLE, random_state=42)
 
     logger.info(
         f"Intra-training split: early={len(train_early)} rows ({len(early_months)} months), "

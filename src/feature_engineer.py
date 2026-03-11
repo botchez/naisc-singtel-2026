@@ -62,14 +62,26 @@ def engineer_features(
 
     ratio_features = []
     if len(num_cols) >= 2:
-        # Compute correlation matrix on training data (numeric only)
-        num_train = train[num_cols].apply(pd.to_numeric, errors="coerce")
-        corr_matrix = num_train.corr().abs()
+        # For high-dimensional datasets (500+ features), computing a full
+        # correlation matrix is O(n*m^2) and can be very expensive.
+        # Cap to top-50 numerical features by variance for correlation analysis.
+        _MAX_CORR_COLS = 50
+        corr_cols = num_cols
+        if len(num_cols) > _MAX_CORR_COLS:
+            variances = train[num_cols].apply(pd.to_numeric, errors="coerce").var().sort_values(ascending=False)
+            corr_cols = variances.head(_MAX_CORR_COLS).index.tolist()
+            logger.info(f"Ratio features: using top {_MAX_CORR_COLS}/{len(num_cols)} cols by variance for correlation")
+
+        # Subsample rows for correlation computation on large datasets
+        corr_train = train[corr_cols].apply(pd.to_numeric, errors="coerce")
+        if len(corr_train) > 100_000:
+            corr_train = corr_train.sample(n=100_000, random_state=42)
+        corr_matrix = corr_train.corr().abs()
 
         # Find top correlated pairs (above threshold, not same column)
         pairs = []
-        for i, col_a in enumerate(num_cols):
-            for col_b in num_cols[i + 1:]:
+        for i, col_a in enumerate(corr_cols):
+            for col_b in corr_cols[i + 1:]:
                 c = corr_matrix.loc[col_a, col_b]
                 if pd.notna(c) and c > 0.3:
                     pairs.append((col_a, col_b, c))
@@ -119,7 +131,11 @@ def engineer_features(
         num_feature_cols = [c for c in train.columns if c not in skip_cols
                            and c in test.columns and pd.api.types.is_numeric_dtype(train[c])]
         if len(num_feature_cols) >= 2:
-            corr = train[num_feature_cols].corr().abs()
+            # Subsample rows for correlation on large datasets
+            corr_data = train[num_feature_cols]
+            if len(corr_data) > 100_000:
+                corr_data = corr_data.sample(n=100_000, random_state=42)
+            corr = corr_data.corr().abs()
             # Find pairs with correlation > 0.98
             drop_dupes = set()
             engineered_set = set(all_new_features)
