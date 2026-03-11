@@ -90,8 +90,11 @@ def prepare_features(
         drop_cols = drop_cols + [c for c in extra_drop_cols if c not in drop_cols]
     feature_cols = [c for c in train.columns if c not in drop_cols and c in test.columns]
 
-    X_train = train[feature_cols].copy()
-    X_test = test[feature_cols].copy()
+    # Shallow copy: column selection creates new DataFrame, mutations below
+    # only replace entire columns (target encoding, temporal parsing) so no
+    # risk of modifying the caller's data via shared memory.
+    X_train = train[feature_cols].copy(deep=False)
+    X_test = test[feature_cols].copy(deep=False)
 
     # Coerce columns classified as numerical but stored as object (e.g., "TotalCharges" with blanks)
     for col in feature_types["numerical"]:
