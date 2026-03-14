@@ -310,194 +310,24 @@ def main():
         if eng_dropped:
             logger.info(f"Dropped {len(eng_dropped)} high-drift engineered features: {eng_dropped}")
 
-    # --- Stage 4b: Mitigation Refinement (test-guided per-feature strategy selection) ---
-    with Timer("Mitigation refinement") as refine_timer:
-        import numpy as np
-        from sklearn.metrics import average_precision_score
-        from model import _encode_target
-        from mitigation import (clip_outliers, log_transform, _clip_then_log,
-                                quantile_bin, rank_transform, quantile_match,
-                                group_rare_categories, frequency_encode_mitigation)
-        from drift_detector import detect_categorical_drift
-
-        target_col = feature_types["target"][0] if feature_types["target"] else None
-        has_test_labels = (target_col and target_col in test_m.columns
-                          and test_m[target_col].notna().any())
-
-        if has_test_labels:
-            y_test_ref = _encode_target(test_m[target_col])
-
-            # Subsample for quick evaluations during refinement
-            # 50K rows is enough to reliably compare strategy variants
-            _MAX_REFINE_SAMPLE = 50_000
-            _refine_tr_idx = None
-            if len(train_m) > _MAX_REFINE_SAMPLE:
-                _refine_tr_idx = train_m.sample(n=_MAX_REFINE_SAMPLE, random_state=42).index
-
-            def _quick_eval(tr_df, te_df, dc):
-                """Quick train+eval to get test AU-PRC for a mitigation variant."""
-                tr_sub = tr_df.loc[_refine_tr_idx] if _refine_tr_idx is not None else tr_df
-                X_tr, y_tr, X_te, _ = prepare_features(tr_sub, te_df, feature_types, extra_drop_cols=dc)
-                m = train_model(X_tr, y_tr)
-                proba = m.predict_proba(X_te)[:, 1]
-                return average_precision_score(y_test_ref, proba)
-
-            # Get baseline score with current mitigation
-            base_score = _quick_eval(train_m, test_m, drop_cols)
-            logger.info(f"Mitigation refinement: baseline test AU-PRC={base_score:.4f}")
-
-            # Identify features to refine: dropped features + mitigated features
-            # We use the normalized (pre-mitigation) data as the starting point
-            from mitigation import normalize_data_quality
-            train_norm, test_norm, _ = normalize_data_quality(train, test, feature_types)
-            drift_norm = run_drift_analysis(train_norm, test_norm, feature_types)
-
-            refine_features = []
-            if not drift_norm.empty:
-                for _, row in drift_norm[drift_norm["severity"].isin(["high", "moderate"])].iterrows():
-                    col = row["column"]
-                    ftype = row["feature_type"]
-                    if col in train_norm.columns and col in test_norm.columns:
-                        refine_features.append((col, ftype, row["severity"]))
-
-            # Cap refinement to top-20 drifted features to avoid O(m*8*epochs)
-            # blowup at 500 features. Prioritize high-severity first.
-            _MAX_REFINE_FEATURES = 20
-            if len(refine_features) > _MAX_REFINE_FEATURES:
-                # Sort: high before moderate
-                severity_order = {"high": 0, "moderate": 1}
-                refine_features.sort(key=lambda x: severity_order.get(x[2], 2))
-                logger.info(f"Capping refinement to {_MAX_REFINE_FEATURES}/{len(refine_features)} drifted features")
-                refine_features = refine_features[:_MAX_REFINE_FEATURES]
-
-            if refine_features:
-                logger.info(f"Refining {len(refine_features)} drifted features by test AU-PRC")
-
-            for col, ftype, severity in refine_features:
-                if col not in train_norm.columns:
-                    continue
-
-                # Build strategy options for this feature
-                options = []
-
-                if ftype == "numerical":
-                    strategies = [
-                        ("keep", None),
-                        ("clip", clip_outliers),
-                        ("log", log_transform),
-                        ("clip+log", _clip_then_log),
-                        ("quantile_match", quantile_match),
-                        ("rank", rank_transform),
-                        ("quantile_bin", quantile_bin),
-                        ("drop", None),
-                    ]
-                    for sname, fn in strategies:
-                        if sname == "keep":
-                            options.append(("keep", train_norm[col].values, test_norm[col].values))
-                        elif sname == "drop":
-                            options.append(("drop", None, None))
-                        else:
-                            result = fn(train_norm[col], test_norm[col])
-                            if result is not None:
-                                tr_c, te_c = result
-                                options.append((sname, tr_c.values, te_c.values))
-
-                elif ftype == "categorical":
-                    strategies = [
-                        ("keep", None),
-                        ("group_rare", group_rare_categories),
-                        ("freq_encode", frequency_encode_mitigation),
-                        ("drop", None),
-                    ]
-                    for sname, fn in strategies:
-                        if sname == "keep":
-                            options.append(("keep", train_norm[col].values, test_norm[col].values))
-                        elif sname == "drop":
-                            options.append(("drop", None, None))
-                        else:
-                            tr_c, te_c = fn(train_norm[col], test_norm[col])
-                            options.append((sname, tr_c.values, te_c.values))
-
-                else:
-                    continue  # temporal handled separately
-
-                if len(options) <= 1:
-                    continue
-
-                # Evaluate each option
-                best_strat = None
-                best_score_col = base_score
-
-                for sname, tr_vals, te_vals in options:
-                    tr_trial = train_m.copy()
-                    te_trial = test_m.copy()
-                    dc_trial = list(drop_cols)
-
-                    if sname == "drop":
-                        if col not in dc_trial:
-                            dc_trial.append(col)
-                        # Restore col in data if it was dropped (it might not be there)
-                        if col not in tr_trial.columns and col in train_norm.columns:
-                            tr_trial[col] = train_norm[col].values
-                            te_trial[col] = test_norm[col].values
-                    elif sname == "keep":
-                        # Restore original normalized values (undo any mitigation)
-                        if col in tr_trial.columns:
-                            tr_trial[col] = tr_vals
-                            te_trial[col] = te_vals
-                        else:
-                            tr_trial[col] = tr_vals
-                            te_trial[col] = te_vals
-                        if col in dc_trial:
-                            dc_trial.remove(col)
-                    else:
-                        # Apply strategy values
-                        if col not in tr_trial.columns:
-                            tr_trial[col] = tr_vals
-                            te_trial[col] = te_vals
-                        else:
-                            tr_trial[col] = tr_vals
-                            te_trial[col] = te_vals
-                        if col in dc_trial:
-                            dc_trial.remove(col)
-
-                    try:
-                        score = _quick_eval(tr_trial, te_trial, dc_trial)
-                        logger.info(f"    {col} [{sname}] -> {score:.4f}")
-                        if score > best_score_col:
-                            best_score_col = score
-                            best_strat = (sname, tr_vals, te_vals, dc_trial)
-                    except Exception:
-                        pass
-
-                # Apply best strategy if it improves over current
-                if best_strat and best_score_col > base_score:
-                    sname, tr_vals, te_vals, dc_new = best_strat
-                    if sname == "drop":
-                        if col not in drop_cols:
-                            drop_cols.append(col)
-                        if col not in train_m.columns and col in train_norm.columns:
-                            train_m[col] = train_norm[col].values
-                            test_m[col] = test_norm[col].values
-                    else:
-                        if col not in train_m.columns:
-                            train_m[col] = tr_vals
-                            test_m[col] = te_vals
-                        else:
-                            train_m[col] = tr_vals
-                            test_m[col] = te_vals
-                        if col in drop_cols:
-                            drop_cols.remove(col)
-                    base_score = best_score_col
-                    logger.info(f"  Refined {col}: {sname} (test AU-PRC={best_score_col:.4f})")
-
-            logger.info(f"Mitigation refinement done: test AU-PRC={base_score:.4f}")
+    # --- Stage 4b: Mitigation Refinement (SKIPPED for performance) ---
+    # Eliminated: was doing up to 160 model trains + 160 full DataFrame copies
+    # Stage 3's progressive mitigation + Stage 5's weight tournament cover this.
+    refine_timer = Timer("Mitigation refinement (skipped)")
+    refine_timer.elapsed = 0.0
 
     # --- Stage 5: Model Training & Prediction ---
     with Timer("Model training") as model_timer:
-        # Baseline model (no mitigation)
+        import numpy as np
+
+        # Baseline model (subsampled for comparison metrics only)
+        _MAX_BASELINE_SAMPLE = 100_000
+        train_baseline = train
+        if len(train) > _MAX_BASELINE_SAMPLE:
+            train_baseline = train.sample(n=_MAX_BASELINE_SAMPLE, random_state=42)
+            logger.info(f"Baseline model: subsampling {_MAX_BASELINE_SAMPLE}/{len(train)} rows")
         X_train_b, y_train_b, X_test_b, customer_ids = prepare_features(
-            train, test, feature_types
+            train_baseline, test, feature_types
         )
         lgbm_b = train_model(X_train_b, y_train_b)
         baseline_metrics = evaluate_and_save(
@@ -510,10 +340,19 @@ def main():
             train_m, test_m, feature_types, extra_drop_cols=drop_cols
         )
 
-        # --- Feature selection: drop zero-importance features ---
+        # --- Feature selection: use subsampled model to prune zero-importance features ---
+        from sklearn.metrics import average_precision_score
+        from model import _encode_target
+
+        _MAX_FEAT_SEL_SAMPLE = 50_000
         try:
-            pre_model = train_model(X_train_m, y_train_m)
-            importances = pre_model.feature_importances_
+            if len(X_train_m) > _MAX_FEAT_SEL_SAMPLE:
+                rng_fs = np.random.RandomState(42)
+                fs_idx = rng_fs.choice(len(X_train_m), size=_MAX_FEAT_SEL_SAMPLE, replace=False)
+                fs_model = train_model(X_train_m.iloc[fs_idx], y_train_m.iloc[fs_idx])
+            else:
+                fs_model = train_model(X_train_m, y_train_m)
+            importances = fs_model.feature_importances_
             zero_imp_cols = [c for c, imp in zip(X_train_m.columns, importances) if imp == 0]
             if zero_imp_cols and len(zero_imp_cols) < len(X_train_m.columns):
                 X_train_m = X_train_m.drop(columns=zero_imp_cols)
@@ -525,10 +364,6 @@ def main():
             logger.warning(f"Feature selection skipped: {e}")
 
         # --- Sample weight tournament: two-stage search ---
-        import numpy as np
-        from sklearn.metrics import average_precision_score
-        from model import _encode_target
-
         train_oof_proba = shift_info.get("train_oof_proba")
         has_domain = train_oof_proba is not None and shift_info.get("shift_detected", False)
         has_recency = month_rank is not None
@@ -540,8 +375,7 @@ def main():
         y_test_m = _encode_target(test_m[target_col]) if has_test_labels else None
 
         # Subsample for weight tournament evaluations on large datasets
-        # 100K rows is enough for reliable AU-PRC comparison between weight strategies
-        _MAX_TOURNEY_SAMPLE = 100_000
+        _MAX_TOURNEY_SAMPLE = 50_000
         _tourney_idx = None
         if len(X_train_m) > _MAX_TOURNEY_SAMPLE:
             rng = np.random.RandomState(42)
@@ -627,14 +461,14 @@ def main():
             blend_obj, blend_evals = _make_cached_objective(_build_blend, "Blend")
             logger.info("Weight tournament: optimizing Blend (Nelder-Mead)")
             minimize(blend_obj, x0=[0.5, 0.7, 0.15], method='Nelder-Mead',
-                     options={'maxiter': 25, 'xatol': 0.01, 'fatol': 0.0001})
+                     options={'maxiter': 12, 'maxfev': 20, 'xatol': 0.01, 'fatol': 0.0002})
             all_results.extend(blend_evals)
 
             # 3. Optimize geometric mean
             geom_obj, geom_evals = _make_cached_objective(_build_geometric, "Geometric")
             logger.info("Weight tournament: optimizing Geometric (Nelder-Mead)")
             minimize(geom_obj, x0=[0.5, 0.7, 0.15], method='Nelder-Mead',
-                     options={'maxiter': 25, 'xatol': 0.01, 'fatol': 0.0001})
+                     options={'maxiter': 12, 'maxfev': 20, 'xatol': 0.01, 'fatol': 0.0002})
             all_results.extend(geom_evals)
 
         elif has_domain:
