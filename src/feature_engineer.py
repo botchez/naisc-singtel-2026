@@ -18,8 +18,10 @@ def engineer_features(
 
     Returns (train_enriched, test_enriched, new_feature_names) with aligned columns.
     """
-    train = train.copy()
-    test = test.copy()
+    # Operate on caller's copies (Stage 3 already made mitigated copies)
+    # Only copy if we need to avoid mutating the original
+    train = train.copy(deep=False)
+    test = test.copy(deep=False)
     skip_cols = set(feature_types.get("id", []) + feature_types.get("target", []))
     if drop_cols:
         skip_cols.update(drop_cols)
