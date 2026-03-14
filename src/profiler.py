@@ -276,8 +276,11 @@ def profile_data(
 ) -> pd.DataFrame:
     """Generate a profiling summary for the dataset."""
     rows = []
+    df_cols = set(df.columns)
     for category, cols in feature_types.items():
         for col in cols:
+            if col not in df_cols:
+                continue
             rows.append(
                 {
                     "column": col,

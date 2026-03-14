@@ -515,10 +515,12 @@ def main():
             pre_model = train_model(X_train_m, y_train_m)
             importances = pre_model.feature_importances_
             zero_imp_cols = [c for c, imp in zip(X_train_m.columns, importances) if imp == 0]
-            if zero_imp_cols:
+            if zero_imp_cols and len(zero_imp_cols) < len(X_train_m.columns):
                 X_train_m = X_train_m.drop(columns=zero_imp_cols)
                 X_test_m = X_test_m.drop(columns=zero_imp_cols)
                 logger.info(f"Dropped {len(zero_imp_cols)} zero-importance features: {zero_imp_cols}")
+            elif zero_imp_cols:
+                logger.warning(f"All {len(zero_imp_cols)} features have zero importance; keeping all")
         except Exception as e:
             logger.warning(f"Feature selection skipped: {e}")
 
