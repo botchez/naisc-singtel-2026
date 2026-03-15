@@ -132,6 +132,13 @@ def engineer_features(
     try:
         num_feature_cols = [c for c in train.columns if c not in skip_cols
                            and c in test.columns and pd.api.types.is_numeric_dtype(train[c])]
+        # Cap columns for duplicate detection to avoid O(m^2) correlation matrix
+        _MAX_DEDUP_COLS = 200
+        if len(num_feature_cols) > _MAX_DEDUP_COLS:
+            _orig_dedup = len(num_feature_cols)
+            _var_sample = train[num_feature_cols].sample(n=min(50_000, len(train)), random_state=42) if len(train) > 50_000 else train[num_feature_cols]
+            num_feature_cols = _var_sample.var().sort_values(ascending=False).head(_MAX_DEDUP_COLS).index.tolist()
+            logger.info(f"Duplicate detection: using top {_MAX_DEDUP_COLS}/{_orig_dedup} cols by variance")
         if len(num_feature_cols) >= 2:
             # Subsample rows for correlation on large datasets
             corr_data = train[num_feature_cols]

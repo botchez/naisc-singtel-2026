@@ -177,7 +177,7 @@ def detect_categorical_drift(
     train_sub = _subsample_series(train_col.dropna())
     test_sub = _subsample_series(test_col.dropna())
 
-    all_categories = sorted(set(train_col.dropna().unique()) | set(test_col.dropna().unique()), key=str)
+    all_categories = sorted(set(train_sub.unique()) | set(test_sub.unique()), key=str)
 
     if len(all_categories) == 0:
         return {"chi2_stat": None, "chi2_pval": None, "jsd": None, "unseen_in_test": [],
@@ -218,9 +218,9 @@ def detect_categorical_drift(
     cramers_v = compute_cramers_v(chi2_stat, n_total, k_cats)
 
     # Unseen categories in test
-    train_cats = set(train_col.dropna().unique())
-    test_cats = set(test_col.dropna().unique())
-    unseen_in_test = sorted(test_cats - train_cats)
+    train_cats = set(train_sub.unique())
+    test_cats = set(test_sub.unique())
+    unseen_in_test = sorted(test_cats - train_cats, key=str)
 
     # Use original full sizes for small-sample factor
     n_tr = len(train_col.dropna())
@@ -540,6 +540,18 @@ def detect_multivariate_shift(
     if not feature_cols:
         return {"auc": 0.5, "fold_aucs": [], "shift_detected": False, "train_oof_proba": None}
 
+    # Cap features for domain classifier efficiency (LightGBM cost is O(n*m*trees))
+    _MAX_DOMAIN_FEATURES = 100
+    if len(feature_cols) > _MAX_DOMAIN_FEATURES:
+        _orig_n_feats = len(feature_cols)
+        _var_sample = train[feature_cols].sample(
+            n=min(50_000, len(train)), random_state=42
+        ) if len(train) > 50_000 else train[feature_cols]
+        _variances = _var_sample.apply(pd.to_numeric, errors="coerce").var().sort_values(ascending=False)
+        feature_cols = _variances.head(_MAX_DOMAIN_FEATURES).index.tolist()
+        from utils import logger as _logger
+        _logger.info(f"Domain classifier: using top {_MAX_DOMAIN_FEATURES}/{_orig_n_feats} features by variance")
+
     X_tr = train[feature_cols].copy()
     X_te = test[feature_cols].copy()
 
@@ -552,18 +564,21 @@ def detect_multivariate_shift(
     if len(X_te) > _MAX_DOMAIN_SAMPLE:
         X_te = X_te.sample(n=_MAX_DOMAIN_SAMPLE, random_state=42).reset_index(drop=True)
 
-    # Simple preprocessing: label encode objects, fill NaN
+    # Simple preprocessing: encode objects via dict mapping, fill NaN
+    _cat_maps = {}  # Save mappings for reuse on full train data
+    _fill_vals = {}
     for col in feature_cols:
         if X_tr[col].dtype == object:
-            le = LabelEncoder()
             combined = pd.concat([X_tr[col].astype(str), X_te[col].astype(str)], ignore_index=True)
-            le.fit(combined)
-            X_tr[col] = le.transform(X_tr[col].astype(str))
-            X_te[col] = le.transform(X_te[col].astype(str))
+            cat_map = {c: i for i, c in enumerate(combined.unique())}
+            X_tr[col] = X_tr[col].astype(str).map(cat_map).astype(int)
+            X_te[col] = X_te[col].astype(str).map(cat_map).astype(int)
+            _cat_maps[col] = cat_map
         if pd.api.types.is_numeric_dtype(X_tr[col]):
             fill = X_tr[col].median()
             if pd.isna(fill):
                 fill = 0
+            _fill_vals[col] = fill
             X_tr[col] = X_tr[col].fillna(fill)
             X_te[col] = X_te[col].fillna(fill)
         else:
@@ -590,6 +605,7 @@ def detect_multivariate_shift(
             is_unbalance=True,
             random_state=42,
             importance_type="gain",
+            n_estimators=50,  # Reduced: domain classifier is diagnostic
         )
         clf.fit(X_all.iloc[fold_train_idx], y_domain[fold_train_idx])
         oof_proba[fold_val_idx] = clf.predict_proba(X_all.iloc[fold_val_idx])[:, 1]
@@ -614,15 +630,13 @@ def detect_multivariate_shift(
     if full_train_n > _MAX_DOMAIN_SAMPLE:
         X_tr_full = train[feature_cols].copy()
         for col in feature_cols:
-            if X_tr_full[col].dtype == object:
-                # Use same encoding: fit on full train+test unique values
-                le_full = LabelEncoder()
-                all_vals = list(set(X_tr_full[col].astype(str).unique()) | set(test[col].astype(str).unique()))
-                le_full.fit(all_vals)
-                X_tr_full[col] = le_full.transform(X_tr_full[col].astype(str))
-            if pd.api.types.is_numeric_dtype(X_tr_full[col]):
-                fill = X_tr_full[col].median()
-                X_tr_full[col] = X_tr_full[col].fillna(fill if not pd.isna(fill) else 0)
+            if col in _cat_maps:
+                cat_map = _cat_maps[col]
+                default_code = len(cat_map)
+                X_tr_full[col] = X_tr_full[col].astype(str).map(cat_map).fillna(default_code).astype(int)
+            elif pd.api.types.is_numeric_dtype(X_tr_full[col]):
+                fill = _fill_vals.get(col, 0)
+                X_tr_full[col] = X_tr_full[col].fillna(fill)
             else:
                 X_tr_full[col] = pd.to_numeric(X_tr_full[col], errors="coerce").fillna(0)
         train_oof_proba = clf.predict_proba(X_tr_full)[:, 1]

@@ -154,27 +154,72 @@ def prepare_features(
             logger.warning(f"Native categorical encoding failed for {col}, falling back to target encoding: {e}")
             te_cat_cols.append(col)
 
+    # Subsample for target encoding fold computation on large datasets
+    _MAX_TE_SAMPLE = 200_000
+    _te_use_sample = len(X_train) > _MAX_TE_SAMPLE
+    _te_sample_idx = None
+    if _te_use_sample:
+        from utils import stratified_subsample_idx
+        # Temporal columns are already parsed to month numbers (1-12) at this point
+        temporal_cols = feature_types.get("temporal", [])
+        te_month_vals = None
+        for tc in temporal_cols:
+            if tc in X_train.columns and pd.api.types.is_numeric_dtype(X_train[tc]):
+                te_month_vals = X_train[tc]
+                break
+        _te_sample_idx = stratified_subsample_idx(
+            len(X_train), _MAX_TE_SAMPLE,
+            month_values=te_month_vals, seed=42,
+        )
+        logger.info(f"Target encoding: using stratified {_MAX_TE_SAMPLE}/{len(X_train)} sample for fold means")
+
     for col in te_cat_cols:
         raw_train = X_train[col].astype(str)
         raw_test = X_test[col].astype(str)
 
-        # Full training set smoothed means (for test encoding)
-        col_counts = y_train.groupby(raw_train).count()
-        col_means_raw = y_train.groupby(raw_train).mean()
+        # Smoothed means (computed on sample if large, full data otherwise)
+        if _te_use_sample:
+            sample_raw = raw_train.iloc[_te_sample_idx]
+            sample_y = y_train.iloc[_te_sample_idx]
+            col_counts = sample_y.groupby(sample_raw).count()
+            col_means_raw = sample_y.groupby(sample_raw).mean()
+        else:
+            col_counts = y_train.groupby(raw_train).count()
+            col_means_raw = y_train.groupby(raw_train).mean()
         col_means = (col_counts * col_means_raw + smoothing_m * global_mean) / (col_counts + smoothing_m)
 
         # K-fold target encoding for train (avoids leakage)
         train_encoded = pd.Series(np.full(len(X_train), np.nan), index=X_train.index)
-        for train_idx, val_idx in kf.split(X_train, y_train):
-            fold_y = y_train.iloc[train_idx]
-            fold_raw = raw_train.iloc[train_idx]
-            fold_counts = fold_y.groupby(fold_raw).count()
-            fold_means_raw = fold_y.groupby(fold_raw).mean()
-            fold_means = (fold_counts * fold_means_raw + smoothing_m * global_mean) / (fold_counts + smoothing_m)
-            train_encoded.iloc[val_idx] = raw_train.iloc[val_idx].map(fold_means)
+
+        if _te_use_sample:
+            # Compute fold means on subsample, map onto ALL rows
+            n_folds = safe_n_splits(len(_te_sample_idx))
+            fold_assignments = np.arange(len(X_train)) % n_folds
+
+            for fold_id in range(n_folds):
+                # Means from other folds' subsample rows
+                other_mask = fold_assignments[_te_sample_idx] != fold_id
+                fold_raw = raw_train.iloc[_te_sample_idx[other_mask]]
+                fold_y = y_train.iloc[_te_sample_idx[other_mask]]
+                fc = fold_y.groupby(fold_raw).count()
+                fm = fold_y.groupby(fold_raw).mean()
+                fold_means = (fc * fm + smoothing_m * global_mean) / (fc + smoothing_m)
+
+                # Map to all full-dataset rows in this fold
+                this_fold_mask = fold_assignments == fold_id
+                train_encoded.iloc[np.where(this_fold_mask)[0]] = raw_train[this_fold_mask].map(fold_means)
+        else:
+            for train_idx, val_idx in kf.split(X_train, y_train):
+                fold_y = y_train.iloc[train_idx]
+                fold_raw = raw_train.iloc[train_idx]
+                fold_counts = fold_y.groupby(fold_raw).count()
+                fold_means_raw = fold_y.groupby(fold_raw).mean()
+                fold_means = (fold_counts * fold_means_raw + smoothing_m * global_mean) / (fold_counts + smoothing_m)
+                train_encoded.iloc[val_idx] = raw_train.iloc[val_idx].map(fold_means)
+
         X_train[col] = train_encoded.fillna(global_mean)
 
-        # Test: use full training set smoothed means
+        # Test: use smoothed means
         X_test[col] = raw_test.map(col_means).fillna(global_mean)
 
     # Fill remaining NaN: let LightGBM handle numeric NaN natively (learns optimal
@@ -196,7 +241,7 @@ def train_model(
     y_train: pd.Series,
     sample_weight: np.ndarray | None = None,
 ) -> LGBMClassifier:
-    """Train LightGBM with fixed hyperparameters."""
+    """Train LightGBM with fixed hyperparameters. (DO NOT TOUCH!!!)"""
     model = LGBMClassifier(
         verbosity=-1,
         objective="binary",

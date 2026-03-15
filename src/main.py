@@ -271,18 +271,50 @@ def main():
     profile_data(train, feature_types, label="train")
     profile_data(test, feature_types, label="test")
 
+    # --- Early subsampling: cap training data for pipeline efficiency ---
+    # Subsample BEFORE numeric coercion to avoid O(10M) per column.
+    # Stages 2-5 operate on subsampled data; final model caps at 500K anyway.
+    _MAX_PIPELINE_TRAIN = 500_000
+    if len(train) > _MAX_PIPELINE_TRAIN:
+        from utils import stratified_subsample_idx, _parse_month_labels
+
+        _original_n = len(train)
+        # Try temporal stratification to preserve month distribution
+        _month_vals = None
+        for tc in feature_types.get("temporal", []):
+            if tc in train.columns:
+                _month_vals = _parse_month_labels(train[tc])
+                if _month_vals is not None:
+                    break
+
+        _pipeline_idx = stratified_subsample_idx(
+            len(train), _MAX_PIPELINE_TRAIN,
+            month_values=_month_vals, seed=42,
+        )
+        train = train.iloc[_pipeline_idx].reset_index(drop=True)
+        logger.info(
+            f"Early subsampling: {_MAX_PIPELINE_TRAIN:,}/{_original_n:,} training rows"
+            f"{' (stratified by temporal)' if _month_vals is not None else ''}"
+        )
+
     # Coerce columns classified as numerical but still stored as object dtype
+    # (after subsampling so this runs on 500K rows, not 10M)
     for col in feature_types.get("numerical", []):
         if col in train.columns and not pd.api.types.is_numeric_dtype(train[col]):
             train[col] = pd.to_numeric(train[col], errors="coerce")
+        if col in test.columns and not pd.api.types.is_numeric_dtype(test[col]):
             test[col] = pd.to_numeric(test[col], errors="coerce")
 
     # --- Stage 2: Drift Detection (train vs test) ---
     with Timer("Drift detection") as drift_timer:
-        drift_df = run_drift_analysis(train, test, feature_types)
-        # Label shift detection (prior probability shift)
-        label_shift_info = detect_label_shift(train, test, feature_types)
-        # Intra-training temporal drift detection
+        # Pre-subsample to 50K for drift analysis — statistical tests cap at 50K
+        # internally anyway; passing 500K just wastes time on isna/dropna/to_numeric
+        _DRIFT_SAMPLE = 50_000
+        train_drift = train.sample(n=min(_DRIFT_SAMPLE, len(train)), random_state=42) if len(train) > _DRIFT_SAMPLE else train
+        test_drift = test.sample(n=min(_DRIFT_SAMPLE, len(test)), random_state=42) if len(test) > _DRIFT_SAMPLE else test
+        drift_df = run_drift_analysis(train_drift, test_drift, feature_types)
+        label_shift_info = detect_label_shift(train_drift, test_drift, feature_types)
+        # Keep full train for month_rank (used for recency weighting across all rows)
         intra_drift_df, month_rank = detect_intra_training_drift(train, feature_types)
 
     # --- Stage 3: Drift Mitigation ---
@@ -373,12 +405,26 @@ def main():
         y_test_m = _encode_target(test_m[target_col]) if has_test_labels else None
 
         # Subsample for weight tournament evaluations on large datasets
+        from utils import stratified_subsample_idx
+
         _MAX_TOURNEY_SAMPLE = 50_000
         _tourney_idx = None
+        _test_tourney_idx = None
+
         if len(X_train_m) > _MAX_TOURNEY_SAMPLE:
-            rng = np.random.RandomState(42)
-            _tourney_idx = rng.choice(len(X_train_m), size=_MAX_TOURNEY_SAMPLE, replace=False)
-            logger.info(f"Weight tournament: subsampling {_MAX_TOURNEY_SAMPLE}/{len(X_train_m)} rows")
+            _mr_train = month_rank.reindex(X_train_m.index) if month_rank is not None else None
+            _tourney_idx = stratified_subsample_idx(
+                len(X_train_m), _MAX_TOURNEY_SAMPLE,
+                month_values=_mr_train, seed=42,
+            )
+            logger.info(f"Weight tournament: stratified subsampling {_MAX_TOURNEY_SAMPLE}/{len(X_train_m)} train rows")
+
+        if has_test_labels and len(X_test_m) > _MAX_TOURNEY_SAMPLE:
+            _test_tourney_idx = stratified_subsample_idx(
+                len(X_test_m), _MAX_TOURNEY_SAMPLE,
+                month_values=None, seed=42,
+            )
+            logger.info(f"Weight tournament: subsampling {_MAX_TOURNEY_SAMPLE}/{len(X_test_m)} test rows")
 
         def _eval_candidate(label, weights):
             """Train with weights, return (label, weights, test_auprc, train_auprc)."""
@@ -392,8 +438,13 @@ def main():
             train_proba = m.predict_proba(X_sub)[:, 1]
             train_sc = average_precision_score(y_sub, train_proba)
             if has_test_labels:
-                test_proba = m.predict_proba(X_test_m)[:, 1]
-                test_sc = average_precision_score(y_test_m, test_proba)
+                if _test_tourney_idx is not None:
+                    X_test_sub = X_test_m.iloc[_test_tourney_idx]
+                    y_test_sub = y_test_m.iloc[_test_tourney_idx]
+                else:
+                    X_test_sub, y_test_sub = X_test_m, y_test_m
+                test_proba = m.predict_proba(X_test_sub)[:, 1]
+                test_sc = average_precision_score(y_test_sub, test_proba)
             else:
                 test_sc = train_sc  # fallback to train if no test labels
             logger.info(f"  {label} -> train={train_sc:.4f} test={test_sc:.4f}")
@@ -459,14 +510,14 @@ def main():
             blend_obj, blend_evals = _make_cached_objective(_build_blend, "Blend")
             logger.info("Weight tournament: optimizing Blend (Nelder-Mead)")
             minimize(blend_obj, x0=[0.5, 0.7, 0.15], method='Nelder-Mead',
-                     options={'maxiter': 12, 'maxfev': 20, 'xatol': 0.01, 'fatol': 0.0002})
+                     options={'maxiter': 8, 'maxfev': 12, 'xatol': 0.02, 'fatol': 0.0005})
             all_results.extend(blend_evals)
 
             # 3. Optimize geometric mean
             geom_obj, geom_evals = _make_cached_objective(_build_geometric, "Geometric")
             logger.info("Weight tournament: optimizing Geometric (Nelder-Mead)")
             minimize(geom_obj, x0=[0.5, 0.7, 0.15], method='Nelder-Mead',
-                     options={'maxiter': 12, 'maxfev': 20, 'xatol': 0.01, 'fatol': 0.0002})
+                     options={'maxiter': 8, 'maxfev': 12, 'xatol': 0.02, 'fatol': 0.0005})
             all_results.extend(geom_evals)
 
         elif has_domain:
@@ -496,8 +547,23 @@ def main():
         logger.info(f"Final winner: {best_label} (test AU-PRC={best_score:.4f})")
         weight_status = best_label
 
-        # Train final model with winning weights
-        lgbm_m = train_model(X_train_m, y_train_m, sample_weight=best_weights)
+        # Train final model with winning weights (stratified subsample on large datasets)
+        _MAX_FINAL_TRAIN = 500_000
+        if len(X_train_m) > _MAX_FINAL_TRAIN:
+            _mr_final = month_rank.reindex(X_train_m.index) if month_rank is not None else None
+            _final_idx = stratified_subsample_idx(
+                len(X_train_m), _MAX_FINAL_TRAIN,
+                month_values=_mr_final, seed=42,
+            )
+            X_train_final = X_train_m.iloc[_final_idx]
+            y_train_final = y_train_m.iloc[_final_idx]
+            w_final = best_weights[_final_idx] if best_weights is not None else None
+            logger.info(f"Final model: stratified subsampling {_MAX_FINAL_TRAIN}/{len(X_train_m)} rows")
+        else:
+            X_train_final, y_train_final = X_train_m, y_train_m
+            w_final = best_weights
+
+        lgbm_m = train_model(X_train_final, y_train_final, sample_weight=w_final)
 
         mitigated_metrics = evaluate_and_save(
             lgbm_m, X_train_m, y_train_m, X_test_m, customer_ids, test_m, feature_types,
