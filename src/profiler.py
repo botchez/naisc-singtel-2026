@@ -289,8 +289,11 @@ def profile_data(
     _PROFILE_SAMPLE_SIZE = 100_000
     df_prof = df.sample(n=_PROFILE_SAMPLE_SIZE, random_state=42) if len(df) > _PROFILE_SAMPLE_SIZE else df
     rows = []
+    df_cols = set(df.columns)
     for category, cols in feature_types.items():
         for col in cols:
+            if col not in df_cols:
+                continue
             rows.append(
                 {
                     "column": col,
