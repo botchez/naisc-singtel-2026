@@ -518,7 +518,7 @@ def detect_multivariate_shift(
     test: pd.DataFrame,
     feature_types: dict[str, list[str]],
     extra_drop_cols: list[str] | None = None,
-    n_splits: int = 5,
+    n_splits: int = 3,
 ) -> dict:
     """Classifier-based multivariate covariate shift detection.
 
