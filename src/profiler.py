@@ -71,12 +71,13 @@ def _auto_detect_id_column(df: pd.DataFrame) -> str | None:
         if pattern in norm_map:
             return norm_map[pattern]
 
+    _sample = df.sample(n=min(100_000, len(df)), random_state=42) if len(df) > 100_000 else df
     for norm, orig in norm_map.items():
-        if norm.endswith("id") and df[orig].nunique() / max(len(df), 1) > 0.9:
+        if norm.endswith("id") and _sample[orig].nunique() / max(len(_sample), 1) > 0.9:
             return orig
 
     for norm, orig in norm_map.items():
-        if "id" in norm and df[orig].nunique() / max(len(df), 1) > 0.9:
+        if "id" in norm and _sample[orig].nunique() / max(len(_sample), 1) > 0.9:
             return orig
 
     return None
@@ -198,6 +199,14 @@ def detect_feature_types(
         "target": [],
     }
 
+    # Subsample for expensive per-column stats on large datasets
+    _PROFILE_SAMPLE_SIZE = 100_000
+    if len(df) > _PROFILE_SAMPLE_SIZE:
+        df_sample = df.sample(n=_PROFILE_SAMPLE_SIZE, random_state=42)
+        logger.info(f"Feature type detection: using {_PROFILE_SAMPLE_SIZE}/{len(df)} row sample")
+    else:
+        df_sample = df
+
     for col in df.columns:
         if col not in cols_to_classify:
             continue
@@ -210,18 +219,18 @@ def detect_feature_types(
             continue
 
         # Skip all-null columns
-        if df[col].isna().all():
+        if df_sample[col].isna().all():
             logger.warning(f"Skipping all-null column: '{col}'")
             continue
 
         # Skip zero-variance columns (only 1 unique non-null value)
-        if df[col].nunique() <= 1:
+        if df_sample[col].nunique() <= 1:
             logger.warning(f"Skipping zero-variance column: '{col}'")
             continue
 
         # Skip near-zero-variance columns (>99% same value) — non-informative
         try:
-            top_freq = df[col].value_counts(normalize=True).iloc[0]
+            top_freq = df_sample[col].value_counts(normalize=True).iloc[0]
             if top_freq > 0.99:
                 logger.warning(f"Skipping near-zero-variance column: '{col}' ({top_freq:.1%} dominant)")
                 continue
@@ -229,18 +238,18 @@ def detect_feature_types(
             pass
 
         # Temporal heuristic: object column with month-year patterns like "25-Jan"
-        if not pd.api.types.is_numeric_dtype(df[col]) and _looks_temporal(df[col]):
+        if not pd.api.types.is_numeric_dtype(df_sample[col]) and _looks_temporal(df_sample[col]):
             types["temporal"].append(col)
             continue
 
         # Numeric coercion: if a non-numeric column is mostly parseable as numbers,
         # treat it as numerical (e.g., TotalCharges with a few blank strings)
-        if not pd.api.types.is_numeric_dtype(df[col]) and _looks_numeric(df[col]):
+        if not pd.api.types.is_numeric_dtype(df_sample[col]) and _looks_numeric(df_sample[col]):
             logger.info(f"Coercing '{col}' to numeric (mostly numeric values with unparseable entries)")
             types["numerical"].append(col)
             continue
 
-        if pd.api.types.is_numeric_dtype(df[col]):
+        if pd.api.types.is_numeric_dtype(df_sample[col]):
             types["numerical"].append(col)
         else:
             types["categorical"].append(col)
@@ -250,6 +259,8 @@ def detect_feature_types(
 
 def _looks_numeric(series: pd.Series, threshold: float = 0.8) -> bool:
     """Heuristic: check if a non-numeric column is mostly parseable as numbers."""
+    if len(series) > 100_000:
+        series = series.sample(n=100_000, random_state=42)
     coerced = pd.to_numeric(series, errors="coerce")
     parse_rate = coerced.notna().sum() / max(len(series), 1)
     return parse_rate >= threshold
@@ -275,6 +286,8 @@ def profile_data(
     df: pd.DataFrame, feature_types: dict[str, list[str]], label: str = "dataset"
 ) -> pd.DataFrame:
     """Generate a profiling summary for the dataset."""
+    _PROFILE_SAMPLE_SIZE = 100_000
+    df_prof = df.sample(n=_PROFILE_SAMPLE_SIZE, random_state=42) if len(df) > _PROFILE_SAMPLE_SIZE else df
     rows = []
     for category, cols in feature_types.items():
         for col in cols:
@@ -283,8 +296,8 @@ def profile_data(
                     "column": col,
                     "type": category,
                     "dtype": str(df[col].dtype),
-                    "n_unique": df[col].nunique(),
-                    "null_pct": df[col].isna().mean() * 100,
+                    "n_unique": df_prof[col].nunique(),
+                    "null_pct": df_prof[col].isna().mean() * 100,
                     "sample_value": df[col].dropna().iloc[0] if df[col].notna().any() else None,
                 }
             )

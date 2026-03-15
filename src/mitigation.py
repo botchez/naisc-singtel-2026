@@ -2,6 +2,19 @@ import numpy as np
 import pandas as pd
 from utils import logger
 
+_MAX_EVAL_SAMPLE = 50_000
+
+
+def _eval_subsample(train_col, test_col, max_n=_MAX_EVAL_SAMPLE, seed=42):
+    """Subsample columns for fast strategy evaluation."""
+    rng = np.random.RandomState(seed)
+    tr, te = train_col, test_col
+    if len(tr) > max_n:
+        tr = tr.iloc[rng.choice(len(tr), max_n, replace=False)]
+    if len(te) > max_n:
+        te = te.iloc[rng.choice(len(te), max_n, replace=False)]
+    return tr, te
+
 
 def compute_domain_weights(
     train_oof_proba: np.ndarray, power: float = 0.5
@@ -66,7 +79,14 @@ def detect_abbreviation_mappings(
     Matches abbreviation to full name whose word-initial letters match.
     Ties broken by combined frequency.
     """
-    all_values = set(train[col].dropna().unique()) | set(test[col].dropna().unique())
+    _ABB_SAMPLE = 50_000
+    tr_vals = train[col].dropna()
+    te_vals = test[col].dropna()
+    if len(tr_vals) > _ABB_SAMPLE:
+        tr_vals = tr_vals.sample(n=_ABB_SAMPLE, random_state=42)
+    if len(te_vals) > _ABB_SAMPLE:
+        te_vals = te_vals.sample(n=_ABB_SAMPLE, random_state=42)
+    all_values = set(tr_vals.unique()) | set(te_vals.unique())
 
     abbreviations = [v for v in all_values if len(v) in (2, 3) and v.isupper() and v.isalpha()]
     full_names = [v for v in all_values if " " in v]
@@ -74,8 +94,8 @@ def detect_abbreviation_mappings(
     if not abbreviations or not full_names:
         return {}
 
-    # Combined frequency across both datasets
-    combined_freq = train[col].value_counts().add(test[col].value_counts(), fill_value=0)
+    # Combined frequency across both datasets (subsampled)
+    combined_freq = tr_vals.value_counts().add(te_vals.value_counts(), fill_value=0)
 
     mapping = {}
     for abbrev in abbreviations:
@@ -102,8 +122,8 @@ def normalize_data_quality(
     to lists of normalization action labels applied.
     """
     skip_cols = set(feature_types.get("id", []) + feature_types.get("target", []))
-    train_clean = train.copy()
-    test_clean = test.copy()
+    train_clean = train.copy(deep=False)
+    test_clean = test.copy(deep=False)
     norm_log: dict[str, list[str]] = {}
 
     # Auto-detect abbreviation mappings on all categorical object columns
@@ -124,23 +144,38 @@ def normalize_data_quality(
     normalized = []
     skipped_norm = []
     cat_cols = set(feature_types.get("categorical", []) + feature_types.get("temporal", []))
+
+    # Pre-compute subsample indices for drift comparison on large datasets
+    _NORM_SAMPLE = 50_000
+    _tr_norm_idx = np.random.RandomState(42).choice(
+        len(train_clean), min(_NORM_SAMPLE, len(train_clean)), replace=False
+    ) if len(train_clean) > _NORM_SAMPLE else None
+    _te_norm_idx = np.random.RandomState(42).choice(
+        len(test_clean), min(_NORM_SAMPLE, len(test_clean)), replace=False
+    ) if len(test_clean) > _NORM_SAMPLE else None
+
     for col in train_clean.columns:
         if col in skip_cols or col not in cat_cols:
             continue
         if train_clean[col].dtype == object:
-            # Compute drift before normalization
-            before = detect_categorical_drift(train_clean[col], test_clean[col])
+            # Subsample for drift comparison
+            tr_sample = train_clean[col].iloc[_tr_norm_idx] if _tr_norm_idx is not None else train_clean[col]
+            te_sample = test_clean[col].iloc[_te_norm_idx] if _te_norm_idx is not None else test_clean[col]
+
+            # Compute drift before normalization (on subsample)
+            before = detect_categorical_drift(tr_sample, te_sample)
             before_jsd = before.get("jsd", 0) or 0
 
-            # Trial normalization
-            tr_trial = train_clean[col].astype(str).str.lower().str.replace("-", " ", regex=False)
-            te_trial = test_clean[col].astype(str).str.lower().str.replace("-", " ", regex=False)
-            after = detect_categorical_drift(tr_trial, te_trial)
+            # Trial normalization on subsample for comparison
+            tr_trial_s = tr_sample.astype(str).str.lower().str.replace("-", " ", regex=False)
+            te_trial_s = te_sample.astype(str).str.lower().str.replace("-", " ", regex=False)
+            after = detect_categorical_drift(tr_trial_s, te_trial_s)
             after_jsd = after.get("jsd", 0) or 0
 
             if after_jsd <= before_jsd:
-                train_clean[col] = tr_trial
-                test_clean[col] = te_trial
+                # Apply to full data
+                train_clean[col] = train_clean[col].astype(str).str.lower().str.replace("-", " ", regex=False)
+                test_clean[col] = test_clean[col].astype(str).str.lower().str.replace("-", " ", regex=False)
                 normalized.append(col)
                 norm_log.setdefault(col, []).extend(["Lowercased", "Hyphens removed"])
             else:
@@ -152,16 +187,27 @@ def normalize_data_quality(
         logger.info(f"Skipped normalization for {len(skipped_norm)} columns (would increase drift): {skipped_norm}")
 
     # Fuzzy match: map unseen test categories to closest train category
+    # Skip for high-cardinality columns — fuzzy matching is O(unseen × train_cats)
+    # and only useful for small categoricals (city names, state codes, etc.)
     import difflib
+    _MAX_FUZZY_TRAIN_CATS = 200
+    _MAX_FUZZY_UNSEEN = 50
+    fuzzy_skipped = 0
     for col in cat_cols:
         if col in skip_cols or col not in train_clean.columns or col not in test_clean.columns:
             continue
         if train_clean[col].dtype != object:
             continue
-        train_cats = set(train_clean[col].dropna().unique())
-        test_cats = set(test_clean[col].dropna().unique())
+        tr_s = train_clean[col].iloc[_tr_norm_idx].dropna() if _tr_norm_idx is not None else train_clean[col].dropna()
+        te_s = test_clean[col].iloc[_te_norm_idx].dropna() if _te_norm_idx is not None else test_clean[col].dropna()
+        train_cats = set(tr_s.unique())
+        test_cats = set(te_s.unique())
         unseen = test_cats - train_cats
         if not unseen:
+            continue
+        # Skip if too many categories — fuzzy matching is only for low-cardinality typo fixes
+        if len(train_cats) > _MAX_FUZZY_TRAIN_CATS or len(unseen) > _MAX_FUZZY_UNSEEN:
+            fuzzy_skipped += 1
             continue
         fuzzy_map = {}
         for cat in unseen:
@@ -172,6 +218,8 @@ def normalize_data_quality(
             test_clean[col] = test_clean[col].replace(fuzzy_map)
             logger.info(f"Fuzzy matched '{col}': {fuzzy_map}")
             norm_log.setdefault(col, []).append(f"Fuzzy matched: {fuzzy_map}")
+    if fuzzy_skipped:
+        logger.info(f"Skipped fuzzy matching for {fuzzy_skipped} high-cardinality columns")
     return train_clean, test_clean, norm_log
 
 
@@ -412,15 +460,19 @@ def mitigate_feature_progressive(
             ("Discretization", lambda tc, sc: quantile_bin(tc, sc)),
             ("Rank Transform", lambda tc, sc: rank_transform(tc, sc)),
         ]
+        # Evaluate strategies on subsample, apply winner to full data
+        eval_tr, eval_te = _eval_subsample(train[col], test[col])
         for name, fn in strategies:
-            result = fn(train[col], test[col])
+            result = fn(eval_tr, eval_te)
             if result is None:
                 continue  # strategy not applicable (e.g. log with negatives)
             tr_col, te_col = result
             drift = detect_numerical_drift(tr_col, te_col)
             if drift["severity"] != "high":
-                train[col] = tr_col.values
-                test[col] = te_col.values
+                full_result = fn(train[col], test[col])
+                if full_result is not None:
+                    train[col] = full_result[0].values
+                    test[col] = full_result[1].values
                 log_entry["strategy_applied"] = name
                 log_entry["final_severity"] = drift["severity"]
                 return train, test, log_entry
@@ -428,22 +480,27 @@ def mitigate_feature_progressive(
         return train, test, log_entry
 
     if feature_type == "categorical":
+        # Evaluate strategies on subsample, apply winner to full data
+        eval_tr, eval_te = _eval_subsample(train[col], test[col])
+
         # Strategy 1: Group rare categories
-        tr_col, te_col = group_rare_categories(train[col], test[col])
+        tr_col, te_col = group_rare_categories(eval_tr, eval_te)
         drift = detect_categorical_drift(tr_col, te_col)
         if drift["severity"] != "high":
-            train[col] = tr_col.values
-            test[col] = te_col.values
+            full_tr, full_te = group_rare_categories(train[col], test[col])
+            train[col] = full_tr.values
+            test[col] = full_te.values
             log_entry["strategy_applied"] = "Category Consolidation"
             log_entry["final_severity"] = drift["severity"]
             return train, test, log_entry
 
         # Strategy 2: Frequency encode (converts to numerical)
-        tr_freq, te_freq = frequency_encode_mitigation(train[col], test[col])
+        tr_freq, te_freq = frequency_encode_mitigation(eval_tr, eval_te)
         drift = detect_numerical_drift(tr_freq, te_freq)
         if drift["severity"] != "high":
-            train[col] = tr_freq.values
-            test[col] = te_freq.values
+            full_tr, full_te = frequency_encode_mitigation(train[col], test[col])
+            train[col] = full_tr.values
+            test[col] = full_te.values
             log_entry["strategy_applied"] = "Frequency Encoding"
             log_entry["final_severity"] = drift["severity"]
             return train, test, log_entry
@@ -461,8 +518,11 @@ def mitigate_feature_progressive(
             tr_num, te_num = result
             drift = detect_numerical_drift(tr_num, te_num)
             if drift["severity"] != "high":
-                train[col] = tr_num.values
-                test[col] = te_num.values
+                full_freq_tr, full_freq_te = frequency_encode_mitigation(train[col], test[col])
+                full_result = fn(full_freq_tr, full_freq_te)
+                if full_result is not None:
+                    train[col] = full_result[0].values
+                    test[col] = full_result[1].values
                 log_entry["strategy_applied"] = name
                 log_entry["final_severity"] = drift["severity"]
                 return train, test, log_entry
@@ -492,13 +552,41 @@ def apply_all_mitigations(
 
     Returns (train_mitigated, test_mitigated, drop_cols, mitigation_log, norm_log, shift_info).
     """
-    from drift_detector import run_drift_analysis
+    from drift_detector import _analyze_single_feature, _small_sample_factor, _apply_bh_correction
 
     # Stage 1: Data quality normalization
     train_m, test_m, norm_log = normalize_data_quality(train, test, feature_types)
 
-    # Stage 2: Re-run drift detection on normalized data
-    drift_df_norm = run_drift_analysis(train_m, test_m, feature_types)
+    # Stage 2: Re-check drift only for columns modified by normalization
+    # (avoids re-running all 500 features when only a few changed)
+    drift_df_norm = drift_df.copy()
+    if norm_log and not drift_df_norm.empty:
+        modified_cols = set(norm_log.keys())
+        recheck_count = 0
+        for col in modified_cols:
+            if col not in train_m.columns or col not in test_m.columns:
+                continue
+            ftype = None
+            for ft in ("numerical", "categorical", "temporal"):
+                if col in feature_types.get(ft, []):
+                    ftype = ft
+                    break
+            if ftype is None:
+                continue
+            result = _analyze_single_feature(train_m[col], test_m[col], col, ftype)
+            idx = drift_df_norm.index[drift_df_norm["column"] == col]
+            if len(idx) > 0:
+                for key, val in result.items():
+                    if key in drift_df_norm.columns:
+                        drift_df_norm.loc[idx[0], key] = val
+                recheck_count += 1
+        if recheck_count > 0:
+            ss_factor = _small_sample_factor(len(train_m), len(test_m))
+            drift_df_norm = _apply_bh_correction(drift_df_norm, ss_factor)
+            drift_df_norm = drift_df_norm.sort_values(
+                "severity", key=lambda s: s.map({"high": 0, "moderate": 1, "low": 2, "unknown": 3})
+            )
+        logger.info(f"Re-checked drift for {recheck_count} normalized columns (skipped {len(drift_df) - recheck_count} unchanged)")
 
     # Stage 3: Progressive mitigation for high-drift features
     # Collect all high-drift features (including temporal)
@@ -510,9 +598,14 @@ def apply_all_mitigations(
     mitigation_log = []
     drop_cols = []
 
-    for col, ftype, severity in high_drift_features:
+    if high_drift_features:
+        logger.info(f"Progressive mitigation: processing {len(high_drift_features)} high-drift features")
+
+    for i, (col, ftype, severity) in enumerate(high_drift_features):
         if col not in train_m.columns:
             continue
+        if (i + 1) % 25 == 0:
+            logger.info(f"  High-drift progress: {i + 1}/{len(high_drift_features)}")
         train_m, test_m, entry = mitigate_feature_progressive(
             train_m, test_m, col, ftype, severity
         )
@@ -535,7 +628,19 @@ def apply_all_mitigations(
             if col not in drop_cols and col in train_m.columns:
                 moderate_features.append((col, row["feature_type"], row.get("psi", 0) or 0, row.get("jsd", 0) or 0))
 
-    for col, ftype, orig_psi, orig_jsd in moderate_features:
+    # Cap moderate features to top 50 by drift magnitude for large feature sets
+    _MAX_MODERATE = 50
+    if len(moderate_features) > _MAX_MODERATE:
+        moderate_features.sort(key=lambda x: max(x[2], x[3]), reverse=True)
+        logger.info(f"Moderate mitigation: processing top {_MAX_MODERATE}/{len(moderate_features)} by drift magnitude")
+        moderate_features = moderate_features[:_MAX_MODERATE]
+
+    if moderate_features:
+        logger.info(f"Progressive mitigation: processing {len(moderate_features)} moderate-drift features")
+
+    for mi, (col, ftype, orig_psi, orig_jsd) in enumerate(moderate_features):
+        if (mi + 1) % 25 == 0:
+            logger.info(f"  Moderate-drift progress: {mi + 1}/{len(moderate_features)}")
         if ftype == "numerical":
             strategies = [
                 ("Gentle clipping", lambda tc, sc: clip_outliers(tc, sc)),
@@ -544,20 +649,24 @@ def apply_all_mitigations(
                 ("Quantile matching", lambda tc, sc: quantile_match(tc, sc)),
                 ("Rank transform", lambda tc, sc: rank_transform(tc, sc)),
             ]
+            eval_tr, eval_te = _eval_subsample(train_m[col], test_m[col])
             best_strategy = None
             best_psi = orig_psi
-            best_result = None
+            best_fn = None
+            best_sev = None
             for name, fn in strategies:
-                result = fn(train_m[col], test_m[col])
+                result = fn(eval_tr, eval_te)
                 if result is None:
                     continue
                 tr_col, te_col = result
                 drift = detect_numerical_drift(tr_col, te_col)
                 new_psi = drift.get("psi", orig_psi) or orig_psi
                 if drift["severity"] == "low":
-                    # Immediate accept if drops to low
-                    train_m[col] = tr_col.values
-                    test_m[col] = te_col.values
+                    # Immediate accept — apply to full data
+                    full_result = fn(train_m[col], test_m[col])
+                    if full_result is not None:
+                        train_m[col] = full_result[0].values
+                        test_m[col] = full_result[1].values
                     logger.info(f"  {col}: {name} (moderate -> low)")
                     mitigation_log.append({"column": col, "feature_type": ftype,
                                            "original_severity": "moderate", "strategy_applied": name,
@@ -567,28 +676,31 @@ def apply_all_mitigations(
                 elif new_psi < best_psi:
                     best_psi = new_psi
                     best_strategy = name
-                    best_result = (tr_col, te_col, drift["severity"])
+                    best_fn = fn
+                    best_sev = drift["severity"]
             # Apply best improvement even if still moderate
-            if best_strategy and best_result:
-                tr_col, te_col, final_sev = best_result
-                train_m[col] = tr_col.values
-                test_m[col] = te_col.values
+            if best_strategy and best_fn:
+                full_result = best_fn(train_m[col], test_m[col])
+                if full_result is not None:
+                    train_m[col] = full_result[0].values
+                    test_m[col] = full_result[1].values
                 logger.info(f"  {col}: {best_strategy} (moderate, PSI {orig_psi:.4f} -> {best_psi:.4f})")
                 mitigation_log.append({"column": col, "feature_type": ftype,
                                        "original_severity": "moderate", "strategy_applied": best_strategy,
-                                       "final_severity": final_sev})
+                                       "final_severity": best_sev})
 
         elif ftype == "categorical":
-            # Try group_rare then frequency encoding (with best-improvement fallback)
+            eval_tr, eval_te = _eval_subsample(train_m[col], test_m[col])
             cat_strategies = [
                 ("Rare category grouping", lambda tc, sc: group_rare_categories(tc, sc), "cat"),
                 ("Frequency encoding", lambda tc, sc: frequency_encode_mitigation(tc, sc), "num"),
             ]
             best_strategy = None
             best_jsd = orig_jsd
-            best_result = None
+            best_fn = None
+            best_sev = None
             for name, fn, detect_type in cat_strategies:
-                tr_col, te_col = fn(train_m[col], test_m[col])
+                tr_col, te_col = fn(eval_tr, eval_te)
                 if detect_type == "cat":
                     drift = detect_categorical_drift(tr_col, te_col)
                     new_jsd = drift.get("jsd", orig_jsd) or orig_jsd
@@ -596,28 +708,28 @@ def apply_all_mitigations(
                     drift = detect_numerical_drift(tr_col, te_col)
                     new_jsd = drift.get("psi", orig_jsd) or orig_jsd
                 if drift["severity"] == "low":
-                    # Immediate accept if drops to low
-                    train_m[col] = tr_col.values
-                    test_m[col] = te_col.values
+                    full_tr, full_te = fn(train_m[col], test_m[col])
+                    train_m[col] = full_tr.values
+                    test_m[col] = full_te.values
                     logger.info(f"  {col}: {name} (moderate -> low)")
                     mitigation_log.append({"column": col, "feature_type": ftype,
                                            "original_severity": "moderate", "strategy_applied": name,
                                            "final_severity": "low"})
-                    best_strategy = None  # already applied
+                    best_strategy = None
                     break
                 elif new_jsd < best_jsd:
                     best_jsd = new_jsd
                     best_strategy = name
-                    best_result = (tr_col, te_col, drift["severity"])
-            # Apply best improvement even if still moderate
-            if best_strategy and best_result:
-                tr_col, te_col, final_sev = best_result
-                train_m[col] = tr_col.values
-                test_m[col] = te_col.values
+                    best_fn = fn
+                    best_sev = drift["severity"]
+            if best_strategy and best_fn:
+                full_tr, full_te = best_fn(train_m[col], test_m[col])
+                train_m[col] = full_tr.values
+                test_m[col] = full_te.values
                 logger.info(f"  {col}: {best_strategy} (moderate, JSD {orig_jsd:.4f} -> {best_jsd:.4f})")
                 mitigation_log.append({"column": col, "feature_type": ftype,
                                        "original_severity": "moderate", "strategy_applied": best_strategy,
-                                       "final_severity": final_sev})
+                                       "final_severity": best_sev})
 
     # Stage 4: Multivariate shift detection (diagnostic only, no weighting)
     from drift_detector import detect_multivariate_shift
