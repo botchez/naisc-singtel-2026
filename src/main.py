@@ -353,7 +353,7 @@ def main():
         import numpy as np
 
         # Baseline model (subsampled for comparison metrics only)
-        _MAX_BASELINE_SAMPLE = 100_000
+        _MAX_BASELINE_SAMPLE = 50_000
         train_baseline = train
         if len(train) > _MAX_BASELINE_SAMPLE:
             train_baseline = train.sample(n=_MAX_BASELINE_SAMPLE, random_state=42)
