@@ -145,6 +145,7 @@ def detect_feature_types(
     df: pd.DataFrame,
     id_col: str = "CustomerID",
     target_col: str = "ChurnStatus",
+    temporal_col: str = "Month",
     test_df: pd.DataFrame | None = None,
 ) -> dict[str, list[str]]:
     """Auto-detect feature types with robust column detection.
@@ -172,6 +173,19 @@ def detect_feature_types(
         else:
             logger.warning(f"Target column '{target_col}' not found and could not be auto-detected")
             target_col = None
+
+    # Auto-detect temporal column if default not found
+    if temporal_col not in df.columns:
+        detected = None
+        norm_map_t = {_normalize_col_name(c): c for c in df.columns}
+        if _normalize_col_name(temporal_col) in norm_map_t:
+            detected = norm_map_t[_normalize_col_name(temporal_col)]
+        if detected:
+            logger.info(f"Auto-detected temporal column: '{detected}' ('{temporal_col}' not found)")
+            temporal_col = detected
+        else:
+            logger.info(f"Temporal column '{temporal_col}' not found, will use heuristic detection")
+            temporal_col = None
 
     # Determine which columns to classify as features (must be in both datasets)
     cols_to_classify = set(df.columns)
@@ -237,7 +251,12 @@ def detect_feature_types(
         except Exception:
             pass
 
-        # Temporal heuristic: object column with month-year patterns like "25-Jan"
+        # Known temporal column (exact match)
+        if temporal_col and col == temporal_col:
+            types["temporal"].append(col)
+            continue
+
+        # Temporal heuristic fallback: object column with month-year patterns like "25-Jan"
         if not pd.api.types.is_numeric_dtype(df_sample[col]) and _looks_temporal(df_sample[col]):
             types["temporal"].append(col)
             continue

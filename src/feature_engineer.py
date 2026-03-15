@@ -28,34 +28,41 @@ def engineer_features(
     new_features = []
 
     # 1. Missing value indicators
+    _null_train_parts = {}
+    _null_test_parts = {}
     for col in train.columns:
         if col in skip_cols:
             continue
         null_pct = train[col].isna().mean()
         if null_pct > 0.01 and col in test.columns:
             fname = f"{col}_is_null"
-            train[fname] = train[col].isna().astype(int)
-            test[fname] = test[col].isna().astype(int)
+            _null_train_parts[fname] = train[col].isna().astype(int)
+            _null_test_parts[fname] = test[col].isna().astype(int)
             new_features.append(fname)
 
-    if new_features:
+    if _null_train_parts:
+        train = pd.concat([train, pd.DataFrame(_null_train_parts, index=train.index)], axis=1)
+        test = pd.concat([test, pd.DataFrame(_null_test_parts, index=test.index)], axis=1)
         logger.info(f"Added {len(new_features)} missing indicator features")
 
     # 2. Frequency encoding for high-cardinality categoricals
     cat_cols = [c for c in feature_types.get("categorical", [])
                 if c not in skip_cols and c in train.columns and c in test.columns]
     freq_features = []
+    _freq_train_parts = {}
+    _freq_test_parts = {}
     for col in cat_cols:
         n_unique = train[col].nunique()
         if n_unique > 10:
-            # Frequency map from training data
             freq_map = train[col].value_counts(normalize=True).to_dict()
             fname = f"{col}_freq"
-            train[fname] = train[col].map(freq_map).fillna(0.0)
-            test[fname] = test[col].map(freq_map).fillna(0.0)
+            _freq_train_parts[fname] = train[col].map(freq_map).fillna(0.0)
+            _freq_test_parts[fname] = test[col].map(freq_map).fillna(0.0)
             freq_features.append(fname)
 
-    if freq_features:
+    if _freq_train_parts:
+        train = pd.concat([train, pd.DataFrame(_freq_train_parts, index=train.index)], axis=1)
+        test = pd.concat([test, pd.DataFrame(_freq_test_parts, index=test.index)], axis=1)
         logger.info(f"Added {len(freq_features)} frequency encoding features: {freq_features}")
 
     # 3. Ratio features between correlated numerical pairs
@@ -64,9 +71,6 @@ def engineer_features(
 
     ratio_features = []
     if len(num_cols) >= 2:
-        # For high-dimensional datasets (500+ features), computing a full
-        # correlation matrix is O(n*m^2) and can be very expensive.
-        # Cap to top-50 numerical features by variance for correlation analysis.
         _MAX_CORR_COLS = 50
         corr_cols = num_cols
         if len(num_cols) > _MAX_CORR_COLS:
@@ -74,13 +78,11 @@ def engineer_features(
             corr_cols = variances.head(_MAX_CORR_COLS).index.tolist()
             logger.info(f"Ratio features: using top {_MAX_CORR_COLS}/{len(num_cols)} cols by variance for correlation")
 
-        # Subsample rows for correlation computation on large datasets
         corr_train = train[corr_cols].apply(pd.to_numeric, errors="coerce")
         if len(corr_train) > 100_000:
             corr_train = corr_train.sample(n=100_000, random_state=42)
         corr_matrix = corr_train.corr().abs()
 
-        # Find top correlated pairs (above threshold, not same column)
         pairs = []
         for i, col_a in enumerate(corr_cols):
             for col_b in corr_cols[i + 1:]:
@@ -88,19 +90,22 @@ def engineer_features(
                 if pd.notna(c) and c > 0.3:
                     pairs.append((col_a, col_b, c))
 
-        # Sort by correlation, take top 5
         pairs.sort(key=lambda x: x[2], reverse=True)
+        _ratio_train_parts = {}
+        _ratio_test_parts = {}
         for col_a, col_b, _ in pairs[:5]:
             fname = f"{col_a}_div_{col_b}"
             a_train = pd.to_numeric(train[col_a], errors="coerce").fillna(0)
             b_train = pd.to_numeric(train[col_b], errors="coerce").fillna(0)
             a_test = pd.to_numeric(test[col_a], errors="coerce").fillna(0)
             b_test = pd.to_numeric(test[col_b], errors="coerce").fillna(0)
-            train[fname] = a_train / (b_train + 1)
-            test[fname] = a_test / (b_test + 1)
+            _ratio_train_parts[fname] = a_train / (b_train + 1)
+            _ratio_test_parts[fname] = a_test / (b_test + 1)
             ratio_features.append(fname)
 
-        if ratio_features:
+        if _ratio_train_parts:
+            train = pd.concat([train, pd.DataFrame(_ratio_train_parts, index=train.index)], axis=1)
+            test = pd.concat([test, pd.DataFrame(_ratio_test_parts, index=test.index)], axis=1)
             logger.info(f"Added {len(ratio_features)} ratio features: {ratio_features}")
 
     # 4. Aggregation features: group-level stats (mean) per categorical
@@ -108,21 +113,24 @@ def engineer_features(
     agg_num_cols = num_cols[:10]  # limit to avoid feature explosion
 
     agg_features = []
+    _agg_train_parts = {}
+    _agg_test_parts = {}
     if agg_cat_cols and agg_num_cols:
         for cat_col in agg_cat_cols[:3]:  # top 3 categoricals by cardinality
             for num_col in agg_num_cols[:5]:  # top 5 numerical
                 fname = f"{num_col}_mean_by_{cat_col}"
                 num_train = pd.to_numeric(train[num_col], errors="coerce")
                 group_means = num_train.groupby(train[cat_col]).transform("mean")
-                train[fname] = group_means.fillna(num_train.mean())
+                _agg_train_parts[fname] = group_means.fillna(num_train.mean())
 
-                num_test = pd.to_numeric(test[num_col], errors="coerce")
                 # Map test using training group means
                 train_group_map = num_train.groupby(train[cat_col]).mean().to_dict()
-                test[fname] = test[cat_col].map(train_group_map).fillna(num_train.mean())
+                _agg_test_parts[fname] = test[cat_col].map(train_group_map).fillna(num_train.mean())
                 agg_features.append(fname)
 
-    if agg_features:
+    if _agg_train_parts:
+        train = pd.concat([train, pd.DataFrame(_agg_train_parts, index=train.index)], axis=1)
+        test = pd.concat([test, pd.DataFrame(_agg_test_parts, index=test.index)], axis=1)
         logger.info(f"Added {len(agg_features)} aggregation features")
 
     # Collect all new feature names

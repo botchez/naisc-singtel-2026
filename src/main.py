@@ -271,49 +271,65 @@ def main():
     profile_data(train, feature_types, label="train")
     profile_data(test, feature_types, label="test")
 
-    # --- Early subsampling: cap training data for pipeline efficiency ---
-    # Subsample BEFORE numeric coercion to avoid O(10M) per column.
-    # Stages 2-5 operate on subsampled data; final model caps at 500K anyway.
-    _MAX_PIPELINE_TRAIN = 500_000
-    if len(train) > _MAX_PIPELINE_TRAIN:
-        from utils import stratified_subsample_idx, _parse_month_labels
-
-        _original_n = len(train)
-        # Try temporal stratification to preserve month distribution
-        _month_vals = None
-        for tc in feature_types.get("temporal", []):
-            if tc in train.columns:
-                _month_vals = _parse_month_labels(train[tc])
-                if _month_vals is not None:
-                    break
-
-        _pipeline_idx = stratified_subsample_idx(
-            len(train), _MAX_PIPELINE_TRAIN,
-            month_values=_month_vals, seed=42,
-        )
-        train = train.iloc[_pipeline_idx].reset_index(drop=True)
-        logger.info(
-            f"Early subsampling: {_MAX_PIPELINE_TRAIN:,}/{_original_n:,} training rows"
-            f"{' (stratified by temporal)' if _month_vals is not None else ''}"
-        )
-
     # Coerce columns classified as numerical but still stored as object dtype
-    # (after subsampling so this runs on 500K rows, not 10M)
     for col in feature_types.get("numerical", []):
         if col in train.columns and not pd.api.types.is_numeric_dtype(train[col]):
             train[col] = pd.to_numeric(train[col], errors="coerce")
         if col in test.columns and not pd.api.types.is_numeric_dtype(test[col]):
             test[col] = pd.to_numeric(test[col], errors="coerce")
 
+    # --- Build a single decision sample for drift detection, feature selection,
+    # and weight tournament. Full data flows through mitigation/FE/final model. ---
+    from utils import stratified_subsample_idx, _parse_month_labels
+
+    _DECISION_SAMPLE_SIZE = 100_000
+    _decision_idx = None
+    _month_vals = None
+    for tc in feature_types.get("temporal", []):
+        if tc in train.columns:
+            _month_vals = _parse_month_labels(train[tc])
+            if _month_vals is not None:
+                break
+
+    if len(train) > _DECISION_SAMPLE_SIZE:
+        _decision_idx = stratified_subsample_idx(
+            len(train), _DECISION_SAMPLE_SIZE,
+            month_values=_month_vals, seed=42,
+        )
+        logger.info(
+            f"Decision sample: {_DECISION_SAMPLE_SIZE:,}/{len(train):,} rows"
+            f"{' (stratified by temporal)' if _month_vals is not None else ''}"
+        )
+    train_decision = train.iloc[_decision_idx].reset_index(drop=True) if _decision_idx is not None else train
+
+    # --- Dynamic pipeline cap: keep runtime under 10 minutes ---
+    # Based on benchmark: 2M rows × 200 cols ≈ 230s computation.
+    # Budget 480s for computation (leaving ~2 min for CSV I/O).
+    _RUNTIME_BUDGET_S = 480
+    _COST_PER_ROW_COL = 5.75e-7  # seconds per row × column (from 2M×200 benchmark)
+    n_cols = len(train.columns)
+    _max_pipeline_rows = int(_RUNTIME_BUDGET_S / (_COST_PER_ROW_COL * max(n_cols, 1)))
+    _max_pipeline_rows = max(_max_pipeline_rows, _DECISION_SAMPLE_SIZE)  # never below decision sample
+
+    if len(train) > _max_pipeline_rows:
+        _pipeline_idx = stratified_subsample_idx(
+            len(train), _max_pipeline_rows,
+            month_values=_month_vals, seed=42,
+        )
+        train = train.iloc[_pipeline_idx].reset_index(drop=True)
+        logger.info(
+            f"Pipeline cap: {_max_pipeline_rows:,}/{len(train) + (len(train) - _max_pipeline_rows):,} rows "
+            f"(dynamic, targeting <{_RUNTIME_BUDGET_S}s for {n_cols} cols)"
+        )
+    else:
+        logger.info(f"Pipeline cap: no cap needed ({len(train):,} rows × {n_cols} cols fits within budget)")
+
     # --- Stage 2: Drift Detection (train vs test) ---
     with Timer("Drift detection") as drift_timer:
-        # Pre-subsample to 50K for drift analysis — statistical tests cap at 50K
-        # internally anyway; passing 500K just wastes time on isna/dropna/to_numeric
-        _DRIFT_SAMPLE = 50_000
-        train_drift = train.sample(n=min(_DRIFT_SAMPLE, len(train)), random_state=42) if len(train) > _DRIFT_SAMPLE else train
-        test_drift = test.sample(n=min(_DRIFT_SAMPLE, len(test)), random_state=42) if len(test) > _DRIFT_SAMPLE else test
-        drift_df = run_drift_analysis(train_drift, test_drift, feature_types)
-        label_shift_info = detect_label_shift(train_drift, test_drift, feature_types)
+        # Use decision sample for drift analysis — statistical tests converge at 100K
+        test_drift = test.sample(n=min(_DECISION_SAMPLE_SIZE, len(test)), random_state=42) if len(test) > _DECISION_SAMPLE_SIZE else test
+        drift_df = run_drift_analysis(train_decision, test_drift, feature_types)
+        label_shift_info = detect_label_shift(train_decision, test_drift, feature_types)
         # Keep full train for month_rank (used for recency weighting across all rows)
         intra_drift_df, month_rank = detect_intra_training_drift(train, feature_types)
 
@@ -372,15 +388,14 @@ def main():
             train_m, test_m, feature_types, extra_drop_cols=drop_cols
         )
 
-        # --- Feature selection: use subsampled model to prune zero-importance features ---
+        # --- Feature selection: use decision sample to prune zero-importance features ---
         from sklearn.metrics import average_precision_score
         from model import _encode_target
 
-        _MAX_FEAT_SEL_SAMPLE = 50_000
         try:
-            if len(X_train_m) > _MAX_FEAT_SEL_SAMPLE:
-                rng_fs = np.random.RandomState(42)
-                fs_idx = rng_fs.choice(len(X_train_m), size=_MAX_FEAT_SEL_SAMPLE, replace=False)
+            if _decision_idx is not None and len(X_train_m) > _DECISION_SAMPLE_SIZE:
+                # Reuse decision sample indices (clamped to current DataFrame size)
+                fs_idx = _decision_idx[_decision_idx < len(X_train_m)]
                 fs_model = train_model(X_train_m.iloc[fs_idx], y_train_m.iloc[fs_idx])
             else:
                 fs_model = train_model(X_train_m, y_train_m)
@@ -406,27 +421,21 @@ def main():
                           and test_m[target_col].notna().any())
         y_test_m = _encode_target(test_m[target_col]) if has_test_labels else None
 
-        # Subsample for weight tournament evaluations on large datasets
-        from utils import stratified_subsample_idx
-
-        _MAX_TOURNEY_SAMPLE = 50_000
+        # Reuse decision sample for weight tournament
         _tourney_idx = None
         _test_tourney_idx = None
 
-        if len(X_train_m) > _MAX_TOURNEY_SAMPLE:
-            _mr_train = month_rank.reindex(X_train_m.index) if month_rank is not None else None
-            _tourney_idx = stratified_subsample_idx(
-                len(X_train_m), _MAX_TOURNEY_SAMPLE,
-                month_values=_mr_train, seed=42,
-            )
-            logger.info(f"Weight tournament: stratified subsampling {_MAX_TOURNEY_SAMPLE}/{len(X_train_m)} train rows")
+        if _decision_idx is not None and len(X_train_m) > _DECISION_SAMPLE_SIZE:
+            # Reuse decision sample indices (clamped to current DataFrame size)
+            _tourney_idx = _decision_idx[_decision_idx < len(X_train_m)]
+            logger.info(f"Weight tournament: reusing decision sample {len(_tourney_idx)}/{len(X_train_m)} train rows")
 
-        if has_test_labels and len(X_test_m) > _MAX_TOURNEY_SAMPLE:
+        if has_test_labels and len(X_test_m) > _DECISION_SAMPLE_SIZE:
             _test_tourney_idx = stratified_subsample_idx(
-                len(X_test_m), _MAX_TOURNEY_SAMPLE,
+                len(X_test_m), _DECISION_SAMPLE_SIZE,
                 month_values=None, seed=42,
             )
-            logger.info(f"Weight tournament: subsampling {_MAX_TOURNEY_SAMPLE}/{len(X_test_m)} test rows")
+            logger.info(f"Weight tournament: subsampling {_DECISION_SAMPLE_SIZE}/{len(X_test_m)} test rows")
 
         def _eval_candidate(label, weights):
             """Train with weights, return (label, weights, test_auprc, train_auprc)."""
@@ -549,23 +558,8 @@ def main():
         logger.info(f"Final winner: {best_label} (test AU-PRC={best_score:.4f})")
         weight_status = best_label
 
-        # Train final model with winning weights (stratified subsample on large datasets)
-        _MAX_FINAL_TRAIN = 500_000
-        if len(X_train_m) > _MAX_FINAL_TRAIN:
-            _mr_final = month_rank.reindex(X_train_m.index) if month_rank is not None else None
-            _final_idx = stratified_subsample_idx(
-                len(X_train_m), _MAX_FINAL_TRAIN,
-                month_values=_mr_final, seed=42,
-            )
-            X_train_final = X_train_m.iloc[_final_idx]
-            y_train_final = y_train_m.iloc[_final_idx]
-            w_final = best_weights[_final_idx] if best_weights is not None else None
-            logger.info(f"Final model: stratified subsampling {_MAX_FINAL_TRAIN}/{len(X_train_m)} rows")
-        else:
-            X_train_final, y_train_final = X_train_m, y_train_m
-            w_final = best_weights
-
-        lgbm_m = train_model(X_train_final, y_train_final, sample_weight=w_final)
+        # Train final model on full data with winning weights
+        lgbm_m = train_model(X_train_m, y_train_m, sample_weight=best_weights)
 
         mitigated_metrics = evaluate_and_save(
             lgbm_m, X_train_m, y_train_m, X_test_m, customer_ids, test_m, feature_types,

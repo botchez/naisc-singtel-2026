@@ -126,8 +126,9 @@ def normalize_data_quality(
     test_clean = test.copy(deep=False)
     norm_log: dict[str, list[str]] = {}
 
-    # Auto-detect abbreviation mappings on all categorical object columns
-    for col in feature_types.get("categorical", []) + feature_types.get("temporal", []):
+    # Auto-detect abbreviation mappings on categorical columns (NOT temporal)
+    temporal_cols = set(feature_types.get("temporal", []))
+    for col in feature_types.get("categorical", []):
         if col in skip_cols or col not in train_clean.columns or col not in test_clean.columns:
             continue
         if train_clean[col].dtype != object:
@@ -143,7 +144,7 @@ def normalize_data_quality(
     from drift_detector import detect_categorical_drift
     normalized = []
     skipped_norm = []
-    cat_cols = set(feature_types.get("categorical", []) + feature_types.get("temporal", []))
+    cat_cols = set(feature_types.get("categorical", []))  # exclude temporal from normalization/fuzzy
 
     # Pre-compute subsample indices for drift comparison on large datasets
     _NORM_SAMPLE = 50_000
@@ -439,12 +440,10 @@ def mitigate_feature_progressive(
         cos_drift = detect_numerical_drift(train_cos, test_cos)
         # Accept if BOTH sin and cos are below high
         if sin_drift["severity"] != "high" and cos_drift["severity"] != "high":
-            train = train.drop(columns=[col])
-            test = test.drop(columns=[col])
-            train[train_sin.name] = train_sin.values
-            train[train_cos.name] = train_cos.values
-            test[test_sin.name] = test_sin.values
-            test[test_cos.name] = test_cos.values
+            train = pd.concat([train.drop(columns=[col]),
+                               train_sin.to_frame(), train_cos.to_frame()], axis=1)
+            test = pd.concat([test.drop(columns=[col]),
+                              test_sin.to_frame(), test_cos.to_frame()], axis=1)
             worst = sin_drift["severity"] if sin_drift["severity"] == "moderate" else cos_drift["severity"]
             log_entry["strategy_applied"] = "Seasonality Matching"
             log_entry["final_severity"] = worst
