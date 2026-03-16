@@ -147,9 +147,8 @@ def prepare_features(
             cat_to_int = {cat: i for i, cat in enumerate(train_cats)}
             # Encode train
             X_train[col] = raw_train.map(cat_to_int).astype(int).astype("category")
-            # Encode test — unseen categories get a new sentinel code
-            sentinel = len(cat_to_int)
-            X_test[col] = raw_test.map(cat_to_int).fillna(sentinel).astype(int).astype("category")
+            # Encode test — unseen categories get NaN (LightGBM handles missing natively)
+            X_test[col] = raw_test.map(cat_to_int).astype("category")
         except Exception as e:
             logger.warning(f"Native categorical encoding failed for {col}, falling back to target encoding: {e}")
             te_cat_cols.append(col)

@@ -211,8 +211,12 @@ def normalize_data_quality(
             fuzzy_skipped += 1
             continue
         fuzzy_map = {}
+        train_cats_list = list(train_cats)
         for cat in unseen:
-            matches = difflib.get_close_matches(cat, list(train_cats), n=1, cutoff=0.6)
+            # Try strict cutoff first, then relaxed
+            matches = difflib.get_close_matches(cat, train_cats_list, n=1, cutoff=0.6)
+            if not matches:
+                matches = difflib.get_close_matches(cat, train_cats_list, n=1, cutoff=0.45)
             if matches:
                 fuzzy_map[cat] = matches[0]
         if fuzzy_map:
@@ -338,6 +342,24 @@ def frequency_encode_mitigation(
     )
 
 
+def robust_scale(
+    train_col: pd.Series, test_col: pd.Series
+) -> tuple[pd.Series, pd.Series]:
+    """Scale using median and IQR from train. Distribution-robust alternative to z-score."""
+    train_vals = pd.to_numeric(train_col, errors="coerce").dropna().values.astype(float)
+    median = np.median(train_vals)
+    q1, q3 = np.percentile(train_vals, [25, 75])
+    iqr = q3 - q1
+    if iqr < 1e-10:
+        return train_col, test_col
+    tr = (pd.to_numeric(train_col, errors="coerce") - median) / iqr
+    te = (pd.to_numeric(test_col, errors="coerce") - median) / iqr
+    return (
+        pd.Series(tr.values, index=train_col.index, name=train_col.name),
+        pd.Series(te.values, index=test_col.index, name=test_col.name),
+    )
+
+
 def _clip_then_log(train_col, test_col):
     tr_c, te_c = clip_outliers(train_col, test_col)
     # Shift to ensure non-negative before log
@@ -456,6 +478,7 @@ def mitigate_feature_progressive(
             ("Feature Scaling", lambda tc, sc: clip_outliers(tc, sc)),
             ("Feature Scaling (Log)", lambda tc, sc: log_transform(tc, sc)),
             ("Feature Scaling (Clip+Log)", lambda tc, sc: _clip_then_log(tc, sc)),
+            ("Robust Scaling", lambda tc, sc: robust_scale(tc, sc)),
             ("Discretization", lambda tc, sc: quantile_bin(tc, sc)),
             ("Rank Transform", lambda tc, sc: rank_transform(tc, sc)),
         ]
@@ -645,6 +668,7 @@ def apply_all_mitigations(
                 ("Gentle clipping", lambda tc, sc: clip_outliers(tc, sc)),
                 ("Log transform", lambda tc, sc: log_transform(tc, sc)),
                 ("Clip+Log", lambda tc, sc: _clip_then_log(tc, sc)),
+                ("Robust scaling", lambda tc, sc: robust_scale(tc, sc)),
                 ("Quantile matching", lambda tc, sc: quantile_match(tc, sc)),
                 ("Rank transform", lambda tc, sc: rank_transform(tc, sc)),
             ]
