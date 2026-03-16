@@ -34,6 +34,22 @@ def load_data(train_path: str, test_path: str) -> tuple[pd.DataFrame, pd.DataFra
     train = pd.read_csv(train_path, low_memory=False)
     test = pd.read_csv(test_path, low_memory=False)
 
+    # Handle duplicate column names (suffix with _dup1, _dup2, etc.)
+    for df, label in [(train, "train"), (test, "test")]:
+        dupes = df.columns[df.columns.duplicated()]
+        if len(dupes) > 0:
+            new_cols = []
+            seen = {}
+            for c in df.columns:
+                if c in seen:
+                    seen[c] += 1
+                    new_cols.append(f"{c}_dup{seen[c]}")
+                else:
+                    seen[c] = 0
+                    new_cols.append(c)
+            df.columns = new_cols
+            logger.warning(f"Renamed {len(dupes)} duplicate columns in {label}")
+
     mem_before = (train.memory_usage(deep=True).sum() + test.memory_usage(deep=True).sum()) / 1e6
     train = _downcast_dataframe(train)
     test = _downcast_dataframe(test)

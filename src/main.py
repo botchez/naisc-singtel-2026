@@ -400,13 +400,32 @@ def main():
             else:
                 fs_model = train_model(X_train_m, y_train_m)
             importances = fs_model.feature_importances_
-            zero_imp_cols = [c for c, imp in zip(X_train_m.columns, importances) if imp == 0]
+            imp_by_col = dict(zip(X_train_m.columns, importances))
+
+            # Drop zero-importance features
+            zero_imp_cols = [c for c, imp in imp_by_col.items() if imp == 0]
             if zero_imp_cols and len(zero_imp_cols) < len(X_train_m.columns):
                 X_train_m = X_train_m.drop(columns=zero_imp_cols)
                 X_test_m = X_test_m.drop(columns=zero_imp_cols)
                 logger.info(f"Dropped {len(zero_imp_cols)} zero-importance features: {zero_imp_cols}")
             elif zero_imp_cols:
                 logger.warning(f"All {len(zero_imp_cols)} features have zero importance; keeping all")
+
+            # Top-feature pairwise interactions (top-6 numeric by importance)
+            remaining_imps = {c: imp_by_col[c] for c in X_train_m.columns if c in imp_by_col}
+            sorted_cols = sorted(remaining_imps.keys(), key=lambda c: remaining_imps[c], reverse=True)
+            top_cols = [c for c in sorted_cols[:8]
+                        if pd.api.types.is_numeric_dtype(X_train_m[c])]
+            interaction_count = 0
+            for i, ca in enumerate(top_cols):
+                for cb in top_cols[i+1:]:
+                    fname = f"{ca}_x_{cb}"
+                    if fname not in X_train_m.columns:
+                        X_train_m[fname] = X_train_m[ca] * X_train_m[cb]
+                        X_test_m[fname] = X_test_m[ca] * X_test_m[cb]
+                        interaction_count += 1
+            if interaction_count:
+                logger.info(f"Added {interaction_count} top-feature interaction terms")
         except Exception as e:
             logger.warning(f"Feature selection skipped: {e}")
 
@@ -421,21 +440,24 @@ def main():
                           and test_m[target_col].notna().any())
         y_test_m = _encode_target(test_m[target_col]) if has_test_labels else None
 
-        # Reuse decision sample for weight tournament
+        # Reuse decision sample for weight tournament (larger than drift sample for stability)
+        _TOURNEY_SAMPLE_SIZE = 300_000
         _tourney_idx = None
         _test_tourney_idx = None
 
-        if _decision_idx is not None and len(X_train_m) > _DECISION_SAMPLE_SIZE:
-            # Reuse decision sample indices (clamped to current DataFrame size)
-            _tourney_idx = _decision_idx[_decision_idx < len(X_train_m)]
-            logger.info(f"Weight tournament: reusing decision sample {len(_tourney_idx)}/{len(X_train_m)} train rows")
+        if len(X_train_m) > _TOURNEY_SAMPLE_SIZE:
+            _tourney_idx = stratified_subsample_idx(
+                len(X_train_m), _TOURNEY_SAMPLE_SIZE,
+                month_values=_month_vals, seed=42,
+            )
+            logger.info(f"Weight tournament: subsampling {_TOURNEY_SAMPLE_SIZE:,}/{len(X_train_m):,} train rows")
 
-        if has_test_labels and len(X_test_m) > _DECISION_SAMPLE_SIZE:
+        if has_test_labels and len(X_test_m) > _TOURNEY_SAMPLE_SIZE:
             _test_tourney_idx = stratified_subsample_idx(
-                len(X_test_m), _DECISION_SAMPLE_SIZE,
+                len(X_test_m), _TOURNEY_SAMPLE_SIZE,
                 month_values=None, seed=42,
             )
-            logger.info(f"Weight tournament: subsampling {_DECISION_SAMPLE_SIZE}/{len(X_test_m)} test rows")
+            logger.info(f"Weight tournament: subsampling {_TOURNEY_SAMPLE_SIZE:,}/{len(X_test_m):,} test rows")
 
         def _eval_candidate(label, weights):
             """Train with weights, return (label, weights, test_auprc, train_auprc)."""
