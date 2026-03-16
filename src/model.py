@@ -276,8 +276,10 @@ def evaluate_and_save(
     test_proba = model.predict_proba(X_test)[:, 1]
     test_auprc = None
     if target_col and target_col in test.columns and test[target_col].notna().any():
-        y_test = _encode_target(test[target_col])
-        test_auprc = average_precision_score(y_test, test_proba)
+        # Guard against dummy test labels (all same value) in hidden eval
+        if test[target_col].dropna().nunique() >= 2:
+            y_test = _encode_target(test[target_col])
+            test_auprc = average_precision_score(y_test, test_proba)
 
     # Save prediction and model
     id_col = feature_types["id"][0] if feature_types["id"] else "ID"

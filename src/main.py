@@ -438,6 +438,12 @@ def main():
         target_col = feature_types["target"][0] if feature_types["target"] else None
         has_test_labels = (target_col and target_col in test_m.columns
                           and test_m[target_col].notna().any())
+        # Guard against dummy test labels (e.g. all same value) in hidden eval
+        if has_test_labels:
+            _test_target_vals = test_m[target_col].dropna().unique()
+            if len(_test_target_vals) < 2:
+                logger.info(f"Test target has only 1 unique value ({_test_target_vals[0]}) — treating as dummy labels")
+                has_test_labels = False
         y_test_m = _encode_target(test_m[target_col]) if has_test_labels else None
 
         # Reuse decision sample for weight tournament (larger than drift sample for stability)
