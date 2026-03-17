@@ -61,7 +61,7 @@ train.csv, test.csv
 
 ## 2. Entry Point: main.py
 
-`main()` is the orchestrator. It calls into each module sequentially and passes state between stages via local variables. Each stage is timed with a `Timer` context manager, and summary tables are printed at the end.
+`main()` (`main.py:252`) is the orchestrator. It calls into each module sequentially and passes state between stages via local variables. Each stage is timed with a `Timer` context manager, and summary tables are printed at the end.
 
 **Key orchestration decisions:**
 
@@ -75,7 +75,7 @@ train.csv, test.csv
 
 ### 3.1 Loading Data
 
-#### `load_data(train_path, test_path) -> (train_df, test_df)`
+#### `load_data(train_path, test_path) -> (train_df, test_df)` — `profiler.py:28`
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -86,14 +86,14 @@ train.csv, test.csv
 **Logic:**
 1. Reads both CSVs with `pd.read_csv(low_memory=False)`.
 2. **Duplicate column handling**: If any column names appear more than once, appends `_dup1`, `_dup2`, etc. This prevents silent column overwrites that pandas would otherwise allow.
-3. **Memory downcasting** via `_downcast_dataframe()`: Converts `float64` -> `float32`, and `int64` -> the smallest integer type that fits the actual data range (`int8`/`int16`/`int32`). This is critical for the 10M-row datasets — downcasting can halve memory usage.
+3. **Memory downcasting** via `_downcast_dataframe()` (`profiler.py:6`): Converts `float64` -> `float32`, and `int64` -> the smallest integer type that fits the actual data range (`int8`/`int16`/`int32`). This is critical for the 10M-row datasets — downcasting can halve memory usage.
 4. Logs the shape and memory before/after.
 
 **Rationale:** The hidden eval dataset may have up to 10M rows and 500 features. Without downcasting, a 10M x 500 float64 DataFrame would use ~40 GB. With float32, it's ~20 GB. The int downcasting is even more aggressive — a column with values 0-12 (like month) shrinks from 8 bytes/row to 1 byte/row.
 
 ### 3.2 Column Alignment
 
-#### `align_train_test_columns(train, test) -> (train, test_aligned)`
+#### `align_train_test_columns(train, test) -> (train, test_aligned)` — `profiler.py:118`
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -103,7 +103,7 @@ train.csv, test.csv
 
 **Logic:**
 1. Finds columns in train but not in test, and vice versa.
-2. For mismatched columns, normalizes names (lowercase, strip underscores/spaces/hyphens) and checks for fuzzy matches. If `test` has `"customer_id"` and `train` has `"CustomerID"`, they'll match.
+2. For mismatched columns, normalizes names via `_normalize_col_name()` (`profiler.py:63`) — lowercase, strip underscores/spaces/hyphens — and checks for fuzzy matches. If `test` has `"customer_id"` and `train` has `"CustomerID"`, they'll match.
 3. Renames test columns to train's naming convention.
 4. Logs warnings for columns that remain unmatched (expected: target column is typically train-only).
 
@@ -111,7 +111,7 @@ train.csv, test.csv
 
 ### 3.3 Feature Type Detection
 
-#### `detect_feature_types(df, id_col, target_col, temporal_col, test_df) -> feature_types`
+#### `detect_feature_types(df, id_col, target_col, temporal_col, test_df) -> feature_types` — `profiler.py:160`
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -125,9 +125,9 @@ train.csv, test.csv
 **Logic:**
 
 1. **Auto-detection with fallback**: Each of `id_col`, `target_col`, `temporal_col` first tries exact match. If not found:
-   - **ID**: Tries pattern matching against `_ID_PATTERNS` (e.g., "customerid", "userid", "accountid"), then looks for columns ending in "id" with >90% unique values.
-   - **Target**: Tries `_TARGET_PATTERNS` (e.g., "churnstatus", "target", "label"), then looks for suggestive column names containing "target", "label", etc.
-   - **Temporal**: Tries fuzzy normalized name match, then falls back to `_looks_temporal()` heuristic which tries parsing values against 11 date formats.
+   - **ID**: `_auto_detect_id_column()` (`profiler.py:82`) — tries pattern matching against `_ID_PATTERNS` (`profiler.py:68`), then looks for columns ending in "id" with >90% unique values.
+   - **Target**: `_auto_detect_target_column()` (`profiler.py:102`) — tries `_TARGET_PATTERNS` (`profiler.py:74`), then looks for suggestive column names containing "target", "label", etc.
+   - **Temporal**: Tries fuzzy normalized name match (`profiler.py:196`), then falls back to `_looks_temporal()` (`profiler.py:304`) heuristic which tries parsing values against 11 date formats.
 
 2. **Column filtering**: When `test_df` is provided, only columns present in **both** datasets are classified as features. Train-only columns (besides id/target) are logged and skipped. This prevents the model from learning features that won't exist at prediction time.
 
@@ -137,7 +137,7 @@ train.csv, test.csv
    - Skip near-zero-variance columns (>99% same value) — these add noise without predictive power.
    - If matched as `temporal_col`, classify as temporal.
    - If non-numeric but matches `_looks_temporal()` heuristic, classify as temporal.
-   - If non-numeric but >80% parseable as numbers (`_looks_numeric()`), classify as numerical (handles columns like `TotalCharges` which have numeric values with a few blank strings).
+   - If non-numeric but >80% parseable as numbers (`_looks_numeric()`, `profiler.py:295`), classify as numerical (handles columns like `TotalCharges` which have numeric values with a few blank strings).
    - Otherwise: numeric dtype -> numerical, object dtype -> categorical.
 
 4. **Large dataset optimization**: If the DataFrame exceeds 100K rows, per-column stats (nunique, value_counts) are computed on a 100K-row random sample.
@@ -157,7 +157,7 @@ This `feature_types` dict is the **single source of truth** for the entire pipel
 
 ### 3.4 Data Profiling
 
-#### `profile_data(df, feature_types, label) -> DataFrame`
+#### `profile_data(df, feature_types, label) -> DataFrame` — `profiler.py:320`
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -174,22 +174,22 @@ Produces a summary of each column's characteristics. Used primarily for logging 
 
 ### 4.1 Decision Sample
 
-For datasets larger than 100K rows, many operations (drift detection, feature selection, weight tournament) don't benefit from using all rows — statistical tests converge well before 100K. The pipeline creates a **single decision sample** that's reused across these operations.
+For datasets larger than 100K rows, many operations (drift detection, feature selection, weight tournament) don't benefit from using all rows — statistical tests converge well before 100K. The pipeline creates a **single decision sample** that's reused across these operations (`main.py:285-303`).
 
 **Logic:**
-1. Parse the temporal column (if any) to get month-period labels for stratified sampling.
-2. If `len(train) > 100,000`: create `_decision_idx` using `stratified_subsample_idx()` (100K rows, preserving month distribution).
-3. Create `train_decision = train.iloc[_decision_idx]` for drift detection.
+1. Parse the temporal column (if any) via `_parse_month_labels()` (`utils.py:26`) to get month-period labels for stratified sampling.
+2. If `len(train) > 100,000`: create `_decision_idx` using `stratified_subsample_idx()` (`utils.py:39`) — 100K rows, preserving month distribution.
+3. Create `train_decision = train.iloc[_decision_idx]` for drift detection (`main.py:303`).
 
 **Rationale:** Using the same 100K sample across all "decision" operations (drift detection, feature importance, tournament) ensures consistency. Stratified sampling preserves the temporal distribution, which matters because drift is temporal.
 
 ### 4.2 Pipeline Cap
 
-For extremely large datasets, the full pipeline (mitigation, feature engineering, model training) must complete within 10 minutes.
+For extremely large datasets, the full pipeline (mitigation, feature engineering, model training) must complete within 10 minutes (`main.py:306-342`).
 
 **Logic:**
-1. Compute `_max_pipeline_rows = 480 / (5.75e-7 * n_cols)`. This formula is calibrated from benchmarks: at 2M rows x 200 cols, the pipeline takes ~230s.
-2. If `len(train) > _max_pipeline_rows`: subsample train using stratified temporal sampling, then **recompute** `_month_vals`, `_decision_idx`, and `train_decision` on the capped data (the pre-cap indices are now invalid).
+1. Compute `_max_pipeline_rows = 480 / (5.75e-7 * n_cols)` (`main.py:308-311`). This formula is calibrated from benchmarks: at 2M rows x 200 cols, the pipeline takes ~230s.
+2. If `len(train) > _max_pipeline_rows`: subsample train using stratified temporal sampling (`main.py:316-320`), then **recompute** `_month_vals`, `_decision_idx`, and `train_decision` on the capped data (`main.py:323-336`) — the pre-cap indices are now invalid.
 
 **Example scaling:**
 | Dataset | Max Rows | Cap Needed? |
@@ -206,7 +206,7 @@ Drift detection identifies features whose distributions differ between train and
 
 ### 5.1 Train vs Test Drift
 
-#### `run_drift_analysis(train, test, feature_types) -> drift_df`
+#### `run_drift_analysis(train, test, feature_types) -> drift_df` — `drift_detector.py:464`
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -219,13 +219,13 @@ Drift detection identifies features whose distributions differ between train and
 1. Builds a task list of `(column, type)` pairs from feature_types.
 2. For each feature, calls `detect_numerical_drift()` or `detect_categorical_drift()`.
 3. Generates a natural-language drift description via `generate_drift_description()`.
-4. For >20 features, parallelizes via `joblib.Parallel` with threading.
-5. Applies **Benjamini-Hochberg FDR correction** across all p-values, then re-classifies severity using corrected p-values.
-6. Sorts output by severity (high first).
+4. For >20 features, parallelizes via `joblib.Parallel` with threading (`drift_detector.py:490-494`).
+5. Applies **Benjamini-Hochberg FDR correction** via `_apply_bh_correction()` (`drift_detector.py:392`) across all p-values, then re-classifies severity using corrected p-values.
+6. Sorts output by severity (high first) (`drift_detector.py:511`).
 
 ### 5.2 Numerical Drift Detection
 
-#### `detect_numerical_drift(train_col, test_col) -> dict`
+#### `detect_numerical_drift(train_col, test_col) -> dict` — `drift_detector.py:107`
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -238,23 +238,23 @@ Drift detection identifies features whose distributions differ between train and
 | Test | What It Catches | How |
 |---|---|---|
 | **KS test** (Kolmogorov-Smirnov) | Any distributional difference | Maximum vertical distance between CDFs. P-value indicates significance. |
-| **PSI** (Population Stability Index) | Binned distribution changes | Divides range into quantile bins, compares bin proportions. PSI > 0.25 = significant shift. |
+| **PSI** (Population Stability Index) | Binned distribution changes | `compute_psi()` (`drift_detector.py:27`). Divides range into quantile bins, compares bin proportions. PSI > 0.25 = significant shift. |
 | **Wasserstein distance** | Mean/location shifts | "Earth mover's distance" — minimum work to transform one distribution into another. Normalized by train std for scale-invariance. |
 | **IQR ratio** | Spread changes | `test_IQR / train_IQR`. Ratio > 2 or < 0.5 = significant spread change. |
 | **Tail divergence** | Extreme value shifts | Max shift in 1st/99th percentiles, normalized by train std. Catches tail behavior changes missed by histogram-based PSI. |
 
-**Subsampling:** Both columns are subsampled to 50K rows before testing. Beyond this, additional rows add negligible statistical power but cost O(n log n) compute.
+**Subsampling:** Both columns are subsampled to 50K rows via `_subsample_array()` (`drift_detector.py:11`) before testing. The cap is set by `_MAX_DRIFT_SAMPLE` (`drift_detector.py:8`). Beyond this, additional rows add negligible statistical power but cost O(n log n) compute.
 
-**Severity classification** (`_numerical_severity()`):
+**Severity classification** (`_numerical_severity()`, `drift_detector.py:257`):
 - **High**: PSI >= 0.25, or (PSI >= 0.15 and KS p < 0.001), or (Wasserstein_norm >= 1.0 and PSI >= 0.1), or (IQR ratio > 2x and PSI >= 0.1), or (tail_div > 2 and PSI >= 0.05).
 - **Moderate**: PSI >= 0.1, or (KS p < 0.05 and KS_D >= 0.05), or (tail_div > 1 and PSI >= 0.03).
 - **Low**: Everything else.
 
-**Small-sample correction:** A `ss_factor` widens PSI thresholds when samples are small (harmonic mean < 5000), preventing false positives from noisy histogram estimates.
+**Small-sample correction** (`_small_sample_factor()`, `drift_detector.py:244`)**:** A `ss_factor` widens PSI thresholds when samples are small (harmonic mean < 5000), preventing false positives from noisy histogram estimates.
 
 ### 5.3 Categorical Drift Detection
 
-#### `detect_categorical_drift(train_col, test_col) -> dict`
+#### `detect_categorical_drift(train_col, test_col) -> dict` — `drift_detector.py:168`
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -267,17 +267,17 @@ Drift detection identifies features whose distributions differ between train and
 | Test | What It Catches | How |
 |---|---|---|
 | **Chi-squared test** | Any categorical distribution change | Contingency table test. For high-cardinality (>50 categories), groups rare categories into `_other` to avoid sparse-table inflation. |
-| **JSD** (Jensen-Shannon Divergence) | Symmetric distributional divergence | Average of KL divergences in both directions. Range [0, ln(2)]. More robust than chi-squared for unbalanced categories. |
-| **Cramer's V** | Sample-size-normalized effect size | `sqrt(chi2 / (n * (k-1)))`. Unlike chi2 p-value, V is independent of sample size — a p < 0.001 on 100K rows might still be a tiny effect. |
+| **JSD** (Jensen-Shannon Divergence) | Symmetric distributional divergence | `compute_jsd()` (`drift_detector.py:61`). Average of KL divergences in both directions. Range [0, ln(2)]. More robust than chi-squared for unbalanced categories. |
+| **Cramer's V** | Sample-size-normalized effect size | `compute_cramers_v()` (`drift_detector.py:50`). `sqrt(chi2 / (n * (k-1)))`. Unlike chi2 p-value, V is independent of sample size — a p < 0.001 on 100K rows might still be a tiny effect. |
 
-**Severity classification** (`_categorical_severity()`):
+**Severity classification** (`_categorical_severity()`, `drift_detector.py:291`):
 - **High**: JSD >= 0.1, or (Cramer's V >= 0.3 and JSD >= 0.05).
 - **Moderate**: JSD >= 0.05, or chi2 p < 0.001, or Cramer's V >= 0.15.
 - **Low**: Everything else.
 
 ### 5.4 Drift Description Generation
 
-#### `generate_drift_description(train_col, test_col, feature_type, drift_metrics) -> str`
+#### `generate_drift_description(train_col, test_col, feature_type, drift_metrics) -> str` — `drift_detector.py:309`
 
 Produces a human-readable characterization of the drift, e.g.:
 
@@ -296,20 +296,20 @@ For categorical/temporal features, it checks:
 
 ### 5.5 Benjamini-Hochberg FDR Correction
 
-#### `_apply_bh_correction(drift_df, ss_factor) -> drift_df`
+#### `_apply_bh_correction(drift_df, ss_factor) -> drift_df` — `drift_detector.py:392`
 
 When testing 40+ features simultaneously, some will appear significant by chance. The BH procedure controls the **false discovery rate** — the expected proportion of false positives among declared significant results.
 
 **Logic:**
 1. Collects all p-values (KS for numerical, chi2 for categorical).
-2. Sorts p-values and applies the BH formula: `adjusted_p = raw_p * n / rank`.
+2. Sorts p-values and applies the BH formula via `_bh_correct()` (`drift_detector.py:70`): `adjusted_p = raw_p * n / rank`.
 3. Stores corrected p-values in `ks_pval_bh` / `chi2_pval_bh` columns.
 4. Re-classifies severity using corrected p-values (with the same `ss_factor` for consistency).
-5. Re-applies missingness escalation (so missingness drift isn't lost when severity is overwritten).
+5. Re-applies missingness escalation via `_missingness_severity()` (`drift_detector.py:86`) and `_escalate_severity()` (`drift_detector.py:100`) — so missingness drift isn't lost when severity is overwritten.
 
 ### 5.6 Intra-Training Drift Detection
 
-#### `detect_intra_training_drift(train, feature_types) -> (intra_drift_df, month_rank)`
+#### `detect_intra_training_drift(train, feature_types) -> (intra_drift_df, month_rank)` — `drift_detector.py:724`
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -322,13 +322,13 @@ When testing 40+ features simultaneously, some will appear significant by chance
 2. Sorts unique months chronologically, splits into early (first half) and late (second half).
 3. Runs the same drift detection between early and late halves — this reveals **temporal drift within the training data itself**.
 4. Returns only high/moderate-drift features.
-5. Builds `month_rank`: a Series mapping each row to its month's ordinal rank (0 = earliest month, N-1 = latest month). This is used by `compute_recency_weights()` in Stage 6.
+5. Builds `month_rank` (`drift_detector.py:818-820`): a Series mapping each row to its month's ordinal rank (0 = earliest month, N-1 = latest month). This is used by `compute_recency_weights()` in Stage 6.
 
 **Rationale:** If a feature is shifting within training data, it's likely to shift further in the test data (which is from a later time period). The `month_rank` enables recency weighting — giving more importance to recent training rows that are more representative of test conditions.
 
 ### 5.7 Multivariate Shift Detection
 
-#### `detect_multivariate_shift(train, test, feature_types, extra_drop_cols, n_splits) -> dict`
+#### `detect_multivariate_shift(train, test, feature_types, extra_drop_cols, n_splits) -> dict` — `drift_detector.py:516`
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -342,14 +342,14 @@ When testing 40+ features simultaneously, some will appear significant by chance
 This is a **domain classifier** approach. Instead of testing each feature independently, it asks: "Can a model tell whether a row came from train or test?"
 
 **Logic:**
-1. Prepares features: drops id/target/extra_drop, caps at 100 features (top by variance), encodes categoricals as integers, fills NaN with median.
+1. Prepares features: drops id/target/extra_drop (`drift_detector.py:535-538`), caps at 100 features by variance (`drift_detector.py:544-553`), encodes categoricals as integers (`drift_detector.py:570-576`), fills NaN with median (`drift_detector.py:577-586`).
 2. Concatenates train and test, labels train as 0 and test as 1.
-3. Trains a lightweight LightGBM (50 trees) with **stratified 3-fold CV**.
+3. Trains a lightweight LightGBM (50 trees, `drift_detector.py:608-615`) with **stratified 3-fold CV** (`drift_detector.py:602`).
 4. Computes **out-of-fold AUC** (area under ROC curve for domain classification).
    - AUC ~ 0.5 = no shift (model can't distinguish train from test).
    - AUC ~ 1.0 = extreme shift (train and test are trivially separable).
    - AUC > 0.65 = shift detected.
-5. **Extracts per-training-row P(test)**: the probability that each training row "looks like" a test row. If train was subsampled for the domain classifier, the last fold's classifier scores the full training set (using saved encoding mappings).
+5. **Extracts per-training-row P(test)** (`drift_detector.py:636-650`): the probability that each training row "looks like" a test row. If train was subsampled for the domain classifier, the last fold's classifier scores the full training set (using saved encoding mappings from `_cat_maps` and `_fill_vals`, `drift_detector.py:568-569`).
 6. Logs top-5 features driving the shift (by feature importance gain).
 
 **Rationale:** Univariate tests can miss drift that only appears in feature interactions. The domain classifier captures **multivariate covariate shift**. The per-row P(test) probabilities become sample weights in Stage 6 — training rows that resemble test data are upweighted.
@@ -360,7 +360,7 @@ This is a **domain classifier** approach. Instead of testing each feature indepe
 
 ### 6.1 Orchestrator
 
-#### `apply_all_mitigations(train, test, drift_df, feature_types) -> (train_m, test_m, drop_cols, mitigation_log, norm_log, shift_info)`
+#### `apply_all_mitigations(train, test, drift_df, feature_types) -> (train_m, test_m, drop_cols, mitigation_log, norm_log, shift_info)` — `mitigation.py:561`
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -388,41 +388,41 @@ This is a **domain classifier** approach. Instead of testing each feature indepe
 
 ### 6.2 Data Quality Normalization (Stage 3a)
 
-#### `normalize_data_quality(train, test, feature_types) -> (train_clean, test_clean, norm_log)`
+#### `normalize_data_quality(train, test, feature_types) -> (train_clean, test_clean, norm_log)` — `mitigation.py:113`
 
 This stage fixes surface-level data quality issues that masquerade as drift.
 
 **Three normalization steps:**
 
-1. **Abbreviation detection** (`detect_abbreviation_mappings()`):
+1. **Abbreviation detection** (`detect_abbreviation_mappings()`, `mitigation.py:72`):
    - Scans each categorical column for 2-3 character uppercase strings (e.g., "LA", "NYC", "SD").
    - Matches abbreviations to multi-word values whose word initials match (e.g., "LA" -> "Los Angeles").
    - Applies mapping to both train and test.
    - *Why this matters:* If train has "Los Angeles" but test has "LA", the model would treat them as different categories, losing signal.
 
-2. **Conditional lowercase + hyphen removal**:
-   - For each categorical column, computes JSD **before** and **after** lowercasing + hyphen removal.
-   - Only applies if normalization reduces or maintains JSD (i.e., doesn't increase drift).
+2. **Conditional lowercase + hyphen removal** (`mitigation.py:144-183`):
+   - For each categorical column, computes JSD **before** and **after** lowercasing + hyphen removal (`mitigation.py:167-174`).
+   - Only applies if normalization reduces or maintains JSD (`mitigation.py:176`) — i.e., doesn't increase drift.
    - *Why conditional:* Some columns have meaningful case distinctions. Blindly lowercasing "Yes"/"No" -> "yes"/"no" wouldn't help. The JSD check ensures normalization only happens when it genuinely closes the gap.
    - *Example:* `Contract` has "Month-to-Month" in train vs "month-to-month" in test. Lowercasing + hyphen removal aligns them.
 
-3. **Fuzzy matching for unseen test categories**:
-   - For low-cardinality categoricals (<=200 train categories, <=50 unseen), uses `difflib.get_close_matches()` to map unseen test values to their closest train equivalent.
+3. **Fuzzy matching for unseen test categories** (`mitigation.py:190-227`):
+   - For low-cardinality categoricals (`_MAX_FUZZY_TRAIN_CATS=200`, `_MAX_FUZZY_UNSEEN=50`, `mitigation.py:194-195`), uses `difflib.get_close_matches()` to map unseen test values to their closest train equivalent (`mitigation.py:217-219`).
    - Two-pass: strict cutoff (0.6) then relaxed (0.45).
-   - High-cardinality columns are skipped (fuzzy matching is O(unseen x train_cats) and only useful for typo-like mismatches).
+   - High-cardinality columns are skipped (`mitigation.py:210-211`) — fuzzy matching is O(unseen x train_cats) and only useful for typo-like mismatches.
 
 ### 6.3 Drift Re-check (Stage 3b)
 
-After normalization, drift is rechecked only for modified columns (not all 500). This is an efficiency optimization — why re-test 480 unchanged columns?
+After normalization, drift is rechecked only for modified columns (not all 500). This is an efficiency optimization — why re-test 480 unchanged columns? (`mitigation.py:583-611`)
 
 **Logic:**
-1. For each column in `norm_log`, re-runs `_analyze_single_feature()`.
-2. Updates the `drift_df_norm` DataFrame in place.
-3. Re-applies BH correction and re-sorts by severity.
+1. For each column in `norm_log`, re-runs `_analyze_single_feature()` (`drift_detector.py:451`).
+2. Updates the `drift_df_norm` DataFrame in place (`mitigation.py:599-604`).
+3. Re-applies BH correction and re-sorts by severity (`mitigation.py:606-610`).
 
 ### 6.4 Progressive Mitigation — High Drift (Stage 3c)
 
-#### `mitigate_feature_progressive(train, test, col, feature_type, original_severity) -> (train, test, log_entry)`
+#### `mitigate_feature_progressive(train, test, col, feature_type, original_severity) -> (train, test, log_entry)` — `mitigation.py:435`
 
 For each high-drift feature, tries a sequence of increasingly aggressive strategies. The first strategy that reduces severity below "high" wins. If all fail, the feature is dropped.
 
@@ -439,7 +439,7 @@ For each high-drift feature, tries a sequence of increasingly aggressive strateg
 5. Discretization (quantile binning using train edges)
 6. Rank transform (percentile rank based on train CDF)
 
-Each strategy is first evaluated on a 50K subsample. If it reduces severity, it's applied to full data. This subsample-then-apply pattern saves computation when strategies fail.
+Each strategy is first evaluated on a 50K subsample via `_eval_subsample()` (`mitigation.py:8`). If it reduces severity, it's applied to full data (`mitigation.py:494-500`). This subsample-then-apply pattern saves computation when strategies fail.
 
 **Categorical features:**
 1. Group rare categories (below 1% frequency -> `_other`)
@@ -464,28 +464,29 @@ Same approach but with a softer goal: reduce severity to "low" if possible, othe
 
 The best-improving strategy is applied even if severity stays "moderate" — partial improvement still helps the model.
 
-**Cap at 50:** For datasets with hundreds of features, only the top-50 most-drifted moderate features are processed (sorted by PSI/JSD). This prevents the mitigation stage from dominating runtime.
+**Cap at 50** (`_MAX_MODERATE`, `mitigation.py:654`)**:** For datasets with hundreds of features, only the top-50 most-drifted moderate features are processed (sorted by PSI/JSD, `mitigation.py:655-658`). This prevents the mitigation stage from dominating runtime.
 
 ### 6.6 Mitigation Strategy Reference
 
-| Strategy | Function | Input | Output | Rationale |
-|---|---|---|---|---|
-| Median align | `median_align()` | num, num | num, num | Shifts test median to match train median. Simple location correction. |
-| Clip outliers | `clip_outliers()` | num, num | num, num | Clips both to train's [1st, 99th] percentiles. Tames extreme values. |
-| Log transform | `log_transform()` | num, num | num, num | log1p, compresses right-skewed distributions. Only works for non-negative data. |
-| Robust scaling | `robust_scale()` | num, num | num, num | (x - median) / IQR using train stats. Robust to outliers unlike z-score. |
-| Quantile binning | `quantile_bin()` | num, num | int, int | Discretizes into bins defined by train quantile edges. Eliminates continuous drift. |
-| Quantile matching | `quantile_match()` | num, num | num, num | CDF-to-CDF mapping. Each test value -> its percentile rank in test -> mapped to corresponding train quantile. Preserves test rank order, aligns distributions. |
-| Rank transform | `rank_transform()` | num, num | float, float | Converts to percentile rank (0-1) based on train CDF. Distribution-agnostic. |
-| Group rare cats | `group_rare_categories()` | cat, cat | cat, cat | Categories <1% frequency in train -> `_other`. Also maps unseen test categories to `_other`. |
-| Frequency encode | `frequency_encode_mitigation()` | cat, cat | float, float | Replace category with train-set frequency (0-1). Converts categorical -> numerical. |
-| Cyclical encode | `encode_temporal_cyclical()` | temporal, temporal | sin+cos, sin+cos | Parse month -> sin(2pi*m/12), cos(2pi*m/12). Captures seasonality without ordinal bias. |
+| Strategy | Function | Location | Input | Output | Rationale |
+|---|---|---|---|---|---|
+| Median align | `median_align()` | `mitigation.py:234` | num, num | num, num | Shifts test median to match train median. Simple location correction. |
+| Clip outliers | `clip_outliers()` | `mitigation.py:250` | num, num | num, num | Clips both to train's [1st, 99th] percentiles. Tames extreme values. |
+| Log transform | `log_transform()` | `mitigation.py:259` | num, num | num, num | log1p, compresses right-skewed distributions. Only works for non-negative data. |
+| Robust scaling | `robust_scale()` | `mitigation.py:345` | num, num | num, num | (x - median) / IQR using train stats. Robust to outliers unlike z-score. |
+| Quantile binning | `quantile_bin()` | `mitigation.py:268` | num, num | int, int | Discretizes into bins defined by train quantile edges. Eliminates continuous drift. |
+| Quantile matching | `quantile_match()` | `mitigation.py:376` | num, num | num, num | CDF-to-CDF mapping. Each test value -> its percentile rank in test -> mapped to corresponding train quantile. Preserves test rank order, aligns distributions. |
+| Rank transform | `rank_transform()` | `mitigation.py:413` | num, num | float, float | Converts to percentile rank (0-1) based on train CDF. Distribution-agnostic. |
+| Clip+Log | `_clip_then_log()` | `mitigation.py:363` | num, num | num, num | Clip outliers first, shift to non-negative, then log1p. Combines both strategies. |
+| Group rare cats | `group_rare_categories()` | `mitigation.py:284` | cat, cat | cat, cat | Categories <1% frequency in train -> `_other`. Also maps unseen test categories to `_other`. |
+| Frequency encode | `frequency_encode_mitigation()` | `mitigation.py:329` | cat, cat | float, float | Replace category with train-set frequency (0-1). Converts categorical -> numerical. |
+| Cyclical encode | `encode_temporal_cyclical()` | `mitigation.py:298` | temporal, temporal | sin+cos, sin+cos | Parse month -> sin(2pi*m/12), cos(2pi*m/12). Captures seasonality without ordinal bias. |
 
 ### 6.7 Sample Weight Functions
 
 These don't modify the data — they produce per-row weights used in Stage 6.
 
-#### `compute_domain_weights(train_oof_proba, power) -> ndarray`
+#### `compute_domain_weights(train_oof_proba, power) -> ndarray` — `mitigation.py:19`
 
 Converts domain classifier P(test) into sample weights. Training rows that look more like test data get higher weight.
 
@@ -495,7 +496,7 @@ Converts domain classifier P(test) into sample weights. Training rows that look 
 3. Cap extreme values at 99th percentile.
 4. Normalize to mean=1.0 (so total effective sample size is preserved).
 
-#### `compute_recency_weights(month_rank, decay) -> ndarray`
+#### `compute_recency_weights(month_rank, decay) -> ndarray` — `mitigation.py:48`
 
 Exponential decay weighting by temporal recency. Recent months get weight ~1.0; older months decay.
 
@@ -507,7 +508,7 @@ Exponential decay weighting by temporal recency. Recent months get weight ~1.0; 
 
 ## 7. Stage 4: Feature Engineering (feature_engineer.py)
 
-#### `engineer_features(train, test, feature_types, drop_cols) -> (train_enriched, test_enriched, new_feature_names)`
+#### `engineer_features(train, test, feature_types, drop_cols) -> (train_enriched, test_enriched, new_feature_names)` — `feature_engineer.py:6`
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -517,27 +518,27 @@ Exponential decay weighting by temporal recency. Recent months get weight ~1.0; 
 | `drop_cols` | `list[str]` | Columns marked for dropping |
 | **Returns** | `tuple[DataFrame, DataFrame, list[str]]` | Enriched DataFrames + list of new feature names |
 
-All feature engineering is **dynamic** — no hardcoded column names. Features are derived from the `feature_types` dict and statistical properties of the data.
+All feature engineering is **dynamic** — no hardcoded column names. Features are derived from the `feature_types` dict and statistical properties of the data. A name collision guard (`existing_cols`, `feature_engineer.py:29`) prevents duplicate feature names across all stages.
 
-### 7.1 Missing Value Indicators
+### 7.1 Missing Value Indicators (`feature_engineer.py:32-50`)
 
 For columns with >1% null rate, adds a binary `{col}_is_null` feature. This lets the model learn from missingness patterns — e.g., if `TotalCharges` is null for new customers with 0 tenure, that pattern is predictive.
 
-### 7.2 Frequency Encoding
+### 7.2 Frequency Encoding (`feature_engineer.py:52-73`)
 
 For high-cardinality categoricals (>10 unique values), adds `{col}_freq` — the training-set frequency of each category value. This provides a numerical representation that captures category popularity without the dimensionality explosion of one-hot encoding.
 
 Low-cardinality categoricals (<= 10 unique) are handled later by target encoding in Stage 5.
 
-### 7.3 Ratio Features
+### 7.3 Ratio Features (`feature_engineer.py:75-119`)
 
 Finds the top-5 most correlated numerical pairs (|r| > 0.3) and creates `{col_a}_div_{col_b}` = a / (b + 1). The +1 prevents division by zero.
 
-**Correlation cap:** For datasets with >50 numerical features, only the top-50 by variance are used for the correlation matrix (avoiding O(m^2) computation on 500 features).
+**Correlation cap** (`_MAX_CORR_COLS=50`, `feature_engineer.py:81`)**:** For datasets with >50 numerical features, only the top-50 by variance are used for the correlation matrix (avoiding O(m^2) computation on 500 features).
 
 **Rationale:** Ratio features capture relationships that tree models can technically learn but require many splits to approximate. `TotalCharges / TotalRevenue` is a single feature expressing relative spending efficiency.
 
-### 7.4 Aggregation Features
+### 7.4 Aggregation Features (`feature_engineer.py:121-147`)
 
 Groups `mean(numerical)` by `categorical`, creating features like `MonthlyCharge_mean_by_Contract`.
 
@@ -546,15 +547,15 @@ Groups `mean(numerical)` by `categorical`, creating features like `MonthlyCharge
 
 **Rationale:** Aggregation features encode group-level patterns. If customers on "Month-to-Month" contracts have higher average MonthlyCharge, this feature makes that pattern directly accessible to the model.
 
-### 7.5 Near-Duplicate Removal
+### 7.5 Near-Duplicate Removal (`feature_engineer.py:152-193`)
 
 After all features are added, computes the correlation matrix among all numerical features and drops one of any pair with |corr| > 0.98. When choosing which to drop, engineered features are preferred over originals (keep the raw signal, discard the derivative).
 
-**Column cap:** For >200 numerical features, only the top-200 by variance are checked (avoiding O(m^2) on 500+ columns).
+**Column cap** (`_MAX_DEDUP_COLS=200`, `feature_engineer.py:157`)**:** For >200 numerical features, only the top-200 by variance are checked (avoiding O(m^2) on 500+ columns).
 
-### 7.6 Post-Engineering Drift Check (in main.py)
+### 7.6 Post-Engineering Drift Check (`main.py:363-375`)
 
-Back in `main.py`, each newly engineered feature is tested for drift. Any engineered feature with "high" drift is dropped — it would confuse the model more than help.
+Back in `main.py`, each newly engineered feature is tested for drift via `detect_numerical_drift()`. Any engineered feature with "high" drift is dropped — it would confuse the model more than help.
 
 ---
 
@@ -562,7 +563,7 @@ Back in `main.py`, each newly engineered feature is tested for drift. Any engine
 
 ### 8.1 Feature Preparation
 
-#### `prepare_features(train, test, feature_types, extra_drop_cols) -> (X_train, y_train, X_test, customer_ids)`
+#### `prepare_features(train, test, feature_types, extra_drop_cols) -> (X_train, y_train, X_test, customer_ids)` — `model.py:60`
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -578,9 +579,9 @@ Back in `main.py`, each newly engineered feature is tested for drift. Any engine
 
 **Processing steps:**
 
-1. **Extract customer IDs** from test (fallback to row indices if ID column missing).
+1. **Extract customer IDs** from test (`model.py:74-78`), fallback to row indices if ID column missing.
 
-2. **Encode target** via `_encode_target()`: Handles "Yes"/"No", 1/0, True/False, "1"/"0", etc. Falls back to minority-class-is-positive heuristic for unknown binary labels.
+2. **Encode target** via `_encode_target()` (`model.py:10`): Handles "Yes"/"No", 1/0, True/False, "1"/"0", etc. Falls back to minority-class-is-positive heuristic for unknown binary labels (`model.py:38-42`).
 
 3. **Column selection**: Only columns present in both train and test, minus id/target/drop_cols.
 
@@ -588,20 +589,20 @@ Back in `main.py`, each newly engineered feature is tested for drift. Any engine
 
 5. **Dtype alignment**: If train and test disagree on a column's dtype, both are coerced to numeric.
 
-6. **Temporal parsing**: Temporal columns are converted to month number (1-12) via `_parse_temporal_month()`.
+6. **Temporal parsing** (`model.py:113-116`): Temporal columns are converted to month number (1-12) via `_parse_temporal_month()` (`model.py:48`).
 
 7. **Categorical encoding** (split by cardinality):
 
-   **High-cardinality (>10 unique) -> LightGBM native categorical:**
-   - Integer label encoding + pandas `category` dtype.
+   **High-cardinality (>10 unique) -> LightGBM native categorical** (`model.py:131-157`)**:**
+   - Integer label encoding + pandas `category` dtype (`model.py:144-154`).
    - Unseen test categories get NaN (LightGBM handles missing values natively by learning the optimal split direction).
    - *Why native:* LightGBM's native categorical handling uses optimal histogram-based splits, which outperforms one-hot or target encoding for high-cardinality features.
 
-   **Low-cardinality (<=10 unique) -> Target encoding:**
-   - K-fold encoding to prevent leakage: for each fold, category means are computed from out-of-fold rows only. Validation rows never see their own labels in their encoding.
-   - **Bayesian smoothing**: `smoothed_mean = (count * raw_mean + m * global_mean) / (count + m)` with m=10. Categories with few samples shrink toward the global mean, preventing overfitting to small groups.
-   - **Large dataset optimization**: For >200K rows, uses a stratified 200K subsample for fold mean computation, but maps results onto all rows.
-   - **Single-class guard**: If y_train has only one class (edge case in hidden eval), all categories get the global mean.
+   **Low-cardinality (<=10 unique) -> Target encoding** (`model.py:178-231`)**:**
+   - K-fold encoding to prevent leakage (`model.py:220-226`): for each fold, category means are computed from out-of-fold rows only. Validation rows never see their own labels in their encoding.
+   - **Bayesian smoothing** (`model.py:128`, `model.py:197`): `smoothed_mean = (count * raw_mean + m * global_mean) / (count + m)` with m=10. Categories with few samples shrink toward the global mean, preventing overfitting to small groups.
+   - **Large dataset optimization** (`_MAX_TE_SAMPLE=200_000`, `model.py:160-176`): For >200K rows, uses a stratified 200K subsample for fold mean computation, but maps results onto all rows (`model.py:202-218`).
+   - **Single-class guard** (`model.py:123-126`, `model.py:183-186`): If y_train has only one class (edge case in hidden eval), all categories get the global mean.
 
    Test set uses the full-data smoothed means (not fold-specific).
 
@@ -623,32 +624,32 @@ Each row's encoding comes from data it was never part of, eliminating leakage.
 
 ## 9. Stage 6: Model Training & Weight Tournament (main.py + model.py)
 
-### 9.1 Baseline Model
+### 9.1 Baseline Model (`main.py:387-400`)
 
-A model trained on unmitigated data with uniform weights, using the raw `train` and `test` DataFrames. Subsampled to 50K rows for speed (it's only for comparison metrics). Saved as `prediction_baseline.csv` and `model_baseline.joblib`.
+A model trained on unmitigated data with uniform weights, using the raw `train` and `test` DataFrames. Subsampled to 50K rows (`_MAX_BASELINE_SAMPLE`, `main.py:388`) for speed (it's only for comparison metrics). Saved as `prediction_baseline.csv` and `model_baseline.joblib`.
 
-### 9.2 Feature Selection
+### 9.2 Feature Selection (`main.py:407-446`)
 
 Using the mitigated data:
-1. Train an initial model (on decision sample if data is large).
-2. **Drop zero-importance features**: Features that LightGBM never split on. These add noise without predictive value.
-3. **Add top-feature interactions**: Take the top-8 features by importance, create all pairwise products (`col_a * col_b`). This gives the model explicit access to interaction effects. For public data, this creates ~21 interaction terms.
+1. Train an initial model on decision sample if data is large (`main.py:412-417`).
+2. **Drop zero-importance features** (`main.py:422-428`): Features that LightGBM never split on. These add noise without predictive value.
+3. **Add top-feature interactions** (`main.py:430-444`): Take the top-8 features by importance (`main.py:433`), create all pairwise products (`col_a * col_b`, `main.py:436-442`). This gives the model explicit access to interaction effects. For public data, this creates ~21 interaction terms.
 
-### 9.3 Weight Tournament
+### 9.3 Weight Tournament (`main.py:448-603`)
 
-The weight tournament finds the optimal blend of domain weights (from the domain classifier) and recency weights (from month rank). It evaluates candidates by training a model with each weight configuration and measuring test AU-PRC (or train AU-PRC if test labels unavailable).
+The weight tournament finds the optimal blend of domain weights (from the domain classifier) and recency weights (from month rank). It evaluates candidates via `_eval_candidate()` (`main.py:484`) by training a model with each weight configuration and measuring test AU-PRC (or train AU-PRC if test labels unavailable).
 
 **Two weight families are optimized:**
 
-1. **Additive Blend**: `w = alpha * domain^power + (1-alpha) * recency(decay)`
+1. **Additive Blend** (`_build_blend()`, `main.py:508`): `w = alpha * domain^power + (1-alpha) * recency(decay)`
    - `alpha` controls the domain/recency mix
    - `power` dampens domain weights
    - `decay` controls recency steepness
 
-2. **Geometric Mean**: `w = domain^(alpha*power) * recency^(1-alpha)`
+2. **Geometric Mean** (`_build_geometric()`, `main.py:517`): `w = domain^(alpha*power) * recency^(1-alpha)`
    - Multiplicative combination — a row must score well on **both** dimensions to get high weight
 
-**Optimization:** Each family uses **Nelder-Mead** (simplex method) starting from `x0=[0.5, 0.7, 0.15]`, with at most 12 function evaluations. A parameter cache prevents duplicate model trains when the optimizer revisits rounded parameter values.
+**Optimization** (`_make_cached_objective()`, `main.py:539`)**:** Each family uses **Nelder-Mead** (simplex method) starting from `x0=[0.5, 0.7, 0.15]` (`main.py:567-568`), with at most 12 function evaluations. A parameter cache (`_eval_cache`, `main.py:530`) prevents duplicate model trains when the optimizer revisits rounded parameter values.
 
 **Tournament structure:**
 ```
@@ -663,13 +664,13 @@ The weight tournament finds the optimal blend of domain weights (from the domain
 - If only recency weights available (no domain shift): grid search over decay values [0.10, 0.20, 0.40].
 - If neither: Uniform weights (no tournament).
 
-**Subsampling:** For datasets >300K rows, the tournament uses a stratified 300K-row subsample for each model train. The final model (after the winner is selected) is trained on full data.
+**Subsampling** (`_TOURNEY_SAMPLE_SIZE=300_000`, `main.py:466`)**:** For datasets >300K rows, the tournament uses a stratified 300K-row subsample for each model train. The final model (after the winner is selected) is trained on full data.
 
-**Dummy test labels guard:** If test labels exist but have only 1 unique value (judges may provide dummy labels), `has_test_labels` is set to False and the tournament optimizes on train score instead.
+**Dummy test labels guard** (`main.py:457-462`)**:** If test labels exist but have only 1 unique value (judges may provide dummy labels), `has_test_labels` is set to False and the tournament optimizes on train score instead.
 
 ### 9.4 Model Training
 
-#### `train_model(X_train, y_train, sample_weight) -> LGBMClassifier`
+#### `train_model(X_train, y_train, sample_weight) -> LGBMClassifier` — `model.py:247`
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -686,7 +687,7 @@ Uses the fixed hyperparameters. The only knob is `sample_weight`, which is how a
 
 ### 10.1 Evaluation and Saving
 
-#### `evaluate_and_save(model, X_train, y_train, X_test, customer_ids, test, feature_types, tag) -> metrics`
+#### `evaluate_and_save(model, X_train, y_train, X_test, customer_ids, test, feature_types, tag) -> metrics` — `model.py:266`
 
 1. Computes train AU-PRC.
 2. Computes test AU-PRC (only if test has valid target labels with >= 2 unique values).
@@ -695,7 +696,7 @@ Uses the fixed hyperparameters. The only knob is `sample_weight`, which is how a
 
 ### 10.2 Final Output
 
-The mitigated model's outputs are copied to the final filenames:
+The mitigated model's outputs are copied to the final filenames (`main.py:613-614`):
 ```
 prediction_mitigated.csv -> prediction.csv
 model_mitigated.joblib -> model.joblib
@@ -705,30 +706,30 @@ model_mitigated.joblib -> model.joblib
 
 Four tables are printed after all computation completes:
 
-1. **Drift & Mitigation Table**: Shows each drifted feature, its type, a natural-language drift description, and the mitigation action taken.
-2. **Multivariate Shift Summary**: Domain classifier AUC, fold AUC std, shift detected yes/no, winning weight configuration.
-3. **Model Performance Summary**: Baseline vs Mitigated AU-PRC for train and test, with deltas.
-4. **Runtime Summary**: Per-stage timing breakdown.
+1. **Drift & Mitigation Table** (`print_drift_mitigation_summary()`, `main.py:20`): Shows each drifted feature, its type, a natural-language drift description, and the mitigation action taken.
+2. **Multivariate Shift Summary** (`print_multivariate_shift_summary()`, `main.py:147`): Domain classifier AUC, fold AUC std, shift detected yes/no, winning weight configuration.
+3. **Model Performance Summary** (`print_model_performance_summary()`, `model.py:309`): Baseline vs Mitigated AU-PRC for train and test, with deltas.
+4. **Runtime Summary** (`print_runtime_summary()`, `main.py:177`): Per-stage timing breakdown.
 
 ---
 
 ## 11. Shared Utilities (utils.py)
 
-### `safe_n_splits(n_samples, desired, min_per_fold) -> int`
+### `safe_n_splits(n_samples, desired, min_per_fold) -> int` — `utils.py:15`
 Returns a safe number of CV folds: `max(2, min(desired, n_samples // min_per_fold))`. Prevents errors when datasets are too small for the desired fold count.
 
-### `_parse_month_labels(series) -> Series | None`
-Parses a temporal series into month-period strings (e.g., "2025-01") for stratification. Tries 11 date formats. Returns None if parsing fails.
+### `_parse_month_labels(series) -> Series | None` — `utils.py:26`
+Parses a temporal series into month-period strings (e.g., "2025-01") for stratification. Tries 11 date formats (`_TEMPORAL_FORMATS`, `utils.py:20`). Returns None if parsing fails.
 
-### `stratified_subsample_idx(n_total, n_sample, month_values, seed) -> ndarray`
+### `stratified_subsample_idx(n_total, n_sample, month_values, seed) -> ndarray` — `utils.py:39`
 Returns indices for a month-stratified subsample that preserves the proportional distribution of months. Falls back to random sampling if no temporal information.
 
-**Algorithm:**
-1. Compute per-group allocation proportional to group size.
-2. Distribute fractional remainders to groups with largest fractional parts.
-3. Sample within each group.
+**Algorithm** (`utils.py:71-109`):
+1. Compute per-group allocation proportional to group size (`utils.py:83-89`).
+2. Distribute fractional remainders to groups with largest fractional parts (`utils.py:92-100`).
+3. Sample within each group (`utils.py:103-109`).
 
-### `Timer`
+### `Timer` — `utils.py:114`
 Context manager that records elapsed wall-clock time. Used to instrument each pipeline stage.
 
 ---
