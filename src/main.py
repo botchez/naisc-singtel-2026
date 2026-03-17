@@ -10,7 +10,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import pandas as pd
 from profiler import load_data, detect_feature_types, profile_data, align_train_test_columns
-from drift_detector import run_drift_analysis, detect_intra_training_drift, detect_label_shift
+from drift_detector import run_drift_analysis, detect_intra_training_drift
 from model import prepare_features, train_model, evaluate_and_save, print_model_performance_summary
 from mitigation import apply_all_mitigations, compute_domain_weights, compute_recency_weights
 from feature_engineer import engineer_features
@@ -312,13 +312,30 @@ def main():
     _max_pipeline_rows = max(_max_pipeline_rows, _DECISION_SAMPLE_SIZE)  # never below decision sample
 
     if len(train) > _max_pipeline_rows:
+        _original_train_len = len(train)
         _pipeline_idx = stratified_subsample_idx(
             len(train), _max_pipeline_rows,
             month_values=_month_vals, seed=42,
         )
         train = train.iloc[_pipeline_idx].reset_index(drop=True)
+        # Recompute month values and decision index on the capped train
+        # (original _decision_idx pointed into pre-cap rows, now invalid)
+        _month_vals = None
+        for tc in feature_types.get("temporal", []):
+            if tc in train.columns:
+                _month_vals = _parse_month_labels(train[tc])
+                if _month_vals is not None:
+                    break
+        if len(train) > _DECISION_SAMPLE_SIZE:
+            _decision_idx = stratified_subsample_idx(
+                len(train), _DECISION_SAMPLE_SIZE,
+                month_values=_month_vals, seed=42,
+            )
+        else:
+            _decision_idx = None
+        train_decision = train.iloc[_decision_idx].reset_index(drop=True) if _decision_idx is not None else train
         logger.info(
-            f"Pipeline cap: {_max_pipeline_rows:,}/{len(train) + (len(train) - _max_pipeline_rows):,} rows "
+            f"Pipeline cap: {_max_pipeline_rows:,}/{_original_train_len:,} rows "
             f"(dynamic, targeting <{_RUNTIME_BUDGET_S}s for {n_cols} cols)"
         )
     else:
@@ -329,7 +346,6 @@ def main():
         # Use decision sample for drift analysis — statistical tests converge at 100K
         test_drift = test.sample(n=min(_DECISION_SAMPLE_SIZE, len(test)), random_state=42) if len(test) > _DECISION_SAMPLE_SIZE else test
         drift_df = run_drift_analysis(train_decision, test_drift, feature_types)
-        label_shift_info = detect_label_shift(train_decision, test_drift, feature_types)
         # Keep full train for month_rank (used for recency weighting across all rows)
         intra_drift_df, month_rank = detect_intra_training_drift(train, feature_types)
 

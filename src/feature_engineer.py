@@ -26,6 +26,7 @@ def engineer_features(
     if drop_cols:
         skip_cols.update(drop_cols)
     new_features = []
+    existing_cols = set(train.columns) | set(test.columns)  # guard against name collisions
 
     # 1. Missing value indicators
     _null_train_parts = {}
@@ -36,9 +37,12 @@ def engineer_features(
         null_pct = train[col].isna().mean()
         if null_pct > 0.01 and col in test.columns:
             fname = f"{col}_is_null"
+            if fname in existing_cols:
+                continue
             _null_train_parts[fname] = train[col].isna().astype(int)
             _null_test_parts[fname] = test[col].isna().astype(int)
             new_features.append(fname)
+            existing_cols.add(fname)
 
     if _null_train_parts:
         train = pd.concat([train, pd.DataFrame(_null_train_parts, index=train.index)], axis=1)
@@ -56,9 +60,12 @@ def engineer_features(
         if n_unique > 10:
             freq_map = train[col].value_counts(normalize=True).to_dict()
             fname = f"{col}_freq"
+            if fname in existing_cols:
+                continue
             _freq_train_parts[fname] = train[col].map(freq_map).fillna(0.0)
             _freq_test_parts[fname] = test[col].map(freq_map).fillna(0.0)
             freq_features.append(fname)
+            existing_cols.add(fname)
 
     if _freq_train_parts:
         train = pd.concat([train, pd.DataFrame(_freq_train_parts, index=train.index)], axis=1)
@@ -95,6 +102,8 @@ def engineer_features(
         _ratio_test_parts = {}
         for col_a, col_b, _ in pairs[:5]:
             fname = f"{col_a}_div_{col_b}"
+            if fname in existing_cols:
+                continue
             a_train = pd.to_numeric(train[col_a], errors="coerce").fillna(0)
             b_train = pd.to_numeric(train[col_b], errors="coerce").fillna(0)
             a_test = pd.to_numeric(test[col_a], errors="coerce").fillna(0)
@@ -102,6 +111,7 @@ def engineer_features(
             _ratio_train_parts[fname] = a_train / (b_train + 1)
             _ratio_test_parts[fname] = a_test / (b_test + 1)
             ratio_features.append(fname)
+            existing_cols.add(fname)
 
         if _ratio_train_parts:
             train = pd.concat([train, pd.DataFrame(_ratio_train_parts, index=train.index)], axis=1)
@@ -119,6 +129,8 @@ def engineer_features(
         for cat_col in agg_cat_cols[:3]:  # top 3 categoricals by cardinality
             for num_col in agg_num_cols[:5]:  # top 5 numerical
                 fname = f"{num_col}_mean_by_{cat_col}"
+                if fname in existing_cols:
+                    continue
                 num_train = pd.to_numeric(train[num_col], errors="coerce")
                 group_means = num_train.groupby(train[cat_col]).transform("mean")
                 _agg_train_parts[fname] = group_means.fillna(num_train.mean())
@@ -127,6 +139,7 @@ def engineer_features(
                 train_group_map = num_train.groupby(train[cat_col]).mean().to_dict()
                 _agg_test_parts[fname] = test[cat_col].map(train_group_map).fillna(num_train.mean())
                 agg_features.append(fname)
+                existing_cols.add(fname)
 
     if _agg_train_parts:
         train = pd.concat([train, pd.DataFrame(_agg_train_parts, index=train.index)], axis=1)
