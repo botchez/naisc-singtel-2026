@@ -588,6 +588,12 @@ def detect_multivariate_shift(
     X_all = pd.concat([X_tr, X_te], ignore_index=True)
     y_domain = np.array([0] * len(X_tr) + [1] * len(X_te))
 
+    # Guard: need both classes for stratified CV
+    if len(X_tr) == 0 or len(X_te) == 0:
+        from utils import logger as _logger
+        _logger.warning("Domain classifier skipped: empty train or test set")
+        return {"auc": 0.5, "fold_aucs": [], "shift_detected": False, "train_oof_proba": None}
+
     # Adapt fold count for small datasets
     from utils import safe_n_splits
     n_splits = safe_n_splits(len(X_all), desired=n_splits, min_per_fold=20)

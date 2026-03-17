@@ -120,7 +120,10 @@ def prepare_features(
     cat_cols = [c for c in feature_cols if X_train[c].dtype == object]
     global_mean = y_train.mean()
     from utils import safe_n_splits
-    kf = StratifiedKFold(n_splits=safe_n_splits(len(X_train)), shuffle=True, random_state=42)
+    _single_class = y_train.nunique() < 2
+    if _single_class:
+        logger.warning("Single-class target detected — using global mean for all target encoding")
+    kf = StratifiedKFold(n_splits=safe_n_splits(len(X_train)), shuffle=True, random_state=42) if not _single_class else None
 
     smoothing_m = 10  # Bayesian smoothing: shrink low-count category means toward global mean
 
@@ -175,6 +178,12 @@ def prepare_features(
     for col in te_cat_cols:
         raw_train = X_train[col].astype(str)
         raw_test = X_test[col].astype(str)
+
+        # Single-class target: skip k-fold, use global mean for all categories
+        if _single_class:
+            X_train[col] = global_mean
+            X_test[col] = global_mean
+            continue
 
         # Smoothed means (computed on sample if large, full data otherwise)
         if _te_use_sample:
