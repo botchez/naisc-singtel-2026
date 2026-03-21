@@ -523,11 +523,54 @@ def main():
             combined = dw ** alpha * rw ** (1 - alpha)
             return combined / combined.mean()
 
+        # ── Sliding window evaluation helper ──
+        best_window_mask = None  # will be set if a sliding window candidate wins
+
+        def _eval_sliding_window(label, mask):
+            """Train on filtered rows (sliding window), return tournament-compatible tuple.
+
+            The mask is a boolean array aligned with X_train_m's index.
+            Returned weights slot stores the string 'window:<label>' as a sentinel
+            so the final training block knows to filter instead of weight.
+            """
+            X_win = X_train_m.loc[mask]
+            y_win = y_train_m.loc[mask]
+            if _tourney_idx is not None:
+                # Intersect tourney subsample with window
+                valid = mask.loc[X_train_m.index[_tourney_idx]]
+                t_idx = _tourney_idx[valid.values]
+                if len(t_idx) < 100:
+                    logger.info(f"  {label} -> skipped (too few rows in subsample)")
+                    return None
+                X_sub = X_train_m.iloc[t_idx]
+                y_sub = y_train_m.iloc[t_idx]
+            else:
+                X_sub, y_sub = X_win, y_win
+            if len(X_sub) < 100:
+                logger.info(f"  {label} -> skipped (too few rows)")
+                return None
+            m = train_model(X_sub, y_sub)
+            train_proba = m.predict_proba(X_sub)[:, 1]
+            train_sc = average_precision_score(y_sub, train_proba)
+            if has_test_labels:
+                if _test_tourney_idx is not None:
+                    X_test_sub = X_test_m.iloc[_test_tourney_idx]
+                    y_test_sub = y_test_m.iloc[_test_tourney_idx]
+                else:
+                    X_test_sub, y_test_sub = X_test_m, y_test_m
+                test_proba = m.predict_proba(X_test_sub)[:, 1]
+                test_sc = average_precision_score(y_test_sub, test_proba)
+            else:
+                test_sc = train_sc
+            logger.info(f"  {label} -> train={train_sc:.4f} test={test_sc:.4f} ({mask.sum():,} rows)")
+            return label, f"window:{label}", test_sc, train_sc
+
         # ── Weight tournament via Nelder-Mead optimization ──
         from scipy.optimize import minimize
 
         all_results = []  # collect all evaluated candidates
         _eval_cache = {}  # cache rounded params → result to skip duplicate trains
+        _window_masks = {}  # label → boolean mask for sliding window candidates
 
         # 1. Uniform baseline
         res_uniform = _eval_candidate("Uniform", None)
@@ -589,6 +632,30 @@ def main():
                 if rw is not None:
                     all_results.append(_eval_candidate(f"Recency(d={decay})", rw))
 
+        # 4. Sliding window candidates — keep only the most recent N months
+        if has_recency:
+            max_rank = month_rank.max()
+            n_unique_months = max_rank + 1
+            if n_unique_months >= 4:
+                # Try keeping last 50%, 60%, 75%, 90% of months
+                for frac in [0.50, 0.60, 0.75, 0.90]:
+                    keep_months = max(2, int(n_unique_months * frac))
+                    if keep_months >= n_unique_months:
+                        continue  # same as uniform, skip
+                    cutoff_rank = max_rank - keep_months + 1
+                    mask = month_rank >= cutoff_rank
+                    # Align mask to X_train_m index
+                    mask_aligned = mask.reindex(X_train_m.index, fill_value=False)
+                    lbl = f"Window(last_{keep_months}mo)"
+                    res = _eval_sliding_window(lbl, mask_aligned)
+                    if res is not None:
+                        _window_masks[lbl] = mask_aligned
+                        all_results.append(res)
+                logger.info(f"Sliding window: evaluated {len(_window_masks)} window sizes "
+                            f"(total months={n_unique_months})")
+            else:
+                logger.info(f"Sliding window: skipped (only {n_unique_months} unique months)")
+
         # Pick overall winner
         all_results.sort(key=lambda x: x[2], reverse=True)
         best_label, best_weights, best_score, _ = all_results[0]
@@ -602,8 +669,17 @@ def main():
         logger.info(f"Final winner: {best_label} (test AU-PRC={best_score:.4f})")
         weight_status = best_label
 
-        # Train final model on full data with winning weights
-        lgbm_m = train_model(X_train_m, y_train_m, sample_weight=best_weights)
+        # Train final model on full data with winning weights (or sliding window filter)
+        if isinstance(best_weights, str) and best_weights.startswith("window:"):
+            # Sliding window winner — filter rows instead of weighting
+            best_window_mask = _window_masks[best_label]
+            lgbm_m = train_model(
+                X_train_m.loc[best_window_mask],
+                y_train_m.loc[best_window_mask],
+            )
+            logger.info(f"Final model trained on {best_window_mask.sum():,}/{len(X_train_m):,} rows (sliding window)")
+        else:
+            lgbm_m = train_model(X_train_m, y_train_m, sample_weight=best_weights)
 
         mitigated_metrics = evaluate_and_save(
             lgbm_m, X_train_m, y_train_m, X_test_m, customer_ids, test_m, feature_types,
