@@ -2,7 +2,13 @@
 
 **Team Name:** junyiding
 
-## Setup
+## Quick Start (Docker)
+
+```bash
+docker build -t naisc . && docker run --rm naisc
+```
+
+## Setup (without Docker)
 
 ```bash
 pip install -r requirements.txt
