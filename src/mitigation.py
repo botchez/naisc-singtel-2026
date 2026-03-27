@@ -451,13 +451,13 @@ def frequency_encode_mitigation(
         (vc["count"].cast(pl.Float64) / total).to_list()
     ))
 
-    # Map values; unseen categories get 0.0
-    tr_arr = np.array([freq_map.get(v, 0.0) if v is not None else 0.0 for v in train_col.to_list()])
-    te_arr = np.array([freq_map.get(v, 0.0) if v is not None else 0.0 for v in test_col.to_list()])
+    # Map values; unseen categories get 0.0 (vectorized via polars)
+    tr_series = train_col.replace_strict(freq_map, default=0.0, return_dtype=pl.Float64).fill_null(0.0)
+    te_series = test_col.replace_strict(freq_map, default=0.0, return_dtype=pl.Float64).fill_null(0.0)
 
     return (
-        pl.Series(name=train_col.name, values=tr_arr),
-        pl.Series(name=test_col.name, values=te_arr),
+        tr_series.alias(train_col.name),
+        te_series.alias(test_col.name),
     )
 
 
