@@ -8,7 +8,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-import pandas as pd
+import polars as pl
+from polars_compat import to_numeric_coerce, is_numeric_col, to_pandas_for_lgbm
 from profiler import load_data, detect_feature_types, profile_data, align_train_test_columns
 from drift_detector import run_drift_analysis, detect_intra_training_drift
 from model import prepare_features, train_model, evaluate_and_save, print_model_performance_summary
@@ -18,7 +19,7 @@ from utils import Timer, logger
 
 
 def print_drift_mitigation_summary(
-    drift_df: pd.DataFrame,
+    drift_df: pl.DataFrame,
     drop_cols: list[str],
     mitigation_log: list[dict] | None = None,
     norm_log: dict[str, list[str]] | None = None,
@@ -78,16 +79,16 @@ def print_drift_mitigation_summary(
     print(full_sep("╔", "╗"))
     print(f"║{title:^{FULL_W}}║")
 
-    if drift_df.empty:
+    if len(drift_df) == 0:
         print(full_sep("╠", "╣"))
         print(full_row("No features analysed."))
         print(full_sep("╚", "╝"))
         return
 
     # Filter to only drifted features (high or moderate)
-    drifted = drift_df[drift_df["severity"].isin(["high", "moderate"])].copy()
+    drifted = drift_df.filter(pl.col("severity").is_in(["high", "moderate"]))
 
-    if drifted.empty:
+    if len(drifted) == 0:
         print(full_sep("╠", "╣"))
         print(full_row("No high or moderate drift detected across all features."))
         print(full_sep("╚", "╝"))
@@ -108,12 +109,12 @@ def print_drift_mitigation_summary(
     print(h_line("╠", "╬", "╣"))
 
     # Data rows
-    for _, r in drifted.iterrows():
+    for r in drifted.iter_rows(named=True):
         col_name = r["column"][:CW[0] - 2]
         ftype = r["feature_type"]
 
         # Use qualitative description if available, fall back to metrics
-        if "drift_description" in r.index and pd.notna(r.get("drift_description")):
+        if "drift_description" in r and r.get("drift_description") is not None:
             drift_desc = str(r["drift_description"])
         elif ftype == "numerical":
             sev = r["severity"].capitalize()
@@ -271,12 +272,12 @@ def main():
     profile_data(train, feature_types, label="train")
     profile_data(test, feature_types, label="test")
 
-    # Coerce columns classified as numerical but still stored as object dtype
+    # Coerce columns classified as numerical but still stored as non-numeric dtype
     for col in feature_types.get("numerical", []):
-        if col in train.columns and not pd.api.types.is_numeric_dtype(train[col]):
-            train[col] = pd.to_numeric(train[col], errors="coerce")
-        if col in test.columns and not pd.api.types.is_numeric_dtype(test[col]):
-            test[col] = pd.to_numeric(test[col], errors="coerce")
+        if col in train.columns and not is_numeric_col(train[col]):
+            train = train.with_columns(to_numeric_coerce(train[col]).alias(col))
+        if col in test.columns and not is_numeric_col(test[col]):
+            test = test.with_columns(to_numeric_coerce(test[col]).alias(col))
 
     # --- Build a single decision sample for drift detection, feature selection,
     # and weight tournament. Full data flows through mitigation/FE/final model. ---
@@ -300,7 +301,7 @@ def main():
             f"Decision sample: {_DECISION_SAMPLE_SIZE:,}/{len(train):,} rows"
             f"{' (stratified by temporal)' if _month_vals is not None else ''}"
         )
-    train_decision = train.iloc[_decision_idx].reset_index(drop=True) if _decision_idx is not None else train
+    train_decision = train[_decision_idx] if _decision_idx is not None else train
 
     # --- Dynamic pipeline cap: keep runtime under 10 minutes ---
     # Based on benchmark: 2M rows × 200 cols ≈ 230s computation.
@@ -317,7 +318,7 @@ def main():
             len(train), _max_pipeline_rows,
             month_values=_month_vals, seed=42,
         )
-        train = train.iloc[_pipeline_idx].reset_index(drop=True)
+        train = train[_pipeline_idx]
         # Recompute month values and decision index on the capped train
         # (original _decision_idx pointed into pre-cap rows, now invalid)
         _month_vals = None
@@ -333,7 +334,7 @@ def main():
             )
         else:
             _decision_idx = None
-        train_decision = train.iloc[_decision_idx].reset_index(drop=True) if _decision_idx is not None else train
+        train_decision = train[_decision_idx] if _decision_idx is not None else train
         logger.info(
             f"Pipeline cap: {_max_pipeline_rows:,}/{_original_train_len:,} rows "
             f"(dynamic, targeting <{_RUNTIME_BUDGET_S}s for {n_cols} cols)"
@@ -344,7 +345,7 @@ def main():
     # --- Stage 2: Drift Detection (train vs test) ---
     with Timer("Drift detection") as drift_timer:
         # Use decision sample for drift analysis — statistical tests converge at 100K
-        test_drift = test.sample(n=min(_DECISION_SAMPLE_SIZE, len(test)), random_state=42) if len(test) > _DECISION_SAMPLE_SIZE else test
+        test_drift = test.sample(n=min(_DECISION_SAMPLE_SIZE, len(test)), seed=42) if len(test) > _DECISION_SAMPLE_SIZE else test
         drift_df = run_drift_analysis(train_decision, test_drift, feature_types)
         # Keep full train for month_rank (used for recency weighting across all rows)
         intra_drift_df, month_rank = detect_intra_training_drift(train, feature_types)
@@ -367,8 +368,8 @@ def main():
                 continue
             drift = detect_numerical_drift(train_m[col], test_m[col])
             if drift["severity"] == "high":
-                train_m = train_m.drop(columns=[col])
-                test_m = test_m.drop(columns=[col])
+                train_m = train_m.drop(col)
+                test_m = test_m.drop(col)
                 eng_dropped.append(col)
                 drop_cols.append(col)
         if eng_dropped:
@@ -388,7 +389,7 @@ def main():
         _MAX_BASELINE_SAMPLE = 50_000
         train_baseline = train
         if len(train) > _MAX_BASELINE_SAMPLE:
-            train_baseline = train.sample(n=_MAX_BASELINE_SAMPLE, random_state=42)
+            train_baseline = train.sample(n=_MAX_BASELINE_SAMPLE, seed=42)
             logger.info(f"Baseline model: subsampling {_MAX_BASELINE_SAMPLE}/{len(train)} rows")
         X_train_b, y_train_b, X_test_b, customer_ids = prepare_features(
             train_baseline, test, feature_types
@@ -412,7 +413,7 @@ def main():
             if _decision_idx is not None and len(X_train_m) > _DECISION_SAMPLE_SIZE:
                 # Reuse decision sample indices (clamped to current DataFrame size)
                 fs_idx = _decision_idx[_decision_idx < len(X_train_m)]
-                fs_model = train_model(X_train_m.iloc[fs_idx], y_train_m.iloc[fs_idx])
+                fs_model = train_model(X_train_m[fs_idx], y_train_m.gather(fs_idx.tolist()))
             else:
                 fs_model = train_model(X_train_m, y_train_m)
             importances = fs_model.feature_importances_
@@ -421,8 +422,8 @@ def main():
             # Drop zero-importance features
             zero_imp_cols = [c for c, imp in imp_by_col.items() if imp == 0]
             if zero_imp_cols and len(zero_imp_cols) < len(X_train_m.columns):
-                X_train_m = X_train_m.drop(columns=zero_imp_cols)
-                X_test_m = X_test_m.drop(columns=zero_imp_cols)
+                X_train_m = X_train_m.drop(zero_imp_cols)
+                X_test_m = X_test_m.drop(zero_imp_cols)
                 logger.info(f"Dropped {len(zero_imp_cols)} zero-importance features: {zero_imp_cols}")
             elif zero_imp_cols:
                 logger.warning(f"All {len(zero_imp_cols)} features have zero importance; keeping all")
@@ -431,15 +432,20 @@ def main():
             remaining_imps = {c: imp_by_col[c] for c in X_train_m.columns if c in imp_by_col}
             sorted_cols = sorted(remaining_imps.keys(), key=lambda c: remaining_imps[c], reverse=True)
             top_cols = [c for c in sorted_cols[:8]
-                        if pd.api.types.is_numeric_dtype(X_train_m[c])]
+                        if is_numeric_col(X_train_m[c])]
+            interaction_exprs_train = []
+            interaction_exprs_test = []
             interaction_count = 0
             for i, ca in enumerate(top_cols):
                 for cb in top_cols[i+1:]:
                     fname = f"{ca}_x_{cb}"
                     if fname not in X_train_m.columns:
-                        X_train_m[fname] = X_train_m[ca] * X_train_m[cb]
-                        X_test_m[fname] = X_test_m[ca] * X_test_m[cb]
+                        interaction_exprs_train.append((pl.col(ca) * pl.col(cb)).alias(fname))
+                        interaction_exprs_test.append((pl.col(ca) * pl.col(cb)).alias(fname))
                         interaction_count += 1
+            if interaction_exprs_train:
+                X_train_m = X_train_m.with_columns(interaction_exprs_train)
+                X_test_m = X_test_m.with_columns(interaction_exprs_test)
             if interaction_count:
                 logger.info(f"Added {interaction_count} top-feature interaction terms")
         except Exception as e:
@@ -453,10 +459,10 @@ def main():
         # Resolve test labels for validation-guided selection
         target_col = feature_types["target"][0] if feature_types["target"] else None
         has_test_labels = (target_col and target_col in test_m.columns
-                          and test_m[target_col].notna().any())
+                          and test_m[target_col].is_not_null().any())
         # Guard against dummy test labels (e.g. all same value) in hidden eval
         if has_test_labels:
-            _test_target_vals = test_m[target_col].dropna().unique()
+            _test_target_vals = test_m[target_col].drop_nulls().unique()
             if len(_test_target_vals) < 2:
                 logger.info(f"Test target has only 1 unique value ({_test_target_vals[0]}) — treating as dummy labels")
                 has_test_labels = False
@@ -484,22 +490,27 @@ def main():
         def _eval_candidate(label, weights):
             """Train with weights, return (label, weights, test_auprc, train_auprc)."""
             if _tourney_idx is not None:
-                X_sub = X_train_m.iloc[_tourney_idx]
-                y_sub = y_train_m.iloc[_tourney_idx]
+                X_sub = X_train_m[_tourney_idx]
+                y_sub = y_train_m.gather(_tourney_idx.tolist())
                 w_sub = weights[_tourney_idx] if weights is not None else None
             else:
                 X_sub, y_sub, w_sub = X_train_m, y_train_m, weights
             m = train_model(X_sub, y_sub, sample_weight=w_sub)
-            train_proba = m.predict_proba(X_sub)[:, 1]
-            train_sc = average_precision_score(y_sub, train_proba)
+            # LightGBM predict_proba needs pandas — convert polars DataFrame
+            X_sub_pd = to_pandas_for_lgbm(X_sub) if isinstance(X_sub, pl.DataFrame) else X_sub
+            train_proba = m.predict_proba(X_sub_pd)[:, 1]
+            y_sub_np = y_sub.to_numpy() if isinstance(y_sub, pl.Series) else np.asarray(y_sub)
+            train_sc = average_precision_score(y_sub_np, train_proba)
             if has_test_labels:
                 if _test_tourney_idx is not None:
-                    X_test_sub = X_test_m.iloc[_test_tourney_idx]
-                    y_test_sub = y_test_m.iloc[_test_tourney_idx]
+                    X_test_sub = X_test_m[_test_tourney_idx]
+                    y_test_sub = y_test_m.gather(_test_tourney_idx.tolist())
                 else:
                     X_test_sub, y_test_sub = X_test_m, y_test_m
-                test_proba = m.predict_proba(X_test_sub)[:, 1]
-                test_sc = average_precision_score(y_test_sub, test_proba)
+                X_test_sub_pd = to_pandas_for_lgbm(X_test_sub) if isinstance(X_test_sub, pl.DataFrame) else X_test_sub
+                test_proba = m.predict_proba(X_test_sub_pd)[:, 1]
+                y_test_sub_np = y_test_sub.to_numpy() if isinstance(y_test_sub, pl.Series) else np.asarray(y_test_sub)
+                test_sc = average_precision_score(y_test_sub_np, test_proba)
             else:
                 test_sc = train_sc  # fallback to train if no test labels
             logger.info(f"  {label} -> train={train_sc:.4f} test={test_sc:.4f}")

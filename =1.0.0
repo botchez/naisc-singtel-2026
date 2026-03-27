@@ -1,0 +1,11 @@
+Collecting polars
+  Downloading polars-1.39.3-py3-none-any.whl.metadata (10 kB)
+Collecting polars-runtime-32==1.39.3 (from polars)
+  Downloading polars_runtime_32-1.39.3-cp310-abi3-win_amd64.whl.metadata (1.5 kB)
+Downloading polars-1.39.3-py3-none-any.whl (823 kB)
+   ---------------------------------------- 824.0/824.0 kB 15.4 MB/s  0:00:00
+Downloading polars_runtime_32-1.39.3-cp310-abi3-win_amd64.whl (47.0 MB)
+   ---------------------------------------- 47.0/47.0 MB 35.7 MB/s  0:00:01
+Installing collected packages: polars-runtime-32, polars
+
+Successfully installed polars-1.39.3 polars-runtime-32-1.39.3

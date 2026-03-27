@@ -1,11 +1,32 @@
-import pandas as pd
+import polars as pl
 import numpy as np
 from scipy import stats
+from polars_compat import to_numeric_coerce, is_numeric_col, to_pandas_for_lgbm, to_pandas_series
 
 # Maximum sample size for statistical tests. Beyond this, additional rows
 # add negligible statistical power but cost O(n log n) compute.  50K is
 # enough for KS, PSI, Chi², and Wasserstein at any practical significance level.
 _MAX_DRIFT_SAMPLE = 50_000
+
+
+def _ensure_pl_series(s) -> pl.Series:
+    """Auto-convert pandas Series to polars if needed (transition helper)."""
+    if isinstance(s, pl.Series):
+        return s
+    import pandas as pd
+    if isinstance(s, pd.Series):
+        return pl.from_pandas(s)
+    return pl.Series(values=s)
+
+
+def _ensure_pl_df(df) -> pl.DataFrame:
+    """Auto-convert pandas DataFrame to polars if needed (transition helper)."""
+    if isinstance(df, pl.DataFrame):
+        return df
+    import pandas as pd
+    if isinstance(df, pd.DataFrame):
+        return pl.from_pandas(df)
+    return df
 
 
 def _subsample_array(arr: np.ndarray, max_n: int = _MAX_DRIFT_SAMPLE, seed: int = 42) -> np.ndarray:
@@ -17,11 +38,11 @@ def _subsample_array(arr: np.ndarray, max_n: int = _MAX_DRIFT_SAMPLE, seed: int 
     return arr[idx]
 
 
-def _subsample_series(s: pd.Series, max_n: int = _MAX_DRIFT_SAMPLE, seed: int = 42) -> pd.Series:
+def _subsample_series(s: pl.Series, max_n: int = _MAX_DRIFT_SAMPLE, seed: int = 42) -> pl.Series:
     """Randomly subsample a Series if it exceeds max_n."""
     if len(s) <= max_n:
         return s
-    return s.sample(n=max_n, random_state=seed)
+    return s.sample(n=max_n, seed=seed)
 
 
 def compute_psi(expected: np.ndarray, actual: np.ndarray, bins: int = 10) -> float:
@@ -48,7 +69,7 @@ def compute_psi(expected: np.ndarray, actual: np.ndarray, bins: int = 10) -> flo
 
 
 def compute_cramers_v(chi2_stat: float, n: int, k: int) -> float:
-    """Cramér's V: sample-size-normalized chi-squared effect size.
+    """Cramer's V: sample-size-normalized chi-squared effect size.
 
     V ranges from 0 (identical distributions) to 1 (complete separation).
     Unlike chi2 p-value, V is independent of sample size.
@@ -105,22 +126,23 @@ def _escalate_severity(base: str, missingness: str) -> str:
 
 
 def detect_numerical_drift(
-    train_col: pd.Series, test_col: pd.Series
+    train_col: pl.Series, test_col: pl.Series
 ) -> dict:
     """Run drift tests on a single numerical feature."""
-    train_null_pct = float(train_col.isna().mean())
-    test_null_pct = float(test_col.isna().mean())
+    train_col, test_col = _ensure_pl_series(train_col), _ensure_pl_series(test_col)
+    train_null_pct = float(train_col.null_count() / len(train_col))
+    test_null_pct = float(test_col.null_count() / len(test_col))
     miss_sev = _missingness_severity(train_null_pct, test_null_pct)
 
-    train_vals = pd.to_numeric(train_col, errors="coerce").dropna().values.astype(float)
-    test_vals = pd.to_numeric(test_col, errors="coerce").dropna().values.astype(float)
+    train_vals = to_numeric_coerce(train_col).drop_nulls().to_numpy().astype(float)
+    test_vals = to_numeric_coerce(test_col).drop_nulls().to_numpy().astype(float)
 
     if len(train_vals) == 0 or len(test_vals) == 0:
         return {"ks_stat": None, "ks_pval": None, "psi": None, "wasserstein": None,
                 "wasserstein_norm": None, "train_null_pct": round(train_null_pct, 4),
                 "test_null_pct": round(test_null_pct, 4), "severity": _escalate_severity("unknown", miss_sev)}
 
-    # Subsample for statistical tests — 50K rows gives equivalent power
+    # Subsample for statistical tests -- 50K rows gives equivalent power
     train_sample = _subsample_array(train_vals)
     test_sample = _subsample_array(test_vals)
 
@@ -166,26 +188,35 @@ def detect_numerical_drift(
 
 
 def detect_categorical_drift(
-    train_col: pd.Series, test_col: pd.Series
+    train_col: pl.Series, test_col: pl.Series
 ) -> dict:
     """Run drift tests on a single categorical feature."""
-    train_null_pct = float(train_col.isna().mean())
-    test_null_pct = float(test_col.isna().mean())
+    train_col, test_col = _ensure_pl_series(train_col), _ensure_pl_series(test_col)
+    train_null_pct = float(train_col.null_count() / len(train_col))
+    test_null_pct = float(test_col.null_count() / len(test_col))
     miss_sev = _missingness_severity(train_null_pct, test_null_pct)
 
-    # Subsample for chi-squared / JSD — preserves distribution proportions
-    train_sub = _subsample_series(train_col.dropna())
-    test_sub = _subsample_series(test_col.dropna())
+    # Subsample for chi-squared / JSD -- preserves distribution proportions
+    train_sub = _subsample_series(train_col.drop_nulls())
+    test_sub = _subsample_series(test_col.drop_nulls())
 
-    all_categories = sorted(set(train_sub.unique()) | set(test_sub.unique()), key=str)
+    all_categories = sorted(set(train_sub.unique().to_list()) | set(test_sub.unique().to_list()), key=str)
 
     if len(all_categories) == 0:
         return {"chi2_stat": None, "chi2_pval": None, "jsd": None, "unseen_in_test": [],
                 "train_null_pct": round(train_null_pct, 4), "test_null_pct": round(test_null_pct, 4),
                 "severity": _escalate_severity("unknown", miss_sev)}
 
-    train_counts = train_sub.value_counts().reindex(all_categories, fill_value=0).values.astype(float)
-    test_counts = test_sub.value_counts().reindex(all_categories, fill_value=0).values.astype(float)
+    # Build aligned count arrays via polars join
+    vc_train = train_sub.value_counts()
+    all_cats_df = pl.DataFrame({train_sub.name: all_categories})
+    merged_train = all_cats_df.join(vc_train, on=train_sub.name, how="left").fill_null(0)
+    train_counts = merged_train["count"].to_numpy().astype(float)
+
+    vc_test = test_sub.value_counts()
+    all_cats_df_test = pl.DataFrame({test_sub.name: all_categories})
+    merged_test = all_cats_df_test.join(vc_test, on=test_sub.name, how="left").fill_null(0)
+    test_counts = merged_test["count"].to_numpy().astype(float)
 
     # JSD on full distribution (always reliable)
     jsd = compute_jsd(train_counts, test_counts)
@@ -212,19 +243,19 @@ def detect_categorical_drift(
     else:
         chi2_stat, chi2_pval = 0.0, 1.0
 
-    # Cramér's V: sample-size-normalized effect size
+    # Cramer's V: sample-size-normalized effect size
     n_total = int(contingency.sum())
     k_cats = min(contingency.shape[0], contingency.shape[1])
     cramers_v = compute_cramers_v(chi2_stat, n_total, k_cats)
 
     # Unseen categories in test
-    train_cats = set(train_sub.unique())
-    test_cats = set(test_sub.unique())
+    train_cats = set(train_sub.unique().to_list())
+    test_cats = set(test_sub.unique().to_list())
     unseen_in_test = sorted(test_cats - train_cats, key=str)
 
     # Use original full sizes for small-sample factor
-    n_tr = len(train_col.dropna())
-    n_te = len(test_col.dropna())
+    n_tr = len(train_col.drop_nulls())
+    n_te = len(test_col.drop_nulls())
     ss_factor = _small_sample_factor(n_tr, n_te)
     severity = _categorical_severity(chi2_pval, jsd, cramers_v, ss_factor)
     severity = _escalate_severity(severity, miss_sev)
@@ -292,7 +323,7 @@ def _categorical_severity(chi2_pval: float, jsd: float, cramers_v: float = 0.0,
                           ss_factor: float = 1.0) -> str:
     """Classify drift severity for categorical features.
 
-    Uses JSD, Chi² p-value, and Cramér's V (sample-size-normalized effect size).
+    Uses JSD, Chi2 p-value, and Cramer's V (sample-size-normalized effect size).
     ss_factor: small-sample scaling factor for JSD thresholds (>1.0 widens bands).
     """
     if jsd >= 0.1 * ss_factor:
@@ -307,14 +338,15 @@ def _categorical_severity(chi2_pval: float, jsd: float, cramers_v: float = 0.0,
 
 
 def generate_drift_description(
-    train_col: pd.Series, test_col: pd.Series, feature_type: str, drift_metrics: dict
+    train_col: pl.Series, test_col: pl.Series, feature_type: str, drift_metrics: dict
 ) -> str:
+    train_col, test_col = _ensure_pl_series(train_col), _ensure_pl_series(test_col)
     """Generate a qualitative natural-language description of the drift observed."""
     parts = []
 
     if feature_type == "numerical":
-        train_vals = _subsample_array(pd.to_numeric(train_col, errors="coerce").dropna().values.astype(float))
-        test_vals = _subsample_array(pd.to_numeric(test_col, errors="coerce").dropna().values.astype(float))
+        train_vals = _subsample_array(to_numeric_coerce(train_col).drop_nulls().to_numpy().astype(float))
+        test_vals = _subsample_array(to_numeric_coerce(test_col).drop_nulls().to_numpy().astype(float))
         if len(train_vals) == 0 or len(test_vals) == 0:
             return "Insufficient data for drift characterization"
 
@@ -362,8 +394,8 @@ def generate_drift_description(
         # Dominant category shift
         train_mode = train_col.mode()
         test_mode = test_col.mode()
-        if len(train_mode) > 0 and len(test_mode) > 0 and train_mode.iloc[0] != test_mode.iloc[0]:
-            parts.append(f"dominant category changes from '{train_mode.iloc[0]}' to '{test_mode.iloc[0]}'")
+        if len(train_mode) > 0 and len(test_mode) > 0 and train_mode[0] != test_mode[0]:
+            parts.append(f"dominant category changes from '{train_mode[0]}' to '{test_mode[0]}'")
 
         jsd = drift_metrics.get("jsd", 0) or 0
         if jsd >= 0.05 and not parts:
@@ -389,63 +421,81 @@ def generate_drift_description(
     return desc[0].upper() + desc[1:]
 
 
-def _apply_bh_correction(drift_df: pd.DataFrame, ss_factor: float = 1.0) -> pd.DataFrame:
+def _apply_bh_correction(drift_df, ss_factor: float = 1.0):
+    import pandas as pd
+    _input_was_pandas = isinstance(drift_df, pd.DataFrame)
+    drift_df = _ensure_pl_df(drift_df)
     """Apply Benjamini-Hochberg FDR correction across all p-values and re-classify severity."""
     # Collect all p-values (KS and Chi2) for joint correction
+    n = len(drift_df)
     all_pvals = []
-    pval_info = []  # (row_idx, pval_col_name)
+    pval_info = []  # (row_index, pval_col_name)
 
-    for idx, row in drift_df.iterrows():
-        if row["feature_type"] == "numerical" and pd.notna(row.get("ks_pval")):
-            all_pvals.append(row["ks_pval"])
-            pval_info.append((idx, "ks_pval"))
-        elif row["feature_type"] in ("categorical", "temporal") and pd.notna(row.get("chi2_pval")):
-            all_pvals.append(row["chi2_pval"])
-            pval_info.append((idx, "chi2_pval"))
+    for i in range(n):
+        ft = drift_df["feature_type"][i]
+        if ft == "numerical":
+            ks_p = drift_df["ks_pval"][i]
+            if ks_p is not None:
+                all_pvals.append(ks_p)
+                pval_info.append((i, "ks_pval"))
+        elif ft in ("categorical", "temporal"):
+            chi2_p = drift_df["chi2_pval"][i]
+            if chi2_p is not None:
+                all_pvals.append(chi2_p)
+                pval_info.append((i, "chi2_pval"))
 
     if not all_pvals:
-        return drift_df
+        return drift_df.to_pandas() if _input_was_pandas else drift_df
 
     corrected = _bh_correct(np.array(all_pvals))
 
-    # Store corrected p-values alongside originals
-    if "ks_pval_bh" not in drift_df.columns:
-        drift_df["ks_pval_bh"] = np.nan
-    if "chi2_pval_bh" not in drift_df.columns:
-        drift_df["chi2_pval_bh"] = np.nan
-
+    # Build corrected p-value columns
+    ks_bh = [None] * n
+    chi2_bh = [None] * n
     for (idx, pval_col), corr_p in zip(pval_info, corrected):
-        drift_df.loc[idx, f"{pval_col}_bh"] = round(corr_p, 6)
+        if pval_col == "ks_pval":
+            ks_bh[idx] = round(corr_p, 6)
+        else:
+            chi2_bh[idx] = round(corr_p, 6)
+
+    drift_df = drift_df.with_columns([
+        pl.Series("ks_pval_bh", ks_bh, dtype=pl.Float64),
+        pl.Series("chi2_pval_bh", chi2_bh, dtype=pl.Float64),
+    ])
 
     # Re-classify severity using corrected p-values with consistent ss_factor
     # Also reapply missingness escalation (which initial detection applied but
     # would otherwise be lost when severity is overwritten here)
-    for idx, row in drift_df.iterrows():
-        train_null = row.get("train_null_pct") or 0.0
-        test_null = row.get("test_null_pct") or 0.0
+    new_severities = []
+    for i in range(n):
+        row_ft = drift_df["feature_type"][i]
+        train_null = drift_df["train_null_pct"][i] or 0.0
+        test_null = drift_df["test_null_pct"][i] or 0.0
         miss_sev = _missingness_severity(train_null, test_null)
 
-        if row["feature_type"] == "numerical":
-            ks_p = row.get("ks_pval_bh", row.get("ks_pval", 1.0))
-            if pd.isna(ks_p):
-                ks_p = row.get("ks_pval", 1.0)
-            psi = row.get("psi") or 0.0
-            w_norm = row.get("wasserstein_norm") or 0.0
-            ks_d = row.get("ks_stat") or 0.0
-            iqr_r = row.get("iqr_ratio") or 1.0
-            t_div = row.get("tail_divergence") or 0.0
+        if row_ft == "numerical":
+            ks_p = ks_bh[i] if ks_bh[i] is not None else (drift_df["ks_pval"][i] or 1.0)
+            psi = drift_df["psi"][i] or 0.0
+            w_norm = drift_df["wasserstein_norm"][i] or 0.0
+            ks_d = drift_df["ks_stat"][i] or 0.0
+            iqr_r = drift_df["iqr_ratio"][i] if "iqr_ratio" in drift_df.columns else 1.0
+            iqr_r = iqr_r or 1.0
+            t_div = drift_df["tail_divergence"][i] if "tail_divergence" in drift_df.columns else 0.0
+            t_div = t_div or 0.0
             sev = _numerical_severity(ks_p, psi, w_norm, ks_d, iqr_r, t_div, ss_factor)
-            drift_df.loc[idx, "severity"] = _escalate_severity(sev, miss_sev)
-        elif row["feature_type"] in ("categorical", "temporal"):
-            chi2_p = row.get("chi2_pval_bh", row.get("chi2_pval", 1.0))
-            if pd.isna(chi2_p):
-                chi2_p = row.get("chi2_pval", 1.0)
-            jsd = row.get("jsd") or 0.0
-            cv = row.get("cramers_v") or 0.0
+            new_severities.append(_escalate_severity(sev, miss_sev))
+        elif row_ft in ("categorical", "temporal"):
+            chi2_p = chi2_bh[i] if chi2_bh[i] is not None else (drift_df["chi2_pval"][i] or 1.0)
+            jsd = drift_df["jsd"][i] or 0.0
+            cv = drift_df["cramers_v"][i] if "cramers_v" in drift_df.columns else 0.0
+            cv = cv or 0.0
             sev = _categorical_severity(chi2_p, jsd, cv, ss_factor)
-            drift_df.loc[idx, "severity"] = _escalate_severity(sev, miss_sev)
+            new_severities.append(_escalate_severity(sev, miss_sev))
+        else:
+            new_severities.append(drift_df["severity"][i])
 
-    return drift_df
+    drift_df = drift_df.with_columns(pl.Series("severity", new_severities))
+    return drift_df.to_pandas() if _input_was_pandas else drift_df
 
 
 def _analyze_single_feature(train_col, test_col, col_name, feature_type):
@@ -462,16 +512,17 @@ def _analyze_single_feature(train_col, test_col, col_name, feature_type):
 
 
 def run_drift_analysis(
-    train: pd.DataFrame,
-    test: pd.DataFrame,
+    train: pl.DataFrame,
+    test: pl.DataFrame,
     feature_types: dict[str, list[str]],
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Run drift detection on all features. Returns a summary DataFrame.
 
     Applies Benjamini-Hochberg FDR correction across all p-values to
     control for multiple testing, then re-classifies severity.
     Uses parallel execution for datasets with many features.
     """
+    train, test = _ensure_pl_df(train), _ensure_pl_df(test)
     from joblib import Parallel, delayed
 
     # Build list of (col, type) pairs to analyze
@@ -498,8 +549,11 @@ def run_drift_analysis(
             for col, ftype in tasks
         ]
 
-    drift_df = pd.DataFrame(results)
-    if drift_df.empty:
+    if not results:
+        return pl.DataFrame()
+
+    drift_df = pl.DataFrame(results)
+    if len(drift_df) == 0:
         return drift_df
 
     # Compute dataset-level ss_factor for consistent threshold scaling
@@ -508,14 +562,18 @@ def run_drift_analysis(
     # Apply BH FDR correction and re-classify severity
     drift_df = _apply_bh_correction(drift_df, ss_factor)
 
-    drift_df = drift_df.sort_values("severity", key=lambda s: s.map({"high": 0, "moderate": 1, "low": 2, "unknown": 3}))
+    # Sort by severity: high first, then moderate, low, unknown
+    severity_order = {"high": 0, "moderate": 1, "low": 2, "unknown": 3}
+    drift_df = drift_df.sort(
+        pl.col("severity").replace_strict(severity_order, default=4)
+    )
 
     return drift_df
 
 
 def detect_multivariate_shift(
-    train: pd.DataFrame,
-    test: pd.DataFrame,
+    train: pl.DataFrame,
+    test: pl.DataFrame,
     feature_types: dict[str, list[str]],
     extra_drop_cols: list[str] | None = None,
     n_splits: int = 3,
@@ -527,10 +585,10 @@ def detect_multivariate_shift(
 
     Returns dict with 'auc', 'fold_aucs', 'shift_detected'.
     """
+    train, test = _ensure_pl_df(train), _ensure_pl_df(test)
     from lightgbm import LGBMClassifier
     from sklearn.model_selection import StratifiedKFold
     from sklearn.metrics import roc_auc_score
-    from sklearn.preprocessing import LabelEncoder
 
     drop_cols = feature_types.get("id", []) + feature_types.get("target", [])
     if extra_drop_cols:
@@ -544,48 +602,67 @@ def detect_multivariate_shift(
     _MAX_DOMAIN_FEATURES = 100
     if len(feature_cols) > _MAX_DOMAIN_FEATURES:
         _orig_n_feats = len(feature_cols)
-        _var_sample = train[feature_cols].sample(
-            n=min(50_000, len(train)), random_state=42
-        ) if len(train) > 50_000 else train[feature_cols]
-        _variances = _var_sample.apply(pd.to_numeric, errors="coerce").var().sort_values(ascending=False)
-        feature_cols = _variances.head(_MAX_DOMAIN_FEATURES).index.tolist()
+        _var_sample = train.select(feature_cols).sample(
+            n=min(50_000, len(train)), seed=42
+        ) if len(train) > 50_000 else train.select(feature_cols)
+        # Compute variance per feature, sort descending, take top N
+        var_dict = {}
+        for c in feature_cols:
+            col_numeric = to_numeric_coerce(_var_sample[c])
+            var_dict[c] = col_numeric.var() or 0.0
+        sorted_by_var = sorted(var_dict.items(), key=lambda x: x[1], reverse=True)
+        feature_cols = [c for c, _ in sorted_by_var[:_MAX_DOMAIN_FEATURES]]
         from utils import logger as _logger
         _logger.info(f"Domain classifier: using top {_MAX_DOMAIN_FEATURES}/{_orig_n_feats} features by variance")
 
-    X_tr = train[feature_cols].copy()
-    X_te = test[feature_cols].copy()
+    X_tr = train.select(feature_cols)
+    X_te = test.select(feature_cols)
 
     # Subsample for domain classifier when datasets are large
     # 100K per split is sufficient for shift detection
     _MAX_DOMAIN_SAMPLE = 100_000
     full_train_n = len(X_tr)
     if len(X_tr) > _MAX_DOMAIN_SAMPLE:
-        X_tr = X_tr.sample(n=_MAX_DOMAIN_SAMPLE, random_state=42).reset_index(drop=True)
+        X_tr = X_tr.sample(n=_MAX_DOMAIN_SAMPLE, seed=42)
     if len(X_te) > _MAX_DOMAIN_SAMPLE:
-        X_te = X_te.sample(n=_MAX_DOMAIN_SAMPLE, random_state=42).reset_index(drop=True)
+        X_te = X_te.sample(n=_MAX_DOMAIN_SAMPLE, seed=42)
 
     # Simple preprocessing: encode objects via dict mapping, fill NaN
     _cat_maps = {}  # Save mappings for reuse on full train data
     _fill_vals = {}
     for col in feature_cols:
-        if X_tr[col].dtype == object:
-            combined = pd.concat([X_tr[col].astype(str), X_te[col].astype(str)], ignore_index=True)
-            cat_map = {c: i for i, c in enumerate(combined.unique())}
-            X_tr[col] = X_tr[col].astype(str).map(cat_map).astype(int)
-            X_te[col] = X_te[col].astype(str).map(cat_map).astype(int)
+        if X_tr[col].dtype == pl.Utf8 or X_tr[col].dtype == pl.String:
+            combined = pl.concat([X_tr[col].cast(pl.Utf8), X_te[col].cast(pl.Utf8)])
+            cat_map = {c: i for i, c in enumerate(combined.unique().to_list())}
+            X_tr = X_tr.with_columns(
+                pl.col(col).cast(pl.Utf8).replace_strict(cat_map, default=-1).cast(pl.Int64).alias(col)
+            )
+            X_te = X_te.with_columns(
+                pl.col(col).cast(pl.Utf8).replace_strict(cat_map, default=-1).cast(pl.Int64).alias(col)
+            )
             _cat_maps[col] = cat_map
-        if pd.api.types.is_numeric_dtype(X_tr[col]):
+        if is_numeric_col(X_tr[col]):
             fill = X_tr[col].median()
-            if pd.isna(fill):
+            if fill is None:
                 fill = 0
             _fill_vals[col] = fill
-            X_tr[col] = X_tr[col].fillna(fill)
-            X_te[col] = X_te[col].fillna(fill)
+            X_tr = X_tr.with_columns(pl.col(col).fill_null(fill).alias(col))
+            X_te = X_te.with_columns(pl.col(col).fill_null(fill).alias(col))
         else:
-            X_tr[col] = pd.to_numeric(X_tr[col], errors="coerce").fillna(0)
-            X_te[col] = pd.to_numeric(X_te[col], errors="coerce").fillna(0)
+            X_tr = X_tr.with_columns(
+                to_numeric_coerce(X_tr[col]).fill_null(0).alias(col)
+            )
+            X_te = X_te.with_columns(
+                to_numeric_coerce(X_te[col]).fill_null(0).alias(col)
+            )
 
-    X_all = pd.concat([X_tr, X_te], ignore_index=True)
+    # Align dtypes before concat (mitigation may change precision)
+    for col in X_tr.columns:
+        if X_tr[col].dtype != X_te[col].dtype:
+            common_dtype = pl.Float64
+            X_tr = X_tr.with_columns(pl.col(col).cast(common_dtype))
+            X_te = X_te.with_columns(pl.col(col).cast(common_dtype))
+    X_all = pl.concat([X_tr, X_te])
     y_domain = np.array([0] * len(X_tr) + [1] * len(X_te))
 
     # Guard: need both classes for stratified CV
@@ -599,12 +676,15 @@ def detect_multivariate_shift(
     n_splits = safe_n_splits(len(X_all), desired=n_splits, min_per_fold=20)
 
     # Stratified k-fold cross-validation
+    # LightGBM needs pandas DataFrames for .fit() / .predict_proba()
+    X_all_pd = to_pandas_for_lgbm(X_all)
+
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     oof_proba = np.zeros(len(X_all))
     fold_aucs = []
     importance_acc = np.zeros(len(feature_cols))
 
-    for fold_train_idx, fold_val_idx in skf.split(X_all, y_domain):
+    for fold_train_idx, fold_val_idx in skf.split(X_all_pd, y_domain):
         clf = LGBMClassifier(
             verbosity=-1,
             objective="binary",
@@ -613,8 +693,8 @@ def detect_multivariate_shift(
             importance_type="gain",
             n_estimators=50,  # Reduced: domain classifier is diagnostic
         )
-        clf.fit(X_all.iloc[fold_train_idx], y_domain[fold_train_idx])
-        oof_proba[fold_val_idx] = clf.predict_proba(X_all.iloc[fold_val_idx])[:, 1]
+        clf.fit(X_all_pd.iloc[fold_train_idx], y_domain[fold_train_idx])
+        oof_proba[fold_val_idx] = clf.predict_proba(X_all_pd.iloc[fold_val_idx])[:, 1]
         fold_aucs.append(roc_auc_score(y_domain[fold_val_idx], oof_proba[fold_val_idx]))
         importance_acc += clf.feature_importances_
 
@@ -634,18 +714,23 @@ def detect_multivariate_shift(
     # propensity scores for ALL training rows (used for sample weighting).
     # Use the last fold's classifier to score the full training set.
     if full_train_n > _MAX_DOMAIN_SAMPLE:
-        X_tr_full = train[feature_cols].copy()
+        X_tr_full = train.select(feature_cols)
         for col in feature_cols:
             if col in _cat_maps:
                 cat_map = _cat_maps[col]
                 default_code = len(cat_map)
-                X_tr_full[col] = X_tr_full[col].astype(str).map(cat_map).fillna(default_code).astype(int)
-            elif pd.api.types.is_numeric_dtype(X_tr_full[col]):
+                X_tr_full = X_tr_full.with_columns(
+                    pl.col(col).cast(pl.Utf8).replace_strict(cat_map, default=default_code).cast(pl.Int64).alias(col)
+                )
+            elif is_numeric_col(X_tr_full[col]):
                 fill = _fill_vals.get(col, 0)
-                X_tr_full[col] = X_tr_full[col].fillna(fill)
+                X_tr_full = X_tr_full.with_columns(pl.col(col).fill_null(fill).alias(col))
             else:
-                X_tr_full[col] = pd.to_numeric(X_tr_full[col], errors="coerce").fillna(0)
-        train_oof_proba = clf.predict_proba(X_tr_full)[:, 1]
+                X_tr_full = X_tr_full.with_columns(
+                    to_numeric_coerce(X_tr_full[col]).fill_null(0).alias(col)
+                )
+        X_tr_full_pd = to_pandas_for_lgbm(X_tr_full)
+        train_oof_proba = clf.predict_proba(X_tr_full_pd)[:, 1]
     else:
         train_oof_proba = oof_proba[:len(X_tr)]
 
@@ -659,8 +744,8 @@ def detect_multivariate_shift(
 
 
 def detect_label_shift(
-    train: pd.DataFrame,
-    test: pd.DataFrame,
+    train: pl.DataFrame,
+    test: pl.DataFrame,
     feature_types: dict[str, list[str]],
 ) -> dict | None:
     """Detect prior probability shift in the target between train and test.
@@ -668,20 +753,22 @@ def detect_label_shift(
     Compares target class distribution (churn rate) between datasets.
     Returns None if test target is not available.
     """
+    train, test = _ensure_pl_df(train), _ensure_pl_df(test)
     from utils import logger
 
     target_cols = feature_types.get("target", [])
     target_col = target_cols[0] if target_cols else None
     if target_col is None or target_col not in train.columns:
         return None
-    if target_col not in test.columns or test[target_col].isna().all():
+    if target_col not in test.columns or test[target_col].is_null().all():
         logger.info("Label shift detection skipped: no target in test")
         return None
 
     try:
         from model import _encode_target
-        y_train = _encode_target(train[target_col])
-        y_test = _encode_target(test[target_col])
+        # _encode_target expects pandas Series
+        y_train = _encode_target(to_pandas_series(train[target_col]))
+        y_test = _encode_target(to_pandas_series(test[target_col]))
 
         train_rate = float(y_train.mean())
         test_rate = float(y_test.mean())
@@ -722,9 +809,9 @@ def detect_label_shift(
 
 
 def detect_intra_training_drift(
-    train: pd.DataFrame,
+    train: pl.DataFrame,
     feature_types: dict[str, list[str]],
-) -> tuple[pd.DataFrame, pd.Series | None]:
+) -> tuple[pl.DataFrame, pl.Series | None]:
     """Detect temporal drift within training data by comparing early vs late months.
 
     Splits training data into early (first half of months) and late (second half)
@@ -733,6 +820,7 @@ def detect_intra_training_drift(
     Returns (intra_drift_df, month_series) where month_series is the parsed month
     ordering per row (or None if no temporal column).
     """
+    train = _ensure_pl_df(train)
     from utils import logger
 
     temporal_cols = feature_types.get("temporal", [])
@@ -744,43 +832,46 @@ def detect_intra_training_drift(
 
     if temporal_col is None:
         logger.info("No temporal column found; skipping intra-training drift detection")
-        return pd.DataFrame(), None
+        return pl.DataFrame(), None
 
     # Parse temporal column to month ordering
-    raw = train[temporal_col].astype(str).str.title()
+    raw = train[temporal_col].cast(pl.Utf8).str.to_titlecase()
     month_series = None
     for fmt in ["%y-%b", "%b-%y", "%Y-%m", "%m-%Y", "%b %Y", "%Y-%b",
                 "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"]:
-        parsed = pd.to_datetime(raw, format=fmt, errors="coerce")
-        if parsed.notna().sum() > len(train) * 0.5:
-            month_series = parsed.dt.to_period("M").astype(str)
+        try:
+            parsed = raw.str.to_datetime(fmt, strict=False)
+        except Exception:
+            continue
+        if parsed.is_not_null().sum() > len(train) * 0.5:
+            month_series = parsed.dt.strftime("%Y-%m")
             break
 
     if month_series is None:
         logger.info(f"Could not parse temporal column '{temporal_col}'; skipping intra-training drift")
-        return pd.DataFrame(), None
+        return pl.DataFrame(), None
 
     # Sort unique months and split into early vs late halves
-    unique_months = sorted(month_series.dropna().unique())
+    unique_months = month_series.drop_nulls().unique().sort().to_list()
     if len(unique_months) < 2:
         logger.info("Only one month in training data; skipping intra-training drift")
-        return pd.DataFrame(), None
+        return pl.DataFrame(), None
 
     mid = len(unique_months) // 2
     early_months = set(unique_months[:mid])
     late_months = set(unique_months[mid:])
 
-    early_mask = month_series.isin(early_months)
-    late_mask = month_series.isin(late_months)
-    train_early = train[early_mask]
-    train_late = train[late_mask]
+    early_mask = month_series.is_in(list(early_months))
+    late_mask = month_series.is_in(list(late_months))
+    train_early = train.filter(early_mask)
+    train_late = train.filter(late_mask)
 
     # Subsample for intra-training drift when dataset is large
     _MAX_INTRA_SAMPLE = 100_000
     if len(train_early) > _MAX_INTRA_SAMPLE:
-        train_early = train_early.sample(n=_MAX_INTRA_SAMPLE, random_state=42)
+        train_early = train_early.sample(n=_MAX_INTRA_SAMPLE, seed=42)
     if len(train_late) > _MAX_INTRA_SAMPLE:
-        train_late = train_late.sample(n=_MAX_INTRA_SAMPLE, random_state=42)
+        train_late = train_late.sample(n=_MAX_INTRA_SAMPLE, seed=42)
 
     logger.info(
         f"Intra-training split: early={len(train_early)} rows ({len(early_months)} months), "
@@ -808,46 +899,51 @@ def detect_intra_training_drift(
             drift["unseen_in_test"] = ", ".join(drift["unseen_in_test"]) if drift["unseen_in_test"] else ""
             results.append({"column": col, "feature_type": "categorical", "drift_description": desc, **drift})
 
-    intra_drift_df = pd.DataFrame(results)
-    if not intra_drift_df.empty:
+    if results:
+        intra_drift_df = pl.DataFrame(results)
+    else:
+        intra_drift_df = pl.DataFrame()
+
+    if len(intra_drift_df) > 0:
         logger.info(f"Intra-training drift: {len(intra_drift_df)} features with high/moderate temporal drift")
     else:
         logger.info("No significant intra-training drift detected")
 
     # Return month_series as parsed month rank for recency weighting
-    month_rank = pd.Series(0, index=train.index)
     month_to_rank = {m: i for i, m in enumerate(unique_months)}
-    month_rank = month_series.map(month_to_rank).fillna(0).astype(int)
+    month_rank = month_series.replace_strict(month_to_rank, default=0).cast(pl.Int64)
 
     return intra_drift_df, month_rank
 
 
-def print_drift_summary(drift_df: pd.DataFrame) -> None:
+def print_drift_summary(drift_df: pl.DataFrame) -> None:
     """Print drift detection summary to console."""
+    drift_df = _ensure_pl_df(drift_df)
     print("\n" + "=" * 70)
     print("DATA DRIFT DETECTION SUMMARY")
     print("=" * 70)
 
-    if drift_df.empty:
+    if len(drift_df) == 0:
         print("No features analysed.")
         return
 
     for severity in ["high", "moderate", "low"]:
-        subset = drift_df[drift_df["severity"] == severity]
-        if subset.empty:
+        subset = drift_df.filter(pl.col("severity") == severity)
+        if len(subset) == 0:
             continue
         print(f"\n--- {severity.upper()} drift ({len(subset)} features) ---")
-        for _, row in subset.iterrows():
+        for row in subset.iter_rows(named=True):
             col = row["column"]
             ftype = row["feature_type"]
             if ftype == "numerical":
-                ks_p = row.get('ks_pval_bh', row['ks_pval'])
-                ks_p = row['ks_pval'] if pd.isna(ks_p) else ks_p
-                w_norm = row.get('wasserstein_norm', 0)
-                w_norm = 0 if pd.isna(w_norm) else w_norm
+                ks_p = row.get("ks_pval_bh") or row["ks_pval"]
+                if ks_p is None:
+                    ks_p = row["ks_pval"]
+                w_norm = row.get("wasserstein_norm", 0)
+                w_norm = 0 if w_norm is None else w_norm
                 print(f"  {col:30s}  KS={row['ks_stat']:.4f} (p={ks_p:.4f} BH)  PSI={row['psi']:.4f}  W*={w_norm:.4f}")
             else:
-                cv = row.get('cramers_v', 0) or 0
+                cv = row.get("cramers_v", 0) or 0
                 unseen = f"  unseen=[{row['unseen_in_test']}]" if row.get("unseen_in_test") else ""
                 print(f"  {col:30s}  Chi2={row['chi2_stat']:.4f} (p={row['chi2_pval']:.4f})  JSD={row['jsd']:.4f}  V={cv:.4f}{unseen}")
 

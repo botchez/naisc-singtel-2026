@@ -1,14 +1,25 @@
 import numpy as np
-import pandas as pd
+import polars as pl
+from polars_compat import to_numeric_coerce, is_numeric_col
 from utils import logger
 
 
+def _ensure_pl_df(df) -> pl.DataFrame:
+    """Auto-convert pandas DataFrame to polars if needed (transition helper)."""
+    if isinstance(df, pl.DataFrame):
+        return df
+    import pandas as pd
+    if isinstance(df, pd.DataFrame):
+        return pl.from_pandas(df)
+    return df
+
+
 def engineer_features(
-    train: pd.DataFrame,
-    test: pd.DataFrame,
+    train,
+    test,
     feature_types: dict[str, list[str]],
     drop_cols: list[str] | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+) -> tuple:
     """Generate dynamic features. No hardcoded column names.
 
     Features added:
@@ -16,12 +27,14 @@ def engineer_features(
     2. Frequency encoding for high-cardinality categoricals (>10 unique)
     3. Ratio features between correlated numerical pairs
 
+    Accepts pandas or polars DataFrames. Returns the same type as the input.
     Returns (train_enriched, test_enriched, new_feature_names) with aligned columns.
     """
-    # Operate on caller's copies (Stage 3 already made mitigated copies)
-    # Only copy if we need to avoid mutating the original
-    train = train.copy(deep=False)
-    test = test.copy(deep=False)
+    import pandas as pd
+    _input_was_pandas = isinstance(train, pd.DataFrame)
+    train = _ensure_pl_df(train).clone()
+    test = _ensure_pl_df(test).clone()
+
     skip_cols = set(feature_types.get("id", []) + feature_types.get("target", []))
     if drop_cols:
         skip_cols.update(drop_cols)
@@ -34,19 +47,19 @@ def engineer_features(
     for col in train.columns:
         if col in skip_cols:
             continue
-        null_pct = train[col].isna().mean()
+        null_pct = train[col].null_count() / len(train)
         if null_pct > 0.01 and col in test.columns:
             fname = f"{col}_is_null"
             if fname in existing_cols:
                 continue
-            _null_train_parts[fname] = train[col].isna().astype(int)
-            _null_test_parts[fname] = test[col].isna().astype(int)
+            _null_train_parts[fname] = train[col].is_null().cast(pl.Int32)
+            _null_test_parts[fname] = test[col].is_null().cast(pl.Int32)
             new_features.append(fname)
             existing_cols.add(fname)
 
     if _null_train_parts:
-        train = pd.concat([train, pd.DataFrame(_null_train_parts, index=train.index)], axis=1)
-        test = pd.concat([test, pd.DataFrame(_null_test_parts, index=test.index)], axis=1)
+        train = train.hstack(pl.DataFrame(_null_train_parts))
+        test = test.hstack(pl.DataFrame(_null_test_parts))
         logger.info(f"Added {len(new_features)} missing indicator features")
 
     # 2. Frequency encoding for high-cardinality categoricals
@@ -56,20 +69,21 @@ def engineer_features(
     _freq_train_parts = {}
     _freq_test_parts = {}
     for col in cat_cols:
-        n_unique = train[col].nunique()
+        n_unique = train[col].n_unique()
         if n_unique > 10:
-            freq_map = train[col].value_counts(normalize=True).to_dict()
+            vc = train[col].value_counts()
+            freq_map = dict(zip(vc[col].to_list(), (vc["count"] / len(train)).to_list()))
             fname = f"{col}_freq"
             if fname in existing_cols:
                 continue
-            _freq_train_parts[fname] = train[col].map(freq_map).fillna(0.0)
-            _freq_test_parts[fname] = test[col].map(freq_map).fillna(0.0)
+            _freq_train_parts[fname] = train[col].replace_strict(freq_map, default=0.0, return_dtype=pl.Float64)
+            _freq_test_parts[fname] = test[col].replace_strict(freq_map, default=0.0, return_dtype=pl.Float64)
             freq_features.append(fname)
             existing_cols.add(fname)
 
     if _freq_train_parts:
-        train = pd.concat([train, pd.DataFrame(_freq_train_parts, index=train.index)], axis=1)
-        test = pd.concat([test, pd.DataFrame(_freq_test_parts, index=test.index)], axis=1)
+        train = train.hstack(pl.DataFrame(_freq_train_parts))
+        test = test.hstack(pl.DataFrame(_freq_test_parts))
         logger.info(f"Added {len(freq_features)} frequency encoding features: {freq_features}")
 
     # 3. Ratio features between correlated numerical pairs
@@ -81,20 +95,26 @@ def engineer_features(
         _MAX_CORR_COLS = 50
         corr_cols = num_cols
         if len(num_cols) > _MAX_CORR_COLS:
-            variances = train[num_cols].apply(pd.to_numeric, errors="coerce").var().sort_values(ascending=False)
-            corr_cols = variances.head(_MAX_CORR_COLS).index.tolist()
+            variances = {}
+            for c in num_cols:
+                v = to_numeric_coerce(train[c]).var()
+                variances[c] = v if v is not None else 0.0
+            corr_cols = sorted(variances, key=variances.get, reverse=True)[:_MAX_CORR_COLS]
             logger.info(f"Ratio features: using top {_MAX_CORR_COLS}/{len(num_cols)} cols by variance for correlation")
 
-        corr_train = train[corr_cols].apply(pd.to_numeric, errors="coerce")
+        # Build numeric data for correlation
+        corr_train = train.select([to_numeric_coerce(train[c]).alias(c) for c in corr_cols])
         if len(corr_train) > 100_000:
-            corr_train = corr_train.sample(n=100_000, random_state=42)
-        corr_matrix = corr_train.corr().abs()
+            corr_train = corr_train.sample(n=100_000, seed=42)
+        arr = corr_train.fill_null(0).to_numpy().T.astype(float)
+        corr_matrix = np.abs(np.corrcoef(arr))
+        col_idx = {c: i for i, c in enumerate(corr_cols)}
 
         pairs = []
         for i, col_a in enumerate(corr_cols):
             for col_b in corr_cols[i + 1:]:
-                c = corr_matrix.loc[col_a, col_b]
-                if pd.notna(c) and c > 0.3:
+                c = corr_matrix[col_idx[col_a], col_idx[col_b]]
+                if not np.isnan(c) and c > 0.3:
                     pairs.append((col_a, col_b, c))
 
         pairs.sort(key=lambda x: x[2], reverse=True)
@@ -104,22 +124,22 @@ def engineer_features(
             fname = f"{col_a}_div_{col_b}"
             if fname in existing_cols:
                 continue
-            a_train = pd.to_numeric(train[col_a], errors="coerce").fillna(0)
-            b_train = pd.to_numeric(train[col_b], errors="coerce").fillna(0)
-            a_test = pd.to_numeric(test[col_a], errors="coerce").fillna(0)
-            b_test = pd.to_numeric(test[col_b], errors="coerce").fillna(0)
-            _ratio_train_parts[fname] = a_train / (b_train + 1)
-            _ratio_test_parts[fname] = a_test / (b_test + 1)
+            a_train = to_numeric_coerce(train[col_a]).fill_null(0)
+            b_train = to_numeric_coerce(train[col_b]).fill_null(0)
+            a_test = to_numeric_coerce(test[col_a]).fill_null(0)
+            b_test = to_numeric_coerce(test[col_b]).fill_null(0)
+            _ratio_train_parts[fname] = (a_train / (b_train + 1)).alias(fname)
+            _ratio_test_parts[fname] = (a_test / (b_test + 1)).alias(fname)
             ratio_features.append(fname)
             existing_cols.add(fname)
 
         if _ratio_train_parts:
-            train = pd.concat([train, pd.DataFrame(_ratio_train_parts, index=train.index)], axis=1)
-            test = pd.concat([test, pd.DataFrame(_ratio_test_parts, index=test.index)], axis=1)
+            train = train.hstack(pl.DataFrame(list(_ratio_train_parts.values())))
+            test = test.hstack(pl.DataFrame(list(_ratio_test_parts.values())))
             logger.info(f"Added {len(ratio_features)} ratio features: {ratio_features}")
 
     # 4. Aggregation features: group-level stats (mean) per categorical
-    agg_cat_cols = [c for c in cat_cols if 3 <= train[c].nunique() <= 50]
+    agg_cat_cols = [c for c in cat_cols if 3 <= train[c].n_unique() <= 50]
     agg_num_cols = num_cols[:10]  # limit to avoid feature explosion
 
     agg_features = []
@@ -131,19 +151,34 @@ def engineer_features(
                 fname = f"{num_col}_mean_by_{cat_col}"
                 if fname in existing_cols:
                     continue
-                num_train = pd.to_numeric(train[num_col], errors="coerce")
-                group_means = num_train.groupby(train[cat_col]).transform("mean")
-                _agg_train_parts[fname] = group_means.fillna(num_train.mean())
+                num_series = to_numeric_coerce(train[num_col])
+                global_mean = num_series.mean()
+                if global_mean is None:
+                    global_mean = 0.0
 
-                # Map test using training group means
-                train_group_map = num_train.groupby(train[cat_col]).mean().to_dict()
-                _agg_test_parts[fname] = test[cat_col].map(train_group_map).fillna(num_train.mean())
+                # Train: window function for group mean
+                group_means = train.with_columns(
+                    num_series.alias("__num_tmp")
+                ).select(
+                    pl.col("__num_tmp").mean().over(cat_col)
+                ).to_series().fill_null(global_mean).alias(fname)
+                _agg_train_parts[fname] = group_means
+
+                # Test: map using training group means
+                agg = train.with_columns(
+                    num_series.alias(num_col)
+                ).group_by(cat_col).agg(pl.col(num_col).mean())
+                means_map = dict(zip(agg[cat_col].to_list(), agg[num_col].to_list()))
+                # Replace None values in means_map with global_mean
+                means_map = {k: (v if v is not None else global_mean) for k, v in means_map.items()}
+                test_mapped = test[cat_col].replace_strict(means_map, default=global_mean, return_dtype=pl.Float64).alias(fname)
+                _agg_test_parts[fname] = test_mapped
                 agg_features.append(fname)
                 existing_cols.add(fname)
 
     if _agg_train_parts:
-        train = pd.concat([train, pd.DataFrame(_agg_train_parts, index=train.index)], axis=1)
-        test = pd.concat([test, pd.DataFrame(_agg_test_parts, index=test.index)], axis=1)
+        train = train.hstack(pl.DataFrame(list(_agg_train_parts.values())))
+        test = test.hstack(pl.DataFrame(list(_agg_test_parts.values())))
         logger.info(f"Added {len(agg_features)} aggregation features")
 
     # Collect all new feature names
@@ -152,20 +187,29 @@ def engineer_features(
     # 5. Duplicate column detection: remove near-duplicate features (|corr| > 0.98)
     try:
         num_feature_cols = [c for c in train.columns if c not in skip_cols
-                           and c in test.columns and pd.api.types.is_numeric_dtype(train[c])]
+                           and c in test.columns and is_numeric_col(train[c])]
         # Cap columns for duplicate detection to avoid O(m^2) correlation matrix
         _MAX_DEDUP_COLS = 200
         if len(num_feature_cols) > _MAX_DEDUP_COLS:
             _orig_dedup = len(num_feature_cols)
-            _var_sample = train[num_feature_cols].sample(n=min(50_000, len(train)), random_state=42) if len(train) > 50_000 else train[num_feature_cols]
-            num_feature_cols = _var_sample.var().sort_values(ascending=False).head(_MAX_DEDUP_COLS).index.tolist()
+            _var_sample = train.select(num_feature_cols)
+            if len(train) > 50_000:
+                _var_sample = _var_sample.sample(n=50_000, seed=42)
+            # Compute variance per column and pick top ones
+            var_dict = {}
+            for c in num_feature_cols:
+                v = _var_sample[c].cast(pl.Float64, strict=False).var()
+                var_dict[c] = v if v is not None else 0.0
+            num_feature_cols = sorted(var_dict, key=var_dict.get, reverse=True)[:_MAX_DEDUP_COLS]
             logger.info(f"Duplicate detection: using top {_MAX_DEDUP_COLS}/{_orig_dedup} cols by variance")
         if len(num_feature_cols) >= 2:
             # Subsample rows for correlation on large datasets
-            corr_data = train[num_feature_cols]
+            corr_data = train.select(num_feature_cols)
             if len(corr_data) > 100_000:
-                corr_data = corr_data.sample(n=100_000, random_state=42)
-            corr = corr_data.corr().abs()
+                corr_data = corr_data.sample(n=100_000, seed=42)
+            arr = corr_data.fill_null(0).to_numpy().T.astype(float)
+            corr = np.abs(np.corrcoef(arr))
+            col_idx = {c: i for i, c in enumerate(num_feature_cols)}
             # Find pairs with correlation > 0.98
             drop_dupes = set()
             engineered_set = set(all_new_features)
@@ -175,7 +219,7 @@ def engineer_features(
                 for col_b in num_feature_cols[i + 1:]:
                     if col_b in drop_dupes:
                         continue
-                    if corr.loc[col_a, col_b] > 0.98:
+                    if corr[col_idx[col_a], col_idx[col_b]] > 0.98:
                         # Prefer dropping the engineered feature over original
                         if col_b in engineered_set and col_a not in engineered_set:
                             drop_dupes.add(col_b)
@@ -185,8 +229,8 @@ def engineer_features(
                             # Both engineered or both original — drop the second
                             drop_dupes.add(col_b)
             if drop_dupes:
-                train = train.drop(columns=[c for c in drop_dupes if c in train.columns])
-                test = test.drop(columns=[c for c in drop_dupes if c in test.columns])
+                train = train.drop([c for c in drop_dupes if c in train.columns])
+                test = test.drop([c for c in drop_dupes if c in test.columns])
                 all_new_features = [f for f in all_new_features if f not in drop_dupes]
                 logger.info(f"Dropped {len(drop_dupes)} near-duplicate features: {sorted(drop_dupes)}")
     except Exception as e:
@@ -194,10 +238,15 @@ def engineer_features(
 
     # Ensure train and test have identical columns
     common_cols = sorted(set(train.columns) & set(test.columns))
-    train = train[common_cols]
-    test = test[common_cols]
+    train = train.select(common_cols)
+    test = test.select(common_cols)
 
     # Filter to only new features that survived column alignment
     all_new_features = [f for f in all_new_features if f in common_cols]
+
+    # Return pandas if input was pandas (transition compatibility)
+    if _input_was_pandas:
+        train = train.to_pandas()
+        test = test.to_pandas()
 
     return train, test, all_new_features
