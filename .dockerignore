@@ -1,0 +1,14 @@
+__pycache__
+*.pyc
+*.joblib
+prediction*.csv
+stress_test_data/
+test_data/
+data/
+docs/
+challenge_images/
+information/
+.git
+.claude
+*.md
+!requirements.txt
