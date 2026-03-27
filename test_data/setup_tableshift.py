@@ -27,6 +27,7 @@ import urllib.request
 
 import numpy as np
 import pandas as pd
+import polars as pl
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -38,16 +39,19 @@ def _split_by_column(df, col, ood_val, sample_train=50000, sample_test=12500):
     if col not in df.columns:
         print(f"  Warning: '{col}' not found, using random 80/20 split")
         np.random.seed(42)
-        mask = np.random.rand(len(df)) < 0.8
-        train_df, test_df = df[mask], df[~mask]
+        n = len(df)
+        mask = np.random.rand(n) < 0.8
+        train_df = df.filter(pl.Series(mask))
+        test_df = df.filter(~pl.Series(mask))
     else:
-        unique_vals = sorted(df[col].dropna().unique())
-        if ood_val not in df[col].values:
+        unique_vals = df[col].drop_nulls().unique().sort().to_list()
+        col_values = df[col].to_list()
+        if ood_val not in col_values:
             # Try numeric coercion
             for cast in [float, int]:
                 try:
                     v = cast(ood_val)
-                    if v in df[col].values:
+                    if v in col_values:
                         ood_val = v
                         break
                 except (ValueError, TypeError):
@@ -55,21 +59,21 @@ def _split_by_column(df, col, ood_val, sample_train=50000, sample_test=12500):
             else:
                 ood_val = unique_vals[-1]
         print(f"  Split: {col} != {ood_val} (train) vs == {ood_val} (test)")
-        train_df = df[df[col] != ood_val]
-        test_df = df[df[col] == ood_val]
+        train_df = df.filter(pl.col(col) != ood_val)
+        test_df = df.filter(pl.col(col) == ood_val)
 
     if len(train_df) > sample_train:
-        train_df = train_df.sample(n=sample_train, random_state=42)
+        train_df = train_df.sample(n=sample_train, seed=42)
     if len(test_df) > sample_test:
-        test_df = test_df.sample(n=sample_test, random_state=42)
+        test_df = test_df.sample(n=sample_test, seed=42)
     return train_df, test_df
 
 
 def _save(train_df, test_df, out_dir, name):
     """Save train/test CSVs and print summary."""
     os.makedirs(out_dir, exist_ok=True)
-    train_df.to_csv(os.path.join(out_dir, "train.csv"), index=False)
-    test_df.to_csv(os.path.join(out_dir, "test.csv"), index=False)
+    train_df.write_csv(os.path.join(out_dir, "train.csv"))
+    test_df.write_csv(os.path.join(out_dir, "test.csv"))
     print(f"  [{name}] Saved: train={train_df.shape}, test={test_df.shape}")
     print(f"  Target rate: train={train_df['target'].mean():.3f}, test={test_df['target'].mean():.3f}")
 
@@ -101,17 +105,19 @@ def setup_acs_dataset(task_name, out_dir):
     print(f"\n[{task_name}] Downloading ACS data (2018, 1-year)...")
     acs_data = _get_acs_data()
 
-    features, label, group = task.df_to_pandas(acs_data)
-    df = features.copy()
+    features_pd, label_pd, group = task.df_to_pandas(acs_data)
+    df = pl.from_pandas(features_pd)
 
     # folktables already applies the target transform (returns bool)
-    df["target"] = label.astype(int)
+    df = df.with_columns(pl.Series("target", label_pd.astype(int).values))
 
     # Carry over ST (state) for splitting
     if "ST" not in df.columns and "ST" in acs_data.columns:
-        df["ST"] = acs_data["ST"].values[:len(df)]
+        st_values = acs_data["ST"].values[:len(df)]
+        df = df.with_columns(pl.Series("ST", st_values))
 
-    df.insert(0, "SampleID", [f"S{i:06d}" for i in range(len(df))])
+    sample_ids = pl.DataFrame({"SampleID": [f"S{i:06d}" for i in range(len(df))]})
+    df = pl.concat([sample_ids, df], how="horizontal")
 
     train_df, test_df = _split_by_column(df, "ST", ood_state)
     _save(train_df, test_df, out_dir, task_name)
@@ -126,30 +132,31 @@ def setup_acsfoodstamps(out_dir):
 
     # Person data
     ds_p = ACSDataSource(survey_year="2018", horizon="1-Year", survey="person")
-    person = ds_p.get_data(states=states, download=True)
+    person_pd = ds_p.get_data(states=states, download=True)
 
     # Household data (has FS and HUPAC columns)
     ds_h = ACSDataSource(survey_year="2018", horizon="1-Year", survey="household")
-    household = ds_h.get_data(states=states, download=True)
+    household_pd = ds_h.get_data(states=states, download=True)
 
     # Keep only needed household columns and merge on SERIALNO
     hh_cols = ["SERIALNO"]
     for c in ["FS", "HUPAC"]:
-        if c in household.columns:
+        if c in household_pd.columns:
             hh_cols.append(c)
-    hh_subset = household[hh_cols].drop_duplicates(subset=["SERIALNO"])
+    hh_subset = pl.from_pandas(household_pd[hh_cols]).unique(subset=["SERIALNO"])
 
-    df = person.merge(hh_subset, on="SERIALNO", how="left")
+    person = pl.from_pandas(person_pd)
+    df = person.join(hh_subset, on="SERIALNO", how="left")
 
     # Filter: working age, at least one child, low income (TableShift criteria)
-    df = df[(df["AGEP"] >= 18) & (df["AGEP"] < 62)]
+    df = df.filter((pl.col("AGEP") >= 18) & (pl.col("AGEP") < 62))
     if "HUPAC" in df.columns:
-        df = df[df["HUPAC"] >= 1]
+        df = df.filter(pl.col("HUPAC") >= 1)
     if "PINCP" in df.columns:
-        df = df[df["PINCP"] <= 30000]
+        df = df.filter(pl.col("PINCP") <= 30000)
 
     # Target: FS == 1 means receives food stamps
-    df["target"] = (df["FS"] == 1).astype(int)
+    df = df.with_columns((pl.col("FS") == 1).cast(pl.Int64).alias("target"))
 
     # Select features (subset of useful person-level + household features)
     feature_cols = [c for c in ["AGEP", "SCHL", "MAR", "SEX", "DIS", "ESP",
@@ -157,8 +164,9 @@ def setup_acsfoodstamps(out_dir):
                                 "DEYE", "DREM", "RAC1P", "RELP", "MIL",
                                 "PINCP", "WKHP", "JWMNP", "HUPAC", "ST"]
                     if c in df.columns]
-    out = df[feature_cols + ["target"]].copy()
-    out.insert(0, "SampleID", [f"F{i:06d}" for i in range(len(out))])
+    out = df.select(feature_cols + ["target"])
+    sample_ids = pl.DataFrame({"SampleID": [f"F{i:06d}" for i in range(len(out))]})
+    out = pl.concat([sample_ids, out], how="horizontal")
 
     train_df, test_df = _split_by_column(out, "ST", 12)
     _save(train_df, test_df, out_dir, "acsfoodstamps")
@@ -188,22 +196,32 @@ def setup_diabetes_readmission(out_dir):
         csv_name = csv_names[0]
         print(f"  Reading {csv_name}...")
         with z.open(csv_name) as f:
-            df = pd.read_csv(f)
+            df = pl.read_csv(f)
 
     print(f"  Raw shape: {df.shape}")
 
     if "readmitted" in df.columns:
-        df["target"] = (df["readmitted"] == "<30").astype(int)
-        df = df.drop(columns=["readmitted"])
+        df = df.with_columns(
+            (pl.col("readmitted") == "<30").cast(pl.Int64).alias("target")
+        )
+        df = df.drop(["readmitted"])
     else:
-        df.rename(columns={df.columns[-1]: "target"}, inplace=True)
+        last_col = df.columns[-1]
+        df = df.rename({last_col: "target"})
 
-    df = df.replace("?", np.nan)
+    # Replace "?" with null across all string columns
+    str_cols = [c for c in df.columns if df[c].dtype == pl.Utf8]
+    if str_cols:
+        df = df.with_columns([
+            pl.when(pl.col(c) == "?").then(None).otherwise(pl.col(c)).alias(c)
+            for c in str_cols
+        ])
 
     if "encounter_id" in df.columns:
-        df = df.rename(columns={"encounter_id": "SampleID"})
+        df = df.rename({"encounter_id": "SampleID"})
     else:
-        df.insert(0, "SampleID", [f"D{i:06d}" for i in range(len(df))])
+        sample_ids = pl.DataFrame({"SampleID": [f"D{i:06d}" for i in range(len(df))]})
+        df = pl.concat([sample_ids, df], how="horizontal")
 
     train_df, test_df = _split_by_column(df, "admission_source_id", 7,
                                          sample_train=60000, sample_test=15000)
@@ -269,8 +287,9 @@ def setup_college_scorecard(out_dir):
         print("  No data from API, skipping")
         return
 
-    # Flatten nested JSON
-    df = pd.json_normalize(all_rows)
+    # Flatten nested JSON — no polars equivalent, use pandas then convert
+    df_pandas = pd.json_normalize(all_rows)
+    df = pl.from_pandas(df_pandas)
     print(f"  Raw shape: {df.shape}")
 
     # Target: completion rate, binarized at median
@@ -279,11 +298,13 @@ def setup_college_scorecard(out_dir):
         print("  Warning: completion rate not found, skipping")
         return
 
-    df[comp_col] = pd.to_numeric(df[comp_col], errors="coerce")
-    df = df.dropna(subset=[comp_col])
+    df = df.with_columns(pl.col(comp_col).cast(pl.Float64, strict=False))
+    df = df.drop_nulls(subset=[comp_col])
     median_rate = df[comp_col].median()
-    df["target"] = (df[comp_col] < median_rate).astype(int)
-    df = df.drop(columns=[comp_col])
+    df = df.with_columns(
+        (pl.col(comp_col) < median_rate).cast(pl.Int64).alias("target")
+    )
+    df = df.drop([comp_col])
 
     # Rename columns to shorter names
     rename_map = {
@@ -310,16 +331,19 @@ def setup_college_scorecard(out_dir):
         "school.online_only": "DISTANCEONLY",
         "school.minority_serving.historically_black": "HBCU",
     }
-    out = df.rename(columns=rename_map)
+    # Only rename columns that exist in df
+    existing_renames = {k: v for k, v in rename_map.items() if k in df.columns}
+    out = df.rename(existing_renames)
 
     # Keep only renamed columns + target
     keep = [v for v in rename_map.values() if v in out.columns] + ["target"]
-    out = out[[c for c in keep if c in out.columns]].copy()
+    keep = [c for c in keep if c in out.columns]
+    out = out.select(keep)
 
     # Convert numeric columns
     for c in out.columns:
         if c not in ["SampleID", "target"]:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
+            out = out.with_columns(pl.col(c).cast(pl.Float64, strict=False))
 
     # Split: CONTROL == 3 (for-profit) as OOD
     train_df, test_df = _split_by_column(out, "CONTROL", 3,
@@ -362,8 +386,10 @@ def _download_brfss_year(year):
         with z.open(xpt_name) as f:
             xpt_data = f.read()
 
-    df = pd.read_sas(io.BytesIO(xpt_data), format="xport")
-    df["IYEAR"] = year
+    # pd.read_sas has no polars equivalent — read with pandas, then convert
+    df_pandas = pd.read_sas(io.BytesIO(xpt_data), format="xport")
+    df_pandas["IYEAR"] = year
+    df = pl.from_pandas(df_pandas)
     return df
 
 
@@ -383,7 +409,7 @@ def setup_brfss(task, out_dir):
         print("  Failed to download BRFSS data, skipping")
         return
 
-    df = pd.concat(dfs, ignore_index=True)
+    df = pl.concat(dfs)
     print(f"  Raw shape: {df.shape}")
 
     # Shared features across BRFSS tasks
@@ -408,9 +434,10 @@ def setup_brfss(task, out_dir):
                           'TOLDHI3', '_CHOLCH2', '_RFCHOL3', 'HAVARTH4',
                           'RENTEFLO', 'ASTHMA3']
         # Binarize: 1 = diagnosed diabetes, 0 = no diabetes
-        df["target"] = df[target_col].copy()
-        df["target"] = df["target"].replace({2: 0, 3: 0, 4: 0})
-        df = df[df["target"].isin([0, 1])]
+        df = df.with_columns(
+            pl.col(target_col).replace({2: 0, 3: 0, 4: 0}).alias("target")
+        )
+        df = df.filter(pl.col("target").is_in([0, 1]))
 
     elif task == "blood_pressure":
         target_col = None
@@ -426,13 +453,14 @@ def setup_brfss(task, out_dir):
                           'TOLDHI3', '_CHOLCH2', 'HAVARTH4', 'ASTHMA3']
         # BPHIGH6: 1=Yes, 2=Yes (pregnancy), 3=No, 4=Borderline
         # Binarize: 1,2 -> 1 (high BP), 3 -> 0 (no), drop 4,7,9
-        df["target"] = df[target_col].copy()
-        df["target"] = df["target"].replace({1: 1, 2: 1, 3: 0})
-        df = df[df["target"].isin([0, 1])]
+        df = df.with_columns(
+            pl.col(target_col).replace({1: 1, 2: 1, 3: 0}).alias("target")
+        )
+        df = df.filter(pl.col("target").is_in([0, 1]))
 
         # Filter to age 50+ (highest risk group, per TableShift)
         if "_AGEG5YR" in df.columns:
-            df = df[df["_AGEG5YR"] >= 7]
+            df = df.filter(pl.col("_AGEG5YR") >= 7)
     else:
         print(f"  Unknown BRFSS task: {task}")
         return
@@ -440,8 +468,9 @@ def setup_brfss(task, out_dir):
     # Select available features
     all_features = shared_features + extra_features
     available = [c for c in all_features if c in df.columns]
-    out = df[available + ["target"]].copy()
-    out.insert(0, "SampleID", [f"B{i:06d}" for i in range(len(out))])
+    out = df.select(available + ["target"])
+    sample_ids = pl.DataFrame({"SampleID": [f"B{i:06d}" for i in range(len(out))]})
+    out = pl.concat([sample_ids, out], how="horizontal")
 
     # Split by state (_STATE): OOD = 6 (California)
     train_df, test_df = _split_by_column(out, "_STATE", 6.0,
@@ -468,12 +497,13 @@ def setup_nhanes_lead(out_dir):
         url = f"https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/{year}/DataFiles/{filename}"
         r = _req.get(url, timeout=60)
         if r.status_code == 200 and r.content[:6] == b"HEADER":
-            return pd.read_sas(io.BytesIO(r.content), format="xport")
+            # pd.read_sas has no polars equivalent
+            return pl.from_pandas(pd.read_sas(io.BytesIO(r.content), format="xport"))
         # Fallback URL
         url2 = f"https://wwwn.cdc.gov/Nchs/Nhanes/{cycle}/{filename}"
         r2 = _req.get(url2, timeout=60)
         if r2.status_code == 200 and r2.content[:6] == b"HEADER":
-            return pd.read_sas(io.BytesIO(r2.content), format="xport")
+            return pl.from_pandas(pd.read_sas(io.BytesIO(r2.content), format="xport"))
         raise ValueError(f"Could not download {filename} for {cycle}")
 
     dfs = []
@@ -483,8 +513,8 @@ def setup_nhanes_lead(out_dir):
             demo = _fetch_xpt(year, cycle, demo_file)
             lab = _fetch_xpt(year, cycle, lab_file)
 
-            merged = demo.merge(lab, on="SEQN", how="inner")
-            merged["CYCLE"] = cycle
+            merged = demo.join(lab, on="SEQN", how="inner")
+            merged = merged.with_columns(pl.lit(cycle).alias("CYCLE"))
             dfs.append(merged)
             print(f"    {cycle}: {merged.shape}")
         except Exception as e:
@@ -494,7 +524,7 @@ def setup_nhanes_lead(out_dir):
         print("  Failed to download NHANES data, skipping")
         return
 
-    df = pd.concat(dfs, ignore_index=True)
+    df = pl.concat(dfs)
     print(f"  Combined shape: {df.shape}")
 
     # Target: blood lead level >= 3.5 µg/dL (CDC reference value)
@@ -507,9 +537,11 @@ def setup_nhanes_lead(out_dir):
         print("  Warning: lead column not found, skipping")
         return
 
-    df[lead_col] = pd.to_numeric(df[lead_col], errors="coerce")
-    df = df.dropna(subset=[lead_col])
-    df["target"] = (df[lead_col] >= 3.5).astype(int)
+    df = df.with_columns(pl.col(lead_col).cast(pl.Float64, strict=False))
+    df = df.drop_nulls(subset=[lead_col])
+    df = df.with_columns(
+        (pl.col(lead_col) >= 3.5).cast(pl.Int64).alias("target")
+    )
 
     # Select features
     feature_candidates = ["RIDAGEYR", "RIAGENDR", "RIDRETH3", "RIDRETH1",
@@ -517,8 +549,9 @@ def setup_nhanes_lead(out_dir):
                           "RIDEXPRG", "DMDBORN4", "DMDCITZN",
                           "WTMEC2YR", "SDMVSTRA"]
     features = [c for c in feature_candidates if c in df.columns]
-    out = df[features + ["target"]].copy()
-    out.insert(0, "SampleID", [f"N{i:06d}" for i in range(len(out))])
+    out = df.select(features + ["target"])
+    sample_ids = pl.DataFrame({"SampleID": [f"N{i:06d}" for i in range(len(out))]})
+    out = pl.concat([sample_ids, out], how="horizontal")
 
     # Split by ethnicity (RIDRETH3 or RIDRETH1): OOD = 4 (Non-Hispanic Asian)
     split_col = "RIDRETH3" if "RIDRETH3" in out.columns else "RIDRETH1"

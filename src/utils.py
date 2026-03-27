@@ -2,7 +2,7 @@ import time
 import logging
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,23 +23,33 @@ _TEMPORAL_FORMATS = [
 ]
 
 
-def _parse_month_labels(series: pd.Series) -> pd.Series | None:
+def _parse_month_labels(series: pl.Series) -> pl.Series | None:
     """Parse a temporal series into month-period strings for stratification.
 
     Returns a Series of month labels (e.g. '2025-01') or None if parsing fails.
     """
-    raw = series.astype(str).str.title()
+    raw = series.cast(pl.Utf8).str.to_titlecase()
     for fmt in _TEMPORAL_FORMATS:
-        parsed = pd.to_datetime(raw, format=fmt, errors="coerce")
-        if parsed.notna().sum() > len(series) * 0.5:
-            return parsed.dt.to_period("M").astype(str)
+        parsed = raw.str.to_datetime(fmt, strict=False)
+        if parsed.is_not_null().sum() > len(series) * 0.5:
+            return parsed.dt.strftime("%Y-%m")
     return None
+
+
+def _is_null_scalar(x) -> bool:
+    """Check if a scalar value is null (None or NaN)."""
+    if x is None:
+        return True
+    try:
+        return np.isnan(x)
+    except (TypeError, ValueError):
+        return False
 
 
 def stratified_subsample_idx(
     n_total: int,
     n_sample: int,
-    month_values: pd.Series | np.ndarray | None = None,
+    month_values: pl.Series | np.ndarray | None = None,
     seed: int = 42,
 ) -> np.ndarray:
     """Return indices for a month-stratified subsample.
@@ -56,14 +66,14 @@ def stratified_subsample_idx(
     if month_values is None:
         return rng.choice(n_total, size=n_sample, replace=False)
 
-    if isinstance(month_values, pd.Series):
-        groups = month_values.values
+    if isinstance(month_values, pl.Series):
+        groups = month_values.to_numpy(allow_copy=True)
     else:
         groups = np.asarray(month_values)
 
     # If all null / single group, fall back to random
-    unique_groups = pd.unique(groups)
-    valid = unique_groups[pd.notna(unique_groups)]
+    unique_groups = np.unique(groups)
+    valid = np.array([g for g in unique_groups if not _is_null_scalar(g)])
     if len(valid) <= 1:
         return rng.choice(n_total, size=n_sample, replace=False)
 
@@ -74,7 +84,7 @@ def stratified_subsample_idx(
         group_indices[g] = np.where(groups == g)[0]
 
     # Handle NaN group (rows that didn't parse)
-    nan_mask = pd.isna(groups)
+    nan_mask = np.array([_is_null_scalar(g) for g in groups])
     if nan_mask.any():
         group_indices["_nan_"] = np.where(nan_mask)[0]
         valid = np.append(valid, "_nan_")

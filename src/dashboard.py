@@ -70,14 +70,31 @@ test_path = st.sidebar.text_input("Test CSV path", value=default_test)
 
 
 # ── Data loading (cached) ────────────────────────────────────────────────
+def _to_pd(obj):
+    """Convert polars DataFrame/Series to pandas for dashboard use."""
+    import polars as pl
+    if isinstance(obj, pl.DataFrame):
+        return obj.to_pandas()
+    if isinstance(obj, pl.Series):
+        return obj.to_pandas()
+    return obj
+
+
 @st.cache_data
 def load_all_data(train_path: str, test_path: str):
-    train, test = load_data(train_path, test_path)
-    feature_types = detect_feature_types(train)
-    drift_df = run_drift_analysis(train, test, feature_types)
-    train_m, test_m, drop_cols, mitigation_log, norm_log = apply_all_mitigations(
-        train, test, drift_df, feature_types
+    train_pl, test_pl = load_data(train_path, test_path)
+    feature_types = detect_feature_types(train_pl)
+    drift_df_pl = run_drift_analysis(train_pl, test_pl, feature_types)
+    train_m_pl, test_m_pl, drop_cols, mitigation_log, norm_log, _shift_info = apply_all_mitigations(
+        train_pl, test_pl, drift_df_pl, feature_types
     )
+
+    # Convert polars → pandas for dashboard visualization
+    train = _to_pd(train_pl)
+    test = _to_pd(test_pl)
+    drift_df = _to_pd(drift_df_pl)
+    train_m = _to_pd(train_m_pl)
+    test_m = _to_pd(test_m_pl)
 
     # Model metrics (if model files exist)
     baseline_metrics, mitigated_metrics = {}, {}
@@ -101,14 +118,14 @@ def load_all_data(train_path: str, test_path: str):
                 baseline_metrics["test_auprc"] = average_precision_score(y_test, test_proba_b)
 
         if os.path.exists("model_mitigated.joblib"):
-            model_m = joblib.load("model_mitigated.joblib")
+            model_m_model = joblib.load("model_mitigated.joblib")
             X_train_m, y_train_m, X_test_m, _ = prepare_features(
                 train_m, test_m, feature_types, extra_drop_cols=drop_cols
             )
-            train_proba_m = model_m.predict_proba(X_train_m)[:, 1]
+            train_proba_m = model_m_model.predict_proba(X_train_m)[:, 1]
             mitigated_metrics["train_auprc"] = average_precision_score(y_train_m, train_proba_m)
             if target_col in test_m.columns and test_m[target_col].notna().any():
-                test_proba_m = model_m.predict_proba(X_test_m)[:, 1]
+                test_proba_m = model_m_model.predict_proba(X_test_m)[:, 1]
                 y_test_m = (test_m[target_col] == "Yes").astype(int)
                 mitigated_metrics["test_auprc"] = average_precision_score(y_test_m, test_proba_m)
 

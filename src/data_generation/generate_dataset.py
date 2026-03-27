@@ -16,14 +16,14 @@ Writes output in chunks to avoid memory issues.
 Supports both CSV and Parquet output.
 
 Usage:
-    pip install numpy pandas pyarrow
+    pip install numpy polars pyarrow
     python generate_dataset.py
 
 Adjust TOTAL_ROWS, OUTPUT_FORMAT, and OUTPUT_PATH below as needed.
 """
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import uuid
 import time
 import os
@@ -227,8 +227,10 @@ def build_feature_specs():
 
     for i in range(20):
         name = f"time_datetime_{feat_id}"
-        specs.append((name, lambda rng, n: pd.to_datetime(
-            rng.integers(BASE_TS, BASE_TS + RANGE_TS, n), unit="s"
+        specs.append((name, lambda rng, n: (
+            (np.datetime64('1970-01-01')
+             + rng.integers(BASE_TS, BASE_TS + RANGE_TS, n).astype('timedelta64[s]'))
+            .astype('datetime64[ms]')
         )))
         feat_id += 1
 
@@ -298,7 +300,7 @@ def generate_chunk(specs, rng, chunk_size):
     data = {}
     for col_name, gen_func in specs:
         data[col_name] = gen_func(rng, chunk_size)
-    return pd.DataFrame(data)
+    return pl.DataFrame(data, nan_to_null=True)
 
 
 def main():
@@ -316,7 +318,7 @@ def main():
     rows_written = 0
 
     if OUTPUT_FORMAT == "csv":
-        # Write header first, then append chunks
+        # Write header with first chunk, then append subsequent chunks without header
         header_written = False
         for chunk_idx in range(NUM_CHUNKS):
             remaining = TOTAL_ROWS - rows_written
@@ -325,12 +327,8 @@ def main():
                 break
 
             df = generate_chunk(specs, rng, this_chunk)
-            df.to_csv(
-                OUTPUT_PATH,
-                mode="a" if header_written else "w",
-                header=not header_written,
-                index=False,
-            )
+            with open(OUTPUT_PATH, "wb" if not header_written else "ab") as f:
+                df.write_csv(f, include_header=not header_written)
             header_written = True
             rows_written += this_chunk
 
@@ -343,7 +341,6 @@ def main():
                   f"{rate:,.0f} rows/s  |  ETA: {eta/60:.1f} min")
 
     elif OUTPUT_FORMAT == "parquet":
-        import pyarrow as pa
         import pyarrow.parquet as pq
 
         writer = None
@@ -354,7 +351,7 @@ def main():
                 break
 
             df = generate_chunk(specs, rng, this_chunk)
-            table = pa.Table.from_pandas(df, preserve_index=False)
+            table = df.to_arrow()
 
             if writer is None:
                 writer = pq.ParquetWriter(OUTPUT_PATH, table.schema, compression="snappy")

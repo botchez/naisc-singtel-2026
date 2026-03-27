@@ -1,59 +1,55 @@
-import pandas as pd
+import polars as pl
 import numpy as np
 from utils import logger
+from polars_compat import is_numeric_col, to_numeric_coerce
 
 
-def _downcast_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+def _downcast_dataframe(df: pl.DataFrame) -> pl.DataFrame:
     """Downcast numeric columns to reduce memory usage.
 
     float64 -> float32, int64 -> int32/int16/int8 where safe.
     Essential for handling 10M+ row datasets within memory limits.
     """
+    cast_exprs = []
     for col in df.columns:
         col_dtype = df[col].dtype
-        if col_dtype == np.float64:
-            df[col] = df[col].astype(np.float32)
-        elif col_dtype == np.int64:
+        if col_dtype == pl.Float64:
+            cast_exprs.append(pl.col(col).cast(pl.Float32))
+        elif col_dtype == pl.Int64:
             col_min = df[col].min()
             col_max = df[col].max()
-            if col_min >= np.iinfo(np.int8).min and col_max <= np.iinfo(np.int8).max:
-                df[col] = df[col].astype(np.int8)
-            elif col_min >= np.iinfo(np.int16).min and col_max <= np.iinfo(np.int16).max:
-                df[col] = df[col].astype(np.int16)
-            elif col_min >= np.iinfo(np.int32).min and col_max <= np.iinfo(np.int32).max:
-                df[col] = df[col].astype(np.int32)
+            if col_min is not None and col_max is not None:
+                if col_min >= np.iinfo(np.int8).min and col_max <= np.iinfo(np.int8).max:
+                    cast_exprs.append(pl.col(col).cast(pl.Int8))
+                elif col_min >= np.iinfo(np.int16).min and col_max <= np.iinfo(np.int16).max:
+                    cast_exprs.append(pl.col(col).cast(pl.Int16))
+                elif col_min >= np.iinfo(np.int32).min and col_max <= np.iinfo(np.int32).max:
+                    cast_exprs.append(pl.col(col).cast(pl.Int32))
+    if cast_exprs:
+        df = df.with_columns(cast_exprs)
     return df
 
 
-def load_data(train_path: str, test_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_data(train_path: str, test_path: str) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Load train and test CSVs with memory optimization.
 
     Applies dtype downcasting to reduce memory footprint for large datasets
-    (e.g., 10M rows × 500 features).
+    (e.g., 10M rows x 500 features).
     """
-    train = pd.read_csv(train_path, low_memory=False)
-    test = pd.read_csv(test_path, low_memory=False)
+    train = pl.read_csv(train_path, infer_schema_length=10000)
+    test = pl.read_csv(test_path, infer_schema_length=10000)
 
-    # Handle duplicate column names (suffix with _dup1, _dup2, etc.)
-    for df, label in [(train, "train"), (test, "test")]:
-        dupes = df.columns[df.columns.duplicated()]
-        if len(dupes) > 0:
-            new_cols = []
-            seen = {}
-            for c in df.columns:
-                if c in seen:
-                    seen[c] += 1
-                    new_cols.append(f"{c}_dup{seen[c]}")
-                else:
-                    seen[c] = 0
-                    new_cols.append(c)
-            df.columns = new_cols
-            logger.warning(f"Renamed {len(dupes)} duplicate columns in {label}")
+    # Polars rejects duplicate column names on read, but handle edge cases
+    # where columns were auto-renamed with _duplicated_N suffix
+    for df_ref, label in [(train, "train"), (test, "test")]:
+        dup_cols = [c for c in df_ref.columns if "_duplicated_" in c]
+        if dup_cols:
+            logger.warning(f"Found {len(dup_cols)} auto-renamed duplicate columns in {label}: {dup_cols}")
 
-    mem_before = (train.memory_usage(deep=True).sum() + test.memory_usage(deep=True).sum()) / 1e6
+    mem_before = (train.estimated_size() + test.estimated_size()) / 1e6
     train = _downcast_dataframe(train)
     test = _downcast_dataframe(test)
-    mem_after = (train.memory_usage(deep=True).sum() + test.memory_usage(deep=True).sum()) / 1e6
+    mem_after = (train.estimated_size() + test.estimated_size()) / 1e6
 
     logger.info(f"Loaded train: {train.shape}, test: {test.shape} "
                 f"(memory: {mem_before:.1f}MB -> {mem_after:.1f}MB)")
@@ -67,9 +63,9 @@ def _normalize_col_name(name: str) -> str:
 
 
 def align_train_test_columns(
-    train: pd.DataFrame,
-    test: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    train: pl.DataFrame,
+    test: pl.DataFrame,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Align columns between train and test using fuzzy name matching.
 
     Renames test columns to match train column names when normalized forms match.
@@ -90,7 +86,7 @@ def align_train_test_columns(
             if norm in train_norm:
                 rename_map[test_col] = train_norm[norm]
 
-    test_aligned = test.rename(columns=rename_map) if rename_map else test
+    test_aligned = test.rename(rename_map) if rename_map else test
 
     if rename_map:
         logger.info(f"Fuzzy-matched columns (test->train): {rename_map}")
@@ -109,11 +105,11 @@ def align_train_test_columns(
 
 
 def detect_feature_types(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     id_col: str = "CustomerID",
     target_col: str = "ChurnStatus",
     temporal_col: str = "Month",
-    test_df: pd.DataFrame | None = None,
+    test_df: pl.DataFrame | None = None,
 ) -> dict[str, list[str]]:
     """Detect feature types. Columns id_col/target_col/temporal_col are
     matched by exact name. When test_df is provided, only classifies
@@ -158,7 +154,7 @@ def detect_feature_types(
     # Subsample for expensive per-column stats on large datasets
     _PROFILE_SAMPLE_SIZE = 100_000
     if len(df) > _PROFILE_SAMPLE_SIZE:
-        df_sample = df.sample(n=_PROFILE_SAMPLE_SIZE, random_state=42)
+        df_sample = df.sample(n=_PROFILE_SAMPLE_SIZE, seed=42)
         logger.info(f"Feature type detection: using {_PROFILE_SAMPLE_SIZE}/{len(df)} row sample")
     else:
         df_sample = df
@@ -175,18 +171,19 @@ def detect_feature_types(
             continue
 
         # Skip all-null columns
-        if df_sample[col].isna().all():
+        if df_sample[col].is_null().all():
             logger.warning(f"Skipping all-null column: '{col}'")
             continue
 
         # Skip zero-variance columns (only 1 unique non-null value)
-        if df_sample[col].nunique() <= 1:
+        if df_sample[col].n_unique() <= 1:
             logger.warning(f"Skipping zero-variance column: '{col}'")
             continue
 
-        # Skip near-zero-variance columns (>99% same value) — non-informative
+        # Skip near-zero-variance columns (>99% same value) -- non-informative
         try:
-            top_freq = df_sample[col].value_counts(normalize=True).iloc[0]
+            vc = df_sample[col].value_counts().sort("count", descending=True)
+            top_freq = vc["count"][0] / len(df_sample)
             if top_freq > 0.99:
                 logger.warning(f"Skipping near-zero-variance column: '{col}' ({top_freq:.1%} dominant)")
                 continue
@@ -200,12 +197,12 @@ def detect_feature_types(
 
         # Numeric coercion: if a non-numeric column is mostly parseable as numbers,
         # treat it as numerical (e.g., TotalCharges with a few blank strings)
-        if not pd.api.types.is_numeric_dtype(df_sample[col]) and _looks_numeric(df_sample[col]):
+        if not is_numeric_col(df_sample[col]) and _looks_numeric(df_sample[col]):
             logger.info(f"Coercing '{col}' to numeric (mostly numeric values with unparseable entries)")
             types["numerical"].append(col)
             continue
 
-        if pd.api.types.is_numeric_dtype(df_sample[col]):
+        if is_numeric_col(df_sample[col]):
             types["numerical"].append(col)
         else:
             types["categorical"].append(col)
@@ -213,41 +210,42 @@ def detect_feature_types(
     return types
 
 
-def _looks_numeric(series: pd.Series, threshold: float = 0.8) -> bool:
+def _looks_numeric(series: pl.Series, threshold: float = 0.8) -> bool:
     """Heuristic: check if a non-numeric column is mostly parseable as numbers."""
     if len(series) > 100_000:
-        series = series.sample(n=100_000, random_state=42)
-    coerced = pd.to_numeric(series, errors="coerce")
-    parse_rate = coerced.notna().sum() / max(len(series), 1)
+        series = series.sample(n=100_000, seed=42)
+    coerced = to_numeric_coerce(series)
+    parse_rate = coerced.is_not_null().sum() / max(len(series), 1)
     return parse_rate >= threshold
 
 
 
 
 def profile_data(
-    df: pd.DataFrame, feature_types: dict[str, list[str]], label: str = "dataset"
-) -> pd.DataFrame:
+    df: pl.DataFrame, feature_types: dict[str, list[str]], label: str = "dataset"
+) -> pl.DataFrame:
     """Generate and print a profiling summary for the dataset."""
     _PROFILE_SAMPLE_SIZE = 100_000
-    df_prof = df.sample(n=_PROFILE_SAMPLE_SIZE, random_state=42) if len(df) > _PROFILE_SAMPLE_SIZE else df
+    df_prof = df.sample(n=_PROFILE_SAMPLE_SIZE, seed=42) if len(df) > _PROFILE_SAMPLE_SIZE else df
     rows = []
     df_cols = set(df.columns)
     for category, cols in feature_types.items():
         for col in cols:
             if col not in df_cols:
                 continue
-            sample_val = df[col].dropna().iloc[0] if df[col].notna().any() else None
+            non_null = df[col].drop_nulls()
+            sample_val = non_null[0] if len(non_null) > 0 else None
             rows.append(
                 {
                     "column": col,
                     "type": category,
                     "dtype": str(df[col].dtype),
-                    "n_unique": df_prof[col].nunique(),
-                    "null_pct": df_prof[col].isna().mean() * 100,
+                    "n_unique": df_prof[col].n_unique(),
+                    "null_pct": df_prof[col].null_count() / len(df_prof) * 100,
                     "sample_value": sample_val,
                 }
             )
-    profile = pd.DataFrame(rows)
+    profile = pl.DataFrame(rows)
 
     # Print table
     col_w = max(max((len(r["column"]) for r in rows), default=6), 6)

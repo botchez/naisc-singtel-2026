@@ -14,7 +14,8 @@ import os
 import sys
 import time
 import numpy as np
-import pandas as pd
+import polars as pl
+import polars.selectors as cs
 
 PRESETS = {
     "small": {"rows": 200_000, "extra_cols": 50},
@@ -47,7 +48,7 @@ def generate_extra_numerical(n_rows, n_cols, rng):
         else:
             # Integer-like
             data[col_name] = rng.integers(0, 50, n_rows)
-    return pd.DataFrame(data)
+    return pl.DataFrame(data)
 
 
 def generate_extra_categorical(n_rows, n_cols, rng):
@@ -58,7 +59,7 @@ def generate_extra_categorical(n_rows, n_cols, rng):
         card = rng.choice([3, 5, 10, 20, 50])  # varied cardinality
         categories = [f"cat_{j}" for j in range(card)]
         data[col_name] = rng.choice(categories, n_rows)
-    return pd.DataFrame(data)
+    return pl.DataFrame(data)
 
 
 def upscale_dataframe(df, target_rows, rng):
@@ -67,25 +68,29 @@ def upscale_dataframe(df, target_rows, rng):
 
     # Sample with replacement to reach target size
     indices = rng.integers(0, len(df), target_rows)
-    upscaled = df.iloc[indices].reset_index(drop=True)
+    upscaled = df[indices]
 
     # Add jitter to numerical columns to avoid exact duplicates
-    num_cols = upscaled.select_dtypes(include=[np.number]).columns
+    num_cols = upscaled.select(cs.numeric()).columns
     for col in num_cols:
         std = upscaled[col].std()
-        if std > 0 and not np.isnan(std):
-            noise = rng.normal(0, std * 0.05, target_rows)  # 5% noise
-            upscaled[col] = upscaled[col] + noise
+        if std is not None and std > 0 and not np.isnan(std):
+            noise = rng.normal(0, std * 0.05, target_rows)
+            upscaled = upscaled.with_columns(
+                (pl.col(col) + pl.Series(values=noise)).alias(col)
+            )
 
     # Regenerate unique CustomerIDs
-    upscaled["CustomerID"] = [f"stress_{i:08x}" for i in range(target_rows)]
+    upscaled = upscaled.with_columns(
+        pl.Series("CustomerID", [f"stress_{i:08x}" for i in range(target_rows)])
+    )
 
     return upscaled
 
 
 def inject_drift(df_test, drift_fraction=0.3, rng=None):
     """Inject synthetic drift into test set to make it realistic."""
-    num_cols = df_test.select_dtypes(include=[np.number]).columns.tolist()
+    num_cols = df_test.select(cs.numeric()).columns
 
     # Shift a fraction of numerical features
     n_drift = max(1, int(len(num_cols) * drift_fraction))
@@ -95,16 +100,24 @@ def inject_drift(df_test, drift_fraction=0.3, rng=None):
         shift_type = rng.choice(["mean_shift", "variance_change", "skew"])
         if shift_type == "mean_shift":
             std = df_test[col].std()
-            if std > 0 and not np.isnan(std):
-                df_test[col] = df_test[col] + std * rng.uniform(0.5, 2.0)
+            if std is not None and std > 0 and not np.isnan(std):
+                shift = std * rng.uniform(0.5, 2.0)
+                df_test = df_test.with_columns(
+                    (pl.col(col) + shift).alias(col)
+                )
         elif shift_type == "variance_change":
             mean = df_test[col].mean()
-            df_test[col] = mean + (df_test[col] - mean) * rng.uniform(1.5, 3.0)
+            scale = rng.uniform(1.5, 3.0)
+            df_test = df_test.with_columns(
+                (mean + (pl.col(col) - mean) * scale).alias(col)
+            )
         else:  # skew
-            df_test[col] = np.abs(df_test[col])
+            df_test = df_test.with_columns(
+                pl.col(col).abs().alias(col)
+            )
 
     # Shift some categorical features
-    cat_cols = df_test.select_dtypes(include=["object"]).columns.tolist()
+    cat_cols = df_test.select(cs.string()).columns
     cat_cols = [c for c in cat_cols if c not in ("CustomerID", "Month")]
     n_cat_drift = max(1, int(len(cat_cols) * 0.2))
     if cat_cols:
@@ -112,7 +125,12 @@ def inject_drift(df_test, drift_fraction=0.3, rng=None):
         for col in drift_cat_cols:
             # Introduce a new category for some rows
             mask = rng.random(len(df_test)) < 0.15
-            df_test.loc[mask, col] = "new_category"
+            df_test = df_test.with_columns(
+                pl.when(pl.Series(values=mask))
+                .then(pl.lit("new_category"))
+                .otherwise(pl.col(col))
+                .alias(col)
+            )
 
     return df_test
 
@@ -157,8 +175,8 @@ def main():
     # Load public data
     print("Loading public data...")
     src_dir = os.path.join(os.path.dirname(__file__), "..", "public_data")
-    train_src = pd.read_csv(os.path.join(src_dir, "train.csv"))
-    test_src = pd.read_csv(os.path.join(src_dir, "test.csv"))
+    train_src = pl.read_csv(os.path.join(src_dir, "train.csv"))
+    test_src = pl.read_csv(os.path.join(src_dir, "test.csv"))
     print(f"  Source train: {train_src.shape}, test: {test_src.shape}")
 
     # Upscale
@@ -180,11 +198,11 @@ def main():
     t0 = time.time()
     train_extra_num = generate_extra_numerical(target_rows, n_extra_num, rng)
     train_extra_cat = generate_extra_categorical(target_rows, n_extra_cat, rng)
-    train_up = pd.concat([train_up, train_extra_num, train_extra_cat], axis=1)
+    train_up = pl.concat([train_up, train_extra_num, train_extra_cat], how="horizontal")
 
     test_extra_num = generate_extra_numerical(test_rows, n_extra_num, rng)
     test_extra_cat = generate_extra_categorical(test_rows, n_extra_cat, rng)
-    test_up = pd.concat([test_up, test_extra_num, test_extra_cat], axis=1)
+    test_up = pl.concat([test_up, test_extra_num, test_extra_cat], how="horizontal")
     print(f"  Done in {time.time()-t0:.1f}s")
 
     # Inject drift into test set
@@ -193,7 +211,7 @@ def main():
 
     # Remove ChurnStatus from test (like real test set)
     if "ChurnStatus" in test_up.columns:
-        test_up = test_up.drop(columns=["ChurnStatus"])
+        test_up = test_up.drop("ChurnStatus")
 
     print(f"Final shapes - train: {train_up.shape}, test: {test_up.shape}")
 
@@ -206,13 +224,13 @@ def main():
 
     print(f"Writing train to {train_path}...")
     t0 = time.time()
-    train_up.to_csv(train_path, index=False)
+    train_up.write_csv(train_path)
     train_size = os.path.getsize(train_path) / 1e9
     print(f"  Done in {time.time()-t0:.1f}s ({train_size:.2f} GB)")
 
     print(f"Writing test to {test_path}...")
     t0 = time.time()
-    test_up.to_csv(test_path, index=False)
+    test_up.write_csv(test_path)
     test_size = os.path.getsize(test_path) / 1e9
     print(f"  Done in {time.time()-t0:.1f}s ({test_size:.2f} GB)")
 

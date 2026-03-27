@@ -1,18 +1,42 @@
 import numpy as np
-import pandas as pd
+import polars as pl
+from polars_compat import to_numeric_coerce, is_numeric_col
 from utils import logger
 
 _MAX_EVAL_SAMPLE = 50_000
 
 
+# ── Auto-conversion helpers (transition period) ──────────────────────────
+
+def _ensure_pl_series(s) -> pl.Series:
+    """Auto-convert pandas Series to polars if needed."""
+    if isinstance(s, pl.Series):
+        return s
+    import pandas as pd
+    if isinstance(s, pd.Series):
+        return pl.from_pandas(s)
+    return pl.Series(values=s)
+
+
+def _ensure_pl_df(df) -> pl.DataFrame:
+    """Auto-convert pandas DataFrame to polars if needed."""
+    if isinstance(df, pl.DataFrame):
+        return df
+    import pandas as pd
+    if isinstance(df, pd.DataFrame):
+        return pl.from_pandas(df)
+    return df
+
+
 def _eval_subsample(train_col, test_col, max_n=_MAX_EVAL_SAMPLE, seed=42):
     """Subsample columns for fast strategy evaluation."""
-    rng = np.random.RandomState(seed)
+    train_col = _ensure_pl_series(train_col)
+    test_col = _ensure_pl_series(test_col)
     tr, te = train_col, test_col
     if len(tr) > max_n:
-        tr = tr.iloc[rng.choice(len(tr), max_n, replace=False)]
+        tr = tr.sample(n=max_n, seed=seed)
     if len(te) > max_n:
-        te = te.iloc[rng.choice(len(te), max_n, replace=False)]
+        te = te.sample(n=max_n, seed=seed)
     return tr, te
 
 
@@ -46,7 +70,7 @@ def compute_domain_weights(
 
 
 def compute_recency_weights(
-    month_rank: pd.Series, decay: float = 0.15
+    month_rank, decay: float = 0.15
 ) -> np.ndarray:
     """Compute recency weights from month rank using exponential decay.
 
@@ -56,12 +80,14 @@ def compute_recency_weights(
     if month_rank is None or len(month_rank) == 0:
         return None
 
+    month_rank = _ensure_pl_series(month_rank)
     max_rank = month_rank.max()
     if max_rank == 0:
         return None
 
     # Exponential decay: recent rows weighted higher
-    weights = np.exp(decay * (month_rank.values - max_rank))
+    arr = month_rank.to_numpy().astype(float)
+    weights = np.exp(decay * (arr - max_rank))
 
     # Normalize to mean=1.0
     weights = weights / weights.mean()
@@ -70,7 +96,7 @@ def compute_recency_weights(
 
 
 def detect_abbreviation_mappings(
-    train: pd.DataFrame, test: pd.DataFrame, col: str
+    train: pl.DataFrame, test: pl.DataFrame, col: str
 ) -> dict[str, str]:
     """Auto-detect city abbreviation-to-full-name mappings from the data.
 
@@ -80,22 +106,29 @@ def detect_abbreviation_mappings(
     Ties broken by combined frequency.
     """
     _ABB_SAMPLE = 50_000
-    tr_vals = train[col].dropna()
-    te_vals = test[col].dropna()
+    tr_vals = train[col].drop_nulls()
+    te_vals = test[col].drop_nulls()
     if len(tr_vals) > _ABB_SAMPLE:
-        tr_vals = tr_vals.sample(n=_ABB_SAMPLE, random_state=42)
+        tr_vals = tr_vals.sample(n=_ABB_SAMPLE, seed=42)
     if len(te_vals) > _ABB_SAMPLE:
-        te_vals = te_vals.sample(n=_ABB_SAMPLE, random_state=42)
-    all_values = set(tr_vals.unique()) | set(te_vals.unique())
+        te_vals = te_vals.sample(n=_ABB_SAMPLE, seed=42)
+    all_values = set(tr_vals.unique().to_list()) | set(te_vals.unique().to_list())
 
-    abbreviations = [v for v in all_values if len(v) in (2, 3) and v.isupper() and v.isalpha()]
-    full_names = [v for v in all_values if " " in v]
+    abbreviations = [v for v in all_values if isinstance(v, str) and len(v) in (2, 3) and v.isupper() and v.isalpha()]
+    full_names = [v for v in all_values if isinstance(v, str) and " " in v]
 
     if not abbreviations or not full_names:
         return {}
 
     # Combined frequency across both datasets (subsampled)
-    combined_freq = tr_vals.value_counts().add(te_vals.value_counts(), fill_value=0)
+    tr_vc = tr_vals.value_counts()
+    te_vc = te_vals.value_counts()
+    # Build a combined frequency dict
+    tr_freq = dict(zip(tr_vc.get_column(col).to_list(), tr_vc.get_column("count").to_list()))
+    te_freq = dict(zip(te_vc.get_column(col).to_list(), te_vc.get_column("count").to_list()))
+    combined_freq = {}
+    for k in set(tr_freq) | set(te_freq):
+        combined_freq[k] = tr_freq.get(k, 0) + te_freq.get(k, 0)
 
     mapping = {}
     for abbrev in abbreviations:
@@ -111,19 +144,22 @@ def detect_abbreviation_mappings(
 
 
 def normalize_data_quality(
-    train: pd.DataFrame,
-    test: pd.DataFrame,
+    train,
+    test,
     feature_types: dict[str, list[str]],
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, list[str]]]:
+):
     """Normalize data quality: city abbreviation mapping, lowercase, hyphen removal.
 
     Skips ID and target columns to preserve values like 'Yes'/'No'.
     Returns (train_clean, test_clean, norm_log) where norm_log maps column names
     to lists of normalization action labels applied.
     """
+    import pandas as pd
+    _input_was_pandas = isinstance(train, pd.DataFrame)
+    train_clean = _ensure_pl_df(train).clone()
+    test_clean = _ensure_pl_df(test).clone()
+
     skip_cols = set(feature_types.get("id", []) + feature_types.get("target", []))
-    train_clean = train.copy(deep=False)
-    test_clean = test.copy(deep=False)
     norm_log: dict[str, list[str]] = {}
 
     # Auto-detect abbreviation mappings on categorical columns (NOT temporal)
@@ -131,12 +167,17 @@ def normalize_data_quality(
     for col in feature_types.get("categorical", []):
         if col in skip_cols or col not in train_clean.columns or col not in test_clean.columns:
             continue
-        if train_clean[col].dtype != object:
+        if train_clean[col].dtype not in (pl.Utf8, pl.String):
             continue
         abbreviation_map = detect_abbreviation_mappings(train_clean, test_clean, col)
         if abbreviation_map:
-            for df in [train_clean, test_clean]:
-                df[col] = df[col].replace(abbreviation_map)
+            for old_val, new_val in abbreviation_map.items():
+                train_clean = train_clean.with_columns(
+                    pl.when(pl.col(col) == old_val).then(pl.lit(new_val)).otherwise(pl.col(col)).alias(col)
+                )
+                test_clean = test_clean.with_columns(
+                    pl.when(pl.col(col) == old_val).then(pl.lit(new_val)).otherwise(pl.col(col)).alias(col)
+                )
             logger.info(f"Auto-detected abbreviation mappings in '{col}': {abbreviation_map}")
             norm_log.setdefault(col, []).append("Abbreviations standardized")
 
@@ -148,35 +189,40 @@ def normalize_data_quality(
 
     # Pre-compute subsample indices for drift comparison on large datasets
     _NORM_SAMPLE = 50_000
-    _tr_norm_idx = np.random.RandomState(42).choice(
+    rng = np.random.RandomState(42)
+    _tr_norm_idx = rng.choice(
         len(train_clean), min(_NORM_SAMPLE, len(train_clean)), replace=False
     ) if len(train_clean) > _NORM_SAMPLE else None
-    _te_norm_idx = np.random.RandomState(42).choice(
+    _te_norm_idx = rng.choice(
         len(test_clean), min(_NORM_SAMPLE, len(test_clean)), replace=False
     ) if len(test_clean) > _NORM_SAMPLE else None
 
     for col in train_clean.columns:
         if col in skip_cols or col not in cat_cols:
             continue
-        if train_clean[col].dtype == object:
+        if train_clean[col].dtype in (pl.Utf8, pl.String):
             # Subsample for drift comparison
-            tr_sample = train_clean[col].iloc[_tr_norm_idx] if _tr_norm_idx is not None else train_clean[col]
-            te_sample = test_clean[col].iloc[_te_norm_idx] if _te_norm_idx is not None else test_clean[col]
+            tr_sample = train_clean[col].gather(_tr_norm_idx.tolist()) if _tr_norm_idx is not None else train_clean[col]
+            te_sample = test_clean[col].gather(_te_norm_idx.tolist()) if _te_norm_idx is not None else test_clean[col]
 
             # Compute drift before normalization (on subsample)
             before = detect_categorical_drift(tr_sample, te_sample)
             before_jsd = before.get("jsd", 0) or 0
 
             # Trial normalization on subsample for comparison
-            tr_trial_s = tr_sample.astype(str).str.lower().str.replace("-", " ", regex=False)
-            te_trial_s = te_sample.astype(str).str.lower().str.replace("-", " ", regex=False)
+            tr_trial_s = tr_sample.cast(pl.Utf8).str.to_lowercase().str.replace_all("-", " ", literal=True)
+            te_trial_s = te_sample.cast(pl.Utf8).str.to_lowercase().str.replace_all("-", " ", literal=True)
             after = detect_categorical_drift(tr_trial_s, te_trial_s)
             after_jsd = after.get("jsd", 0) or 0
 
             if after_jsd <= before_jsd:
                 # Apply to full data
-                train_clean[col] = train_clean[col].astype(str).str.lower().str.replace("-", " ", regex=False)
-                test_clean[col] = test_clean[col].astype(str).str.lower().str.replace("-", " ", regex=False)
+                train_clean = train_clean.with_columns(
+                    pl.col(col).cast(pl.Utf8).str.to_lowercase().str.replace_all("-", " ", literal=True).alias(col)
+                )
+                test_clean = test_clean.with_columns(
+                    pl.col(col).cast(pl.Utf8).str.to_lowercase().str.replace_all("-", " ", literal=True).alias(col)
+                )
                 normalized.append(col)
                 norm_log.setdefault(col, []).extend(["Lowercased", "Hyphens removed"])
             else:
@@ -188,7 +234,7 @@ def normalize_data_quality(
         logger.info(f"Skipped normalization for {len(skipped_norm)} columns (would increase drift): {skipped_norm}")
 
     # Fuzzy match: map unseen test categories to closest train category
-    # Skip for high-cardinality columns — fuzzy matching is O(unseen × train_cats)
+    # Skip for high-cardinality columns -- fuzzy matching is O(unseen x train_cats)
     # and only useful for small categoricals (city names, state codes, etc.)
     import difflib
     _MAX_FUZZY_TRAIN_CATS = 200
@@ -197,16 +243,16 @@ def normalize_data_quality(
     for col in cat_cols:
         if col in skip_cols or col not in train_clean.columns or col not in test_clean.columns:
             continue
-        if train_clean[col].dtype != object:
+        if train_clean[col].dtype not in (pl.Utf8, pl.String):
             continue
-        tr_s = train_clean[col].iloc[_tr_norm_idx].dropna() if _tr_norm_idx is not None else train_clean[col].dropna()
-        te_s = test_clean[col].iloc[_te_norm_idx].dropna() if _te_norm_idx is not None else test_clean[col].dropna()
-        train_cats = set(tr_s.unique())
-        test_cats = set(te_s.unique())
+        tr_s = train_clean[col].gather(_tr_norm_idx.tolist()).drop_nulls() if _tr_norm_idx is not None else train_clean[col].drop_nulls()
+        te_s = test_clean[col].gather(_te_norm_idx.tolist()).drop_nulls() if _te_norm_idx is not None else test_clean[col].drop_nulls()
+        train_cats = set(tr_s.unique().to_list())
+        test_cats = set(te_s.unique().to_list())
         unseen = test_cats - train_cats
         if not unseen:
             continue
-        # Skip if too many categories — fuzzy matching is only for low-cardinality typo fixes
+        # Skip if too many categories -- fuzzy matching is only for low-cardinality typo fixes
         if len(train_cats) > _MAX_FUZZY_TRAIN_CATS or len(unseen) > _MAX_FUZZY_UNSEEN:
             fuzzy_skipped += 1
             continue
@@ -220,11 +266,18 @@ def normalize_data_quality(
             if matches:
                 fuzzy_map[cat] = matches[0]
         if fuzzy_map:
-            test_clean[col] = test_clean[col].replace(fuzzy_map)
+            # Apply fuzzy map via chained when/then
+            expr = pl.col(col)
+            for old_val, new_val in fuzzy_map.items():
+                expr = pl.when(pl.col(col) == old_val).then(pl.lit(new_val)).otherwise(expr)
+            test_clean = test_clean.with_columns(expr.alias(col))
             logger.info(f"Fuzzy matched '{col}': {fuzzy_map}")
             norm_log.setdefault(col, []).append(f"Fuzzy matched: {fuzzy_map}")
     if fuzzy_skipped:
         logger.info(f"Skipped fuzzy matching for {fuzzy_skipped} high-cardinality columns")
+
+    if _input_was_pandas:
+        return train_clean.to_pandas(), test_clean.to_pandas(), norm_log
     return train_clean, test_clean, norm_log
 
 
@@ -232,82 +285,130 @@ def normalize_data_quality(
 
 
 def median_align(
-    train_col: pd.Series, test_col: pd.Series
-) -> tuple[pd.Series, pd.Series]:
+    train_col, test_col
+):
     """Shift test values so that test median matches train median."""
-    train_vals = pd.to_numeric(train_col, errors="coerce").dropna()
-    test_vals = pd.to_numeric(test_col, errors="coerce").dropna()
+    train_col = _ensure_pl_series(train_col)
+    test_col = _ensure_pl_series(test_col)
+    train_vals = to_numeric_coerce(train_col).drop_nulls()
+    test_vals = to_numeric_coerce(test_col).drop_nulls()
     if len(train_vals) == 0 or len(test_vals) == 0:
         return train_col, test_col
     shift = train_vals.median() - test_vals.median()
     if abs(shift) < 1e-10:
         return train_col, test_col  # no shift needed
-    test_aligned = test_col.copy()
-    test_aligned = pd.to_numeric(test_aligned, errors="coerce") + shift
-    return train_col, test_aligned
+    test_aligned = to_numeric_coerce(test_col) + shift
+    return train_col, test_aligned.alias(test_col.name)
 
 
 def clip_outliers(
-    train_col: pd.Series, test_col: pd.Series
-) -> tuple[pd.Series, pd.Series]:
+    train_col, test_col
+):
     """Clip both columns to [1st, 99th] percentile of train."""
-    vals = pd.to_numeric(train_col, errors="coerce").dropna().values.astype(float)
+    train_col = _ensure_pl_series(train_col)
+    test_col = _ensure_pl_series(test_col)
+    vals = to_numeric_coerce(train_col).drop_nulls().to_numpy().astype(float)
     lo, hi = np.percentile(vals, [1, 99])
     return train_col.clip(lo, hi), test_col.clip(lo, hi)
 
 
 def log_transform(
-    train_col: pd.Series, test_col: pd.Series
-) -> tuple[pd.Series, pd.Series] | None:
+    train_col, test_col
+):
     """Apply log1p if all values >= 0; return None to skip otherwise."""
-    if (train_col.dropna() < 0).any() or (test_col.dropna() < 0).any():
+    train_col = _ensure_pl_series(train_col)
+    test_col = _ensure_pl_series(test_col)
+    tr_clean = to_numeric_coerce(train_col).drop_nulls()
+    te_clean = to_numeric_coerce(test_col).drop_nulls()
+    if (tr_clean < 0).any() or (te_clean < 0).any():
         return None
-    return np.log1p(train_col), np.log1p(test_col)
+    # Use numpy for log1p, then wrap back as polars Series
+    tr_numeric = to_numeric_coerce(train_col)
+    te_numeric = to_numeric_coerce(test_col)
+    tr_arr = tr_numeric.to_numpy()
+    te_arr = te_numeric.to_numpy()
+    return (
+        pl.Series(name=train_col.name, values=np.log1p(tr_arr)),
+        pl.Series(name=test_col.name, values=np.log1p(te_arr)),
+    )
 
 
 def quantile_bin(
-    train_col: pd.Series, test_col: pd.Series, n_bins: int = 10
-) -> tuple[pd.Series, pd.Series]:
+    train_col, test_col, n_bins: int = 10
+):
     """Discretize into quantile bins defined by train edges."""
-    vals = pd.to_numeric(train_col, errors="coerce").dropna().values.astype(float)
+    train_col = _ensure_pl_series(train_col)
+    test_col = _ensure_pl_series(test_col)
+    vals = to_numeric_coerce(train_col).drop_nulls().to_numpy().astype(float)
     # Adapt bins to sample size
     n_bins = min(n_bins, max(2, len(vals) // 20))
     percentiles = np.linspace(0, 100, n_bins + 1)[1:-1]
     edges = np.percentile(vals, percentiles)
     edges = np.unique(edges)
+    tr_arr = to_numeric_coerce(train_col).to_numpy()
+    te_arr = to_numeric_coerce(test_col).to_numpy()
     return (
-        pd.Series(np.digitize(train_col, edges), index=train_col.index, name=train_col.name),
-        pd.Series(np.digitize(test_col, edges), index=test_col.index, name=test_col.name),
+        pl.Series(name=train_col.name, values=np.digitize(tr_arr, edges)),
+        pl.Series(name=test_col.name, values=np.digitize(te_arr, edges)),
     )
 
 
 def group_rare_categories(
-    train_col: pd.Series, test_col: pd.Series, min_freq: float = 0.01
-) -> tuple[pd.Series, pd.Series]:
+    train_col, test_col, min_freq: float = 0.01
+):
     """Merge categories below min_freq in train + unseen-in-train into '_other'."""
-    freq = train_col.value_counts(normalize=True)
-    rare_cats = set(freq[freq < min_freq].index)
-    train_cats = set(train_col.dropna().unique())
+    train_col = _ensure_pl_series(train_col)
+    test_col = _ensure_pl_series(test_col)
 
-    def _remap(s: pd.Series) -> pd.Series:
-        return s.map(lambda v: v if pd.isna(v) else ("_other" if v in rare_cats or v not in train_cats else v))
+    # Compute frequency of each category in train
+    vc = train_col.drop_nulls().value_counts()
+    total = len(train_col.drop_nulls())
+    if total == 0:
+        return train_col, test_col
+    # vc columns: [train_col.name, "count"]
+    col_name = train_col.name
+    freq_df = vc.with_columns((pl.col("count") / total).alias("freq"))
+    rare_cats_df = freq_df.filter(pl.col("freq") < min_freq)
+    rare_cats = set(rare_cats_df[col_name].to_list())
+    train_cats = set(train_col.drop_nulls().unique().to_list())
+
+    def _remap(s: pl.Series) -> pl.Series:
+        # Null stays null; rare or unseen -> "_other"; rest stays
+        rare_list = list(rare_cats)
+        train_list = list(train_cats)
+        result = s.to_frame().select(
+            pl.when(pl.col(s.name).is_null()).then(pl.lit(None))
+            .when(pl.col(s.name).is_in(rare_list) | ~pl.col(s.name).is_in(train_list))
+            .then(pl.lit("_other"))
+            .otherwise(pl.col(s.name))
+            .alias(s.name)
+        )[s.name]
+        return result
 
     return _remap(train_col), _remap(test_col)
 
 
 def encode_temporal_cyclical(
-    train_col: pd.Series, test_col: pd.Series
-) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    train_col, test_col
+):
     """Parse temporal -> month -> sin/cos pair. Returns (train_sin, train_cos, test_sin, test_cos)."""
-    def _to_month(s: pd.Series) -> pd.Series:
+    train_col = _ensure_pl_series(train_col)
+    test_col = _ensure_pl_series(test_col)
+
+    def _to_month(s: pl.Series) -> np.ndarray:
         # Title-case to restore month abbreviations after lowercase normalization
-        s_title = s.astype(str).str.title()
+        s_title = s.cast(pl.Utf8).str.to_titlecase()
         for fmt in ["%y-%b", "%b-%y", "%Y-%m", "%m-%Y", "%b %Y", "%Y-%b",
                     "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"]:
-            parsed = pd.to_datetime(s_title, format=fmt, errors="coerce")
-            if parsed.notna().sum() > len(s) * 0.5:
-                return parsed.dt.month.fillna(1).astype(float)
-        return pd.Series(np.ones(len(s)), index=s.index)
+            try:
+                parsed = s_title.str.to_datetime(fmt, strict=False)
+                not_null_count = parsed.is_not_null().sum()
+                if not_null_count > len(s) * 0.5:
+                    month = parsed.dt.month().fill_null(1).cast(pl.Float64)
+                    return month.to_numpy()
+            except Exception:
+                continue
+        return np.ones(len(s))
 
     train_month = _to_month(train_col)
     test_month = _to_month(test_col)
@@ -319,52 +420,81 @@ def encode_temporal_cyclical(
 
     name = train_col.name
     return (
-        pd.Series(train_sin, index=train_col.index, name=f"{name}_sin"),
-        pd.Series(train_cos, index=train_col.index, name=f"{name}_cos"),
-        pd.Series(test_sin, index=test_col.index, name=f"{name}_sin"),
-        pd.Series(test_cos, index=test_col.index, name=f"{name}_cos"),
+        pl.Series(name=f"{name}_sin", values=train_sin),
+        pl.Series(name=f"{name}_cos", values=train_cos),
+        pl.Series(name=f"{name}_sin", values=test_sin),
+        pl.Series(name=f"{name}_cos", values=test_cos),
     )
 
 
 def frequency_encode_mitigation(
-    train_col: pd.Series, test_col: pd.Series
-) -> tuple[pd.Series, pd.Series]:
+    train_col, test_col
+):
     """Replace categories with their training-set frequency (0-1).
 
     Converts categorical to numerical, making it amenable to numerical strategies.
     """
-    freq_map = train_col.value_counts(normalize=True).to_dict()
-    tr_encoded = train_col.map(freq_map).fillna(0.0)
-    te_encoded = test_col.map(freq_map).fillna(0.0)
+    train_col = _ensure_pl_series(train_col)
+    test_col = _ensure_pl_series(test_col)
+
+    # Build frequency map from train
+    vc = train_col.drop_nulls().value_counts()
+    total = len(train_col.drop_nulls())
+    if total == 0:
+        return (
+            pl.Series(name=train_col.name, values=np.zeros(len(train_col))),
+            pl.Series(name=test_col.name, values=np.zeros(len(test_col))),
+        )
+    col_name = train_col.name
+    freq_map = dict(zip(
+        vc[col_name].to_list(),
+        (vc["count"].cast(pl.Float64) / total).to_list()
+    ))
+
+    # Map values; unseen categories get 0.0
+    tr_arr = np.array([freq_map.get(v, 0.0) if v is not None else 0.0 for v in train_col.to_list()])
+    te_arr = np.array([freq_map.get(v, 0.0) if v is not None else 0.0 for v in test_col.to_list()])
+
     return (
-        pd.Series(tr_encoded.values, index=train_col.index, name=train_col.name),
-        pd.Series(te_encoded.values, index=test_col.index, name=test_col.name),
+        pl.Series(name=train_col.name, values=tr_arr),
+        pl.Series(name=test_col.name, values=te_arr),
     )
 
 
 def robust_scale(
-    train_col: pd.Series, test_col: pd.Series
-) -> tuple[pd.Series, pd.Series]:
+    train_col, test_col
+):
     """Scale using median and IQR from train. Distribution-robust alternative to z-score."""
-    train_vals = pd.to_numeric(train_col, errors="coerce").dropna().values.astype(float)
+    train_col = _ensure_pl_series(train_col)
+    test_col = _ensure_pl_series(test_col)
+    train_vals = to_numeric_coerce(train_col).drop_nulls().to_numpy().astype(float)
     median = np.median(train_vals)
     q1, q3 = np.percentile(train_vals, [25, 75])
     iqr = q3 - q1
     if iqr < 1e-10:
         return train_col, test_col
-    tr = (pd.to_numeric(train_col, errors="coerce") - median) / iqr
-    te = (pd.to_numeric(test_col, errors="coerce") - median) / iqr
+    tr_arr = (to_numeric_coerce(train_col).to_numpy() - median) / iqr
+    te_arr = (to_numeric_coerce(test_col).to_numpy() - median) / iqr
     return (
-        pd.Series(tr.values, index=train_col.index, name=train_col.name),
-        pd.Series(te.values, index=test_col.index, name=test_col.name),
+        pl.Series(name=train_col.name, values=tr_arr),
+        pl.Series(name=test_col.name, values=te_arr),
     )
 
 
 def _clip_then_log(train_col, test_col):
+    train_col = _ensure_pl_series(train_col)
+    test_col = _ensure_pl_series(test_col)
     tr_c, te_c = clip_outliers(train_col, test_col)
     # Shift to ensure non-negative before log
-    min_val = min(tr_c.min(), te_c.min())
-    if pd.isna(min_val):
+    tr_min = tr_c.min()
+    te_min = te_c.min()
+    min_val = min(
+        tr_min if tr_min is not None else float('inf'),
+        te_min if te_min is not None else float('inf')
+    )
+    if min_val is None or min_val != min_val:  # NaN check
+        return None
+    if min_val == float('inf'):
         return None
     if min_val < 0:
         shift = abs(min_val) + 1e-6
@@ -374,17 +504,19 @@ def _clip_then_log(train_col, test_col):
 
 
 def quantile_match(
-    train_col: pd.Series, test_col: pd.Series, n_quantiles: int = 100
-) -> tuple[pd.Series, pd.Series]:
+    train_col, test_col, n_quantiles: int = 100
+):
     """Align test distribution to train via CDF-to-CDF quantile mapping.
 
     For each test value, finds its percentile rank in the test distribution,
     then maps to the corresponding value from the training distribution.
     Training data is unchanged; test rank ordering is preserved.
     """
-    train_vals = pd.to_numeric(train_col, errors="coerce").dropna().values.astype(float)
-    test_numeric = pd.to_numeric(test_col, errors="coerce")
-    test_vals = test_numeric.dropna().values.astype(float)
+    train_col = _ensure_pl_series(train_col)
+    test_col = _ensure_pl_series(test_col)
+    train_vals = to_numeric_coerce(train_col).drop_nulls().to_numpy().astype(float)
+    test_numeric = to_numeric_coerce(test_col)
+    test_vals = test_numeric.drop_nulls().to_numpy().astype(float)
 
     if len(train_vals) < 10 or len(test_vals) < 10:
         return train_col, test_col
@@ -395,7 +527,7 @@ def quantile_match(
 
     # Vectorized: compute test CDF rank for all values
     sorted_test = np.sort(test_vals)
-    all_test = test_numeric.values.astype(float)
+    all_test = test_numeric.to_numpy().astype(float)
     ranks = np.searchsorted(sorted_test, all_test, side='right').astype(float) / len(sorted_test)
     ranks = np.clip(ranks, 0, 1)
 
@@ -403,46 +535,56 @@ def quantile_match(
     mapped = np.interp(ranks, probs, train_q)
 
     # Preserve NaN
-    nan_mask = test_numeric.isna()
-    mapped[nan_mask.values] = np.nan
+    nan_mask = test_numeric.is_null().to_numpy()
+    mapped[nan_mask] = np.nan
 
-    result = pd.Series(mapped, index=test_col.index, name=test_col.name)
+    result = pl.Series(name=test_col.name, values=mapped)
     return train_col, result
 
 
 def rank_transform(
-    train_col: pd.Series, test_col: pd.Series
-) -> tuple[pd.Series, pd.Series]:
+    train_col, test_col
+):
     """Convert values to their percentile rank (0-1) based on training distribution.
 
     Distribution-agnostic: eliminates drift while preserving ordering.
     """
-    train_vals = pd.to_numeric(train_col, errors="coerce").dropna().values.astype(float)
+    train_col = _ensure_pl_series(train_col)
+    test_col = _ensure_pl_series(test_col)
+    train_vals = to_numeric_coerce(train_col).drop_nulls().to_numpy().astype(float)
     sorted_vals = np.sort(train_vals)
     n = len(sorted_vals)
 
-    def _to_rank(s):
-        arr = pd.to_numeric(s, errors="coerce").values.astype(float)
-        ranks = np.searchsorted(sorted_vals, arr, side="right") / n
-        return pd.Series(np.clip(ranks, 0, 1), index=s.index, name=s.name)
+    # Fill nulls with median for rank computation
+    train_median = float(np.median(train_vals)) if len(train_vals) > 0 else 0.0
 
-    return _to_rank(train_col.fillna(train_col.median())), _to_rank(test_col.fillna(train_col.median()))
+    def _to_rank(s: pl.Series) -> pl.Series:
+        arr = to_numeric_coerce(s.fill_null(train_median)).to_numpy().astype(float)
+        ranks = np.searchsorted(sorted_vals, arr, side="right") / n
+        return pl.Series(name=s.name, values=np.clip(ranks, 0, 1))
+
+    return _to_rank(train_col), _to_rank(test_col)
 
 
 # ── Progressive mitigation loop ──────────────────────────────────────────
 
 
 def mitigate_feature_progressive(
-    train: pd.DataFrame,
-    test: pd.DataFrame,
+    train,
+    test,
     col: str,
     feature_type: str,
     original_severity: str,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+):
     """Try graduated strategies on a single high-drift feature.
 
     Returns (train, test, log_entry) where log_entry records what happened.
     """
+    import pandas as pd
+    _input_was_pandas = isinstance(train, pd.DataFrame)
+    train = _ensure_pl_df(train)
+    test = _ensure_pl_df(test)
+
     from drift_detector import detect_numerical_drift, detect_categorical_drift
 
     log_entry = {
@@ -462,16 +604,18 @@ def mitigate_feature_progressive(
         cos_drift = detect_numerical_drift(train_cos, test_cos)
         # Accept if BOTH sin and cos are below high
         if sin_drift["severity"] != "high" and cos_drift["severity"] != "high":
-            train = pd.concat([train.drop(columns=[col]),
-                               train_sin.to_frame(), train_cos.to_frame()], axis=1)
-            test = pd.concat([test.drop(columns=[col]),
-                              test_sin.to_frame(), test_cos.to_frame()], axis=1)
+            train = pl.concat([train.drop(col), train_sin.to_frame(), train_cos.to_frame()], how="horizontal")
+            test = pl.concat([test.drop(col), test_sin.to_frame(), test_cos.to_frame()], how="horizontal")
             worst = sin_drift["severity"] if sin_drift["severity"] == "moderate" else cos_drift["severity"]
             log_entry["strategy_applied"] = "Seasonality Matching"
             log_entry["final_severity"] = worst
-            return train, test, log_entry
+            result_train = train.to_pandas() if _input_was_pandas else train
+            result_test = test.to_pandas() if _input_was_pandas else test
+            return result_train, result_test, log_entry
         # Cyclical failed -> drop
-        return train, test, log_entry
+        result_train = train.to_pandas() if _input_was_pandas else train
+        result_test = test.to_pandas() if _input_was_pandas else test
+        return result_train, result_test, log_entry
 
     if feature_type == "numerical":
         strategies = [
@@ -493,13 +637,17 @@ def mitigate_feature_progressive(
             if drift["severity"] != "high":
                 full_result = fn(train[col], test[col])
                 if full_result is not None:
-                    train[col] = full_result[0].values
-                    test[col] = full_result[1].values
+                    train = train.with_columns(full_result[0].alias(col))
+                    test = test.with_columns(full_result[1].alias(col))
                 log_entry["strategy_applied"] = name
                 log_entry["final_severity"] = drift["severity"]
-                return train, test, log_entry
+                result_train = train.to_pandas() if _input_was_pandas else train
+                result_test = test.to_pandas() if _input_was_pandas else test
+                return result_train, result_test, log_entry
         # All strategies failed -> drop
-        return train, test, log_entry
+        result_train = train.to_pandas() if _input_was_pandas else train
+        result_test = test.to_pandas() if _input_was_pandas else test
+        return result_train, result_test, log_entry
 
     if feature_type == "categorical":
         # Evaluate strategies on subsample, apply winner to full data
@@ -510,22 +658,26 @@ def mitigate_feature_progressive(
         drift = detect_categorical_drift(tr_col, te_col)
         if drift["severity"] != "high":
             full_tr, full_te = group_rare_categories(train[col], test[col])
-            train[col] = full_tr.values
-            test[col] = full_te.values
+            train = train.with_columns(full_tr.alias(col))
+            test = test.with_columns(full_te.alias(col))
             log_entry["strategy_applied"] = "Category Consolidation"
             log_entry["final_severity"] = drift["severity"]
-            return train, test, log_entry
+            result_train = train.to_pandas() if _input_was_pandas else train
+            result_test = test.to_pandas() if _input_was_pandas else test
+            return result_train, result_test, log_entry
 
         # Strategy 2: Frequency encode (converts to numerical)
         tr_freq, te_freq = frequency_encode_mitigation(eval_tr, eval_te)
         drift = detect_numerical_drift(tr_freq, te_freq)
         if drift["severity"] != "high":
             full_tr, full_te = frequency_encode_mitigation(train[col], test[col])
-            train[col] = full_tr.values
-            test[col] = full_te.values
+            train = train.with_columns(full_tr.alias(col))
+            test = test.with_columns(full_te.alias(col))
             log_entry["strategy_applied"] = "Frequency Encoding"
             log_entry["final_severity"] = drift["severity"]
-            return train, test, log_entry
+            result_train = train.to_pandas() if _input_was_pandas else train
+            result_test = test.to_pandas() if _input_was_pandas else test
+            return result_train, result_test, log_entry
 
         # Strategy 3: Frequency encode + numerical strategies
         num_strategies = [
@@ -543,27 +695,33 @@ def mitigate_feature_progressive(
                 full_freq_tr, full_freq_te = frequency_encode_mitigation(train[col], test[col])
                 full_result = fn(full_freq_tr, full_freq_te)
                 if full_result is not None:
-                    train[col] = full_result[0].values
-                    test[col] = full_result[1].values
+                    train = train.with_columns(full_result[0].alias(col))
+                    test = test.with_columns(full_result[1].alias(col))
                 log_entry["strategy_applied"] = name
                 log_entry["final_severity"] = drift["severity"]
-                return train, test, log_entry
+                result_train = train.to_pandas() if _input_was_pandas else train
+                result_test = test.to_pandas() if _input_was_pandas else test
+                return result_train, result_test, log_entry
 
         # All categorical strategies failed -> drop
-        return train, test, log_entry
+        result_train = train.to_pandas() if _input_was_pandas else train
+        result_test = test.to_pandas() if _input_was_pandas else test
+        return result_train, result_test, log_entry
 
-    return train, test, log_entry
+    result_train = train.to_pandas() if _input_was_pandas else train
+    result_test = test.to_pandas() if _input_was_pandas else test
+    return result_train, result_test, log_entry
 
 
 # ── Main entry point ─────────────────────────────────────────────────────
 
 
 def apply_all_mitigations(
-    train: pd.DataFrame,
-    test: pd.DataFrame,
-    drift_df: pd.DataFrame,
+    train,
+    test,
+    drift_df,
     feature_types: dict[str, list[str]],
-) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[dict], dict[str, list[str]], dict]:
+):
     """Run all mitigation stages in order.
 
     Pipeline:
@@ -574,15 +732,25 @@ def apply_all_mitigations(
 
     Returns (train_mitigated, test_mitigated, drop_cols, mitigation_log, norm_log, shift_info).
     """
+    import pandas as pd
+    _input_was_pandas = isinstance(train, pd.DataFrame)
+    train = _ensure_pl_df(train)
+    test = _ensure_pl_df(test)
+    drift_df = _ensure_pl_df(drift_df)
+
     from drift_detector import _analyze_single_feature, _small_sample_factor, _apply_bh_correction
 
     # Stage 1: Data quality normalization
+    # normalize_data_quality now works internally with polars; pass polars in, get polars out
     train_m, test_m, norm_log = normalize_data_quality(train, test, feature_types)
+    # Ensure we stay in polars land after normalization
+    train_m = _ensure_pl_df(train_m)
+    test_m = _ensure_pl_df(test_m)
 
     # Stage 2: Re-check drift only for columns modified by normalization
     # (avoids re-running all 500 features when only a few changed)
-    drift_df_norm = drift_df.copy()
-    if norm_log and not drift_df_norm.empty:
+    drift_df_norm = drift_df.clone()
+    if norm_log and len(drift_df_norm) > 0:
         modified_cols = set(norm_log.keys())
         recheck_count = 0
         for col in modified_cols:
@@ -596,26 +764,45 @@ def apply_all_mitigations(
             if ftype is None:
                 continue
             result = _analyze_single_feature(train_m[col], test_m[col], col, ftype)
-            idx = drift_df_norm.index[drift_df_norm["column"] == col]
-            if len(idx) > 0:
+            # Find the row index for this column
+            col_mask = drift_df_norm["column"] == col
+            match_indices = [i for i, v in enumerate(col_mask.to_list()) if v]
+            if match_indices:
+                idx = match_indices[0]
+                # Update each field from the result
                 for key, val in result.items():
                     if key in drift_df_norm.columns:
-                        drift_df_norm.loc[idx[0], key] = val
+                        # Build a new column with the updated value at idx
+                        old_col = drift_df_norm[key]
+                        values = old_col.to_list()
+                        values[idx] = val
+                        drift_df_norm = drift_df_norm.with_columns(
+                            pl.Series(name=key, values=values, dtype=old_col.dtype if not isinstance(val, str) else pl.Utf8)
+                        )
                 recheck_count += 1
         if recheck_count > 0:
             ss_factor = _small_sample_factor(len(train_m), len(test_m))
-            drift_df_norm = _apply_bh_correction(drift_df_norm, ss_factor)
-            drift_df_norm = drift_df_norm.sort_values(
-                "severity", key=lambda s: s.map({"high": 0, "moderate": 1, "low": 2, "unknown": 3})
-            )
+            # _apply_bh_correction accepts both pandas/polars and returns same type
+            drift_df_norm = _ensure_pl_df(_apply_bh_correction(drift_df_norm, ss_factor))
+            # Sort by severity
+            severity_order = {"high": 0, "moderate": 1, "low": 2, "unknown": 3}
+            drift_df_norm = drift_df_norm.with_columns(
+                pl.col("severity").replace_strict(severity_order, default=3).alias("_sev_order")
+            ).sort("_sev_order").drop("_sev_order")
         logger.info(f"Re-checked drift for {recheck_count} normalized columns (skipped {len(drift_df) - recheck_count} unchanged)")
 
     # Stage 3: Progressive mitigation for high-drift features
     # Collect all high-drift features (including temporal)
     high_drift_features = []
-    if not drift_df_norm.empty:
-        for _, row in drift_df_norm[drift_df_norm["severity"] == "high"].iterrows():
-            high_drift_features.append((row["column"], row["feature_type"], row["severity"]))
+    if len(drift_df_norm) > 0:
+        high_mask = drift_df_norm["severity"] == "high"
+        high_rows = drift_df_norm.filter(high_mask)
+        for i in range(len(high_rows)):
+            high_drift_features.append((
+                high_rows["column"][i],
+                high_rows["feature_type"][i],
+                high_rows["severity"][i],
+            ))
 
     mitigation_log = []
     drop_cols = []
@@ -628,9 +815,13 @@ def apply_all_mitigations(
             continue
         if (i + 1) % 25 == 0:
             logger.info(f"  High-drift progress: {i + 1}/{len(high_drift_features)}")
+        # mitigate_feature_progressive accepts both pandas/polars; pass polars
         train_m, test_m, entry = mitigate_feature_progressive(
             train_m, test_m, col, ftype, severity
         )
+        # Ensure we stay in polars
+        train_m = _ensure_pl_df(train_m)
+        test_m = _ensure_pl_df(test_m)
         mitigation_log.append(entry)
         if entry["strategy_applied"] == "Drop Feature":
             drop_cols.append(col)
@@ -644,11 +835,20 @@ def apply_all_mitigations(
     from drift_detector import detect_numerical_drift, detect_categorical_drift
 
     moderate_features = []
-    if not drift_df_norm.empty:
-        for _, row in drift_df_norm[drift_df_norm["severity"] == "moderate"].iterrows():
-            col = row["column"]
+    if len(drift_df_norm) > 0:
+        mod_mask = drift_df_norm["severity"] == "moderate"
+        mod_rows = drift_df_norm.filter(mod_mask)
+        for i in range(len(mod_rows)):
+            col = mod_rows["column"][i]
             if col not in drop_cols and col in train_m.columns:
-                moderate_features.append((col, row["feature_type"], row.get("psi", 0) or 0, row.get("jsd", 0) or 0))
+                psi_val = mod_rows["psi"][i] if "psi" in mod_rows.columns else 0
+                jsd_val = mod_rows["jsd"][i] if "jsd" in mod_rows.columns else 0
+                moderate_features.append((
+                    col,
+                    mod_rows["feature_type"][i],
+                    psi_val if psi_val is not None else 0,
+                    jsd_val if jsd_val is not None else 0,
+                ))
 
     # Cap moderate features to top 50 by drift magnitude for large feature sets
     _MAX_MODERATE = 50
@@ -685,11 +885,11 @@ def apply_all_mitigations(
                 drift = detect_numerical_drift(tr_col, te_col)
                 new_psi = drift.get("psi", orig_psi) or orig_psi
                 if drift["severity"] == "low":
-                    # Immediate accept — apply to full data
+                    # Immediate accept -- apply to full data
                     full_result = fn(train_m[col], test_m[col])
                     if full_result is not None:
-                        train_m[col] = full_result[0].values
-                        test_m[col] = full_result[1].values
+                        train_m = train_m.with_columns(full_result[0].alias(col))
+                        test_m = test_m.with_columns(full_result[1].alias(col))
                     logger.info(f"  {col}: {name} (moderate -> low)")
                     mitigation_log.append({"column": col, "feature_type": ftype,
                                            "original_severity": "moderate", "strategy_applied": name,
@@ -705,8 +905,8 @@ def apply_all_mitigations(
             if best_strategy and best_fn:
                 full_result = best_fn(train_m[col], test_m[col])
                 if full_result is not None:
-                    train_m[col] = full_result[0].values
-                    test_m[col] = full_result[1].values
+                    train_m = train_m.with_columns(full_result[0].alias(col))
+                    test_m = test_m.with_columns(full_result[1].alias(col))
                 logger.info(f"  {col}: {best_strategy} (moderate, PSI {orig_psi:.4f} -> {best_psi:.4f})")
                 mitigation_log.append({"column": col, "feature_type": ftype,
                                        "original_severity": "moderate", "strategy_applied": best_strategy,
@@ -732,8 +932,8 @@ def apply_all_mitigations(
                     new_jsd = drift.get("psi", orig_jsd) or orig_jsd
                 if drift["severity"] == "low":
                     full_tr, full_te = fn(train_m[col], test_m[col])
-                    train_m[col] = full_tr.values
-                    test_m[col] = full_te.values
+                    train_m = train_m.with_columns(full_tr.alias(col))
+                    test_m = test_m.with_columns(full_te.alias(col))
                     logger.info(f"  {col}: {name} (moderate -> low)")
                     mitigation_log.append({"column": col, "feature_type": ftype,
                                            "original_severity": "moderate", "strategy_applied": name,
@@ -747,8 +947,8 @@ def apply_all_mitigations(
                     best_sev = drift["severity"]
             if best_strategy and best_fn:
                 full_tr, full_te = best_fn(train_m[col], test_m[col])
-                train_m[col] = full_tr.values
-                test_m[col] = full_te.values
+                train_m = train_m.with_columns(full_tr.alias(col))
+                test_m = test_m.with_columns(full_te.alias(col))
                 logger.info(f"  {col}: {best_strategy} (moderate, JSD {orig_jsd:.4f} -> {best_jsd:.4f})")
                 mitigation_log.append({"column": col, "feature_type": ftype,
                                        "original_severity": "moderate", "strategy_applied": best_strategy,
@@ -757,6 +957,7 @@ def apply_all_mitigations(
     # Stage 4: Multivariate shift detection (diagnostic only, no weighting)
     from drift_detector import detect_multivariate_shift
 
+    # detect_multivariate_shift auto-converts pandas->polars internally
     shift_info = detect_multivariate_shift(train_m, test_m, feature_types, extra_drop_cols=drop_cols)
 
     if shift_info["shift_detected"]:
@@ -770,4 +971,6 @@ def apply_all_mitigations(
             f"using uniform weights"
         )
 
+    if _input_was_pandas:
+        return train_m.to_pandas(), test_m.to_pandas(), drop_cols, mitigation_log, norm_log, shift_info
     return train_m, test_m, drop_cols, mitigation_log, norm_log, shift_info
