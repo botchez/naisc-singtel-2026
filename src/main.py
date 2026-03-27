@@ -180,9 +180,10 @@ def print_runtime_summary(
     feat_time: float,
     model_time: float,
     refine_time: float = 0.0,
+    load_time: float = 0.0,
 ) -> None:
     """Print a separate runtime breakdown table using box-drawing characters."""
-    total = drift_time + mitigation_time + feat_time + refine_time + model_time
+    total = load_time + drift_time + mitigation_time + feat_time + refine_time + model_time
     CW = (24, 14)
     W = sum(CW) + len(CW) - 1
 
@@ -203,6 +204,8 @@ def print_runtime_summary(
     print(h_line("╠", "╦", "╣"))
     print(col_row("Stage", "Time"))
     print(h_line("╠", "╬", "╣"))
+    if load_time > 0:
+        print(col_row("Data Loading", f"{load_time:.2f}s"))
     print(col_row("Drift Detection", f"{drift_time:.2f}s"))
     print(col_row("Drift Mitigation", f"{mitigation_time:.2f}s"))
     print(col_row("Feature Engineering", f"{feat_time:.2f}s"))
@@ -265,11 +268,12 @@ def main():
     #    time.sleep(1)
 
     # --- Stage 1: Data Ingestion & Profiling ---
-    train, test = load_data(args.train_data_filepath, args.test_data_filepath)
-    train, test = align_train_test_columns(train, test)
-    feature_types = detect_feature_types(train, test_df=test)
-    profile_data(train, feature_types, label="train")
-    profile_data(test, feature_types, label="test")
+    with Timer("Data loading") as load_timer:
+        train, test = load_data(args.train_data_filepath, args.test_data_filepath)
+        train, test = align_train_test_columns(train, test)
+        feature_types = detect_feature_types(train, test_df=test)
+        profile_data(train, feature_types, label="train")
+        profile_data(test, feature_types, label="test")
 
     # Coerce columns classified as numerical but still stored as object dtype
     for col in feature_types.get("numerical", []):
@@ -622,7 +626,7 @@ def main():
         ("Mitigated", mitigated_metrics),
     ]
     print_model_performance_summary(model_results)
-    print_runtime_summary(drift_timer.elapsed, mitigation_timer.elapsed, feat_timer.elapsed, model_timer.elapsed, refine_timer.elapsed)
+    print_runtime_summary(drift_timer.elapsed, mitigation_timer.elapsed, feat_timer.elapsed, model_timer.elapsed, refine_timer.elapsed, load_timer.elapsed)
 
 
 if __name__ == "__main__":
