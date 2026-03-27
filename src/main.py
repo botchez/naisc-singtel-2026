@@ -12,6 +12,7 @@ import polars as pl
 from polars_compat import to_numeric_coerce, is_numeric_col, to_pandas_for_lgbm
 from profiler import load_data, detect_feature_types, profile_data, align_train_test_columns
 from drift_detector import run_drift_analysis, detect_intra_training_drift
+from lightgbm import LGBMClassifier
 from model import prepare_features, train_model, evaluate_and_save, print_model_performance_summary
 from mitigation import apply_all_mitigations, compute_domain_weights, compute_recency_weights
 from feature_engineer import engineer_features
@@ -176,14 +177,15 @@ def print_multivariate_shift_summary(shift_info: dict, weight_status: str = "Uni
 
 
 def print_runtime_summary(
+    ingest_time: float,
     drift_time: float,
     mitigation_time: float,
     feat_time: float,
     model_time: float,
     refine_time: float = 0.0,
+    total_elapsed: float = 0.0,
 ) -> None:
     """Print a separate runtime breakdown table using box-drawing characters."""
-    total = drift_time + mitigation_time + feat_time + refine_time + model_time
     CW = (24, 14)
     W = sum(CW) + len(CW) - 1
 
@@ -204,6 +206,7 @@ def print_runtime_summary(
     print(h_line("╠", "╦", "╣"))
     print(col_row("Stage", "Time"))
     print(h_line("╠", "╬", "╣"))
+    print(col_row("Data Ingestion", f"{ingest_time:.2f}s"))
     print(col_row("Drift Detection", f"{drift_time:.2f}s"))
     print(col_row("Drift Mitigation", f"{mitigation_time:.2f}s"))
     print(col_row("Feature Engineering", f"{feat_time:.2f}s"))
@@ -211,7 +214,7 @@ def print_runtime_summary(
         print(col_row("Mitigation Refinement", f"{refine_time:.2f}s"))
     print(col_row("Model Training", f"{model_time:.2f}s"))
     print(h_line("╠", "╬", "╣"))
-    print(col_row("Total", f"{total:.2f}s"))
+    print(col_row("Total", f"{total_elapsed:.2f}s"))
     print(h_line("╚", "╩", "╝"))
 
 
@@ -265,82 +268,85 @@ def main():
     #    _animate_ascii_typewriter(lines)
     #    time.sleep(1)
 
+    _pipeline_start = time.perf_counter()
+
     # --- Stage 1: Data Ingestion & Profiling ---
-    train, test = load_data(args.train_data_filepath, args.test_data_filepath)
-    train, test = align_train_test_columns(train, test)
-    feature_types = detect_feature_types(train, test_df=test)
-    profile_data(train, feature_types, label="train")
-    profile_data(test, feature_types, label="test")
+    with Timer("Data ingestion & profiling") as ingest_timer:
+        train, test = load_data(args.train_data_filepath, args.test_data_filepath)
+        train, test = align_train_test_columns(train, test)
+        feature_types = detect_feature_types(train, test_df=test)
+        profile_data(train, feature_types, label="train")
+        profile_data(test, feature_types, label="test")
 
-    # Coerce columns classified as numerical but still stored as non-numeric dtype
-    for col in feature_types.get("numerical", []):
-        if col in train.columns and not is_numeric_col(train[col]):
-            train = train.with_columns(to_numeric_coerce(train[col]).alias(col))
-        if col in test.columns and not is_numeric_col(test[col]):
-            test = test.with_columns(to_numeric_coerce(test[col]).alias(col))
+        # Coerce columns classified as numerical but still stored as non-numeric dtype
+        for col in feature_types.get("numerical", []):
+            if col in train.columns and not is_numeric_col(train[col]):
+                train = train.with_columns(to_numeric_coerce(train[col]).alias(col))
+            if col in test.columns and not is_numeric_col(test[col]):
+                test = test.with_columns(to_numeric_coerce(test[col]).alias(col))
 
-    # --- Build a single decision sample for drift detection, feature selection,
-    # and weight tournament. Full data flows through mitigation/FE/final model. ---
-    from utils import stratified_subsample_idx, _parse_month_labels
+        # --- Build a single decision sample for drift detection, feature selection,
+        # and weight tournament. Full data flows through mitigation/FE/final model. ---
+        from utils import stratified_subsample_idx, _parse_month_labels
 
-    _DECISION_SAMPLE_SIZE = 100_000
-    _decision_idx = None
-    _month_vals = None
-    for tc in feature_types.get("temporal", []):
-        if tc in train.columns:
-            _month_vals = _parse_month_labels(train[tc])
-            if _month_vals is not None:
-                break
-
-    if len(train) > _DECISION_SAMPLE_SIZE:
-        _decision_idx = stratified_subsample_idx(
-            len(train), _DECISION_SAMPLE_SIZE,
-            month_values=_month_vals, seed=42,
-        )
-        logger.info(
-            f"Decision sample: {_DECISION_SAMPLE_SIZE:,}/{len(train):,} rows"
-            f"{' (stratified by temporal)' if _month_vals is not None else ''}"
-        )
-    train_decision = train[_decision_idx] if _decision_idx is not None else train
-
-    # --- Dynamic pipeline cap: keep runtime under 10 minutes ---
-    # Based on benchmark: 2M rows × 200 cols ≈ 230s computation.
-    # Budget 480s for computation (leaving ~2 min for CSV I/O).
-    _RUNTIME_BUDGET_S = 480
-    _COST_PER_ROW_COL = 5.75e-7  # seconds per row × column (from 2M×200 benchmark)
-    n_cols = len(train.columns)
-    _max_pipeline_rows = int(_RUNTIME_BUDGET_S / (_COST_PER_ROW_COL * max(n_cols, 1)))
-    _max_pipeline_rows = max(_max_pipeline_rows, _DECISION_SAMPLE_SIZE)  # never below decision sample
-
-    if len(train) > _max_pipeline_rows:
-        _original_train_len = len(train)
-        _pipeline_idx = stratified_subsample_idx(
-            len(train), _max_pipeline_rows,
-            month_values=_month_vals, seed=42,
-        )
-        train = train[_pipeline_idx]
-        # Recompute month values and decision index on the capped train
-        # (original _decision_idx pointed into pre-cap rows, now invalid)
+        _DECISION_SAMPLE_SIZE = 100_000
+        _decision_idx = None
         _month_vals = None
         for tc in feature_types.get("temporal", []):
             if tc in train.columns:
                 _month_vals = _parse_month_labels(train[tc])
                 if _month_vals is not None:
                     break
+
         if len(train) > _DECISION_SAMPLE_SIZE:
             _decision_idx = stratified_subsample_idx(
                 len(train), _DECISION_SAMPLE_SIZE,
                 month_values=_month_vals, seed=42,
             )
-        else:
-            _decision_idx = None
+            logger.info(
+                f"Decision sample: {_DECISION_SAMPLE_SIZE:,}/{len(train):,} rows"
+                f"{' (stratified by temporal)' if _month_vals is not None else ''}"
+            )
         train_decision = train[_decision_idx] if _decision_idx is not None else train
-        logger.info(
-            f"Pipeline cap: {_max_pipeline_rows:,}/{_original_train_len:,} rows "
-            f"(dynamic, targeting <{_RUNTIME_BUDGET_S}s for {n_cols} cols)"
-        )
-    else:
-        logger.info(f"Pipeline cap: no cap needed ({len(train):,} rows × {n_cols} cols fits within budget)")
+
+        # --- Dynamic pipeline cap: keep runtime under 10 minutes ---
+        # Based on benchmark: 2M rows × 200 cols ≈ 230s computation.
+        # Budget 480s for computation (leaving ~2 min for CSV I/O).
+        _RUNTIME_BUDGET_S = 480
+        _COST_PER_ROW_COL = 5.75e-7  # seconds per row × column (from 2M×200 benchmark)
+        n_cols = len(train.columns)
+        _max_pipeline_rows = int(_RUNTIME_BUDGET_S / (_COST_PER_ROW_COL * max(n_cols, 1)))
+        _max_pipeline_rows = max(_max_pipeline_rows, _DECISION_SAMPLE_SIZE)  # never below decision sample
+
+        if len(train) > _max_pipeline_rows:
+            _original_train_len = len(train)
+            _pipeline_idx = stratified_subsample_idx(
+                len(train), _max_pipeline_rows,
+                month_values=_month_vals, seed=42,
+            )
+            train = train[_pipeline_idx]
+            # Recompute month values and decision index on the capped train
+            # (original _decision_idx pointed into pre-cap rows, now invalid)
+            _month_vals = None
+            for tc in feature_types.get("temporal", []):
+                if tc in train.columns:
+                    _month_vals = _parse_month_labels(train[tc])
+                    if _month_vals is not None:
+                        break
+            if len(train) > _DECISION_SAMPLE_SIZE:
+                _decision_idx = stratified_subsample_idx(
+                    len(train), _DECISION_SAMPLE_SIZE,
+                    month_values=_month_vals, seed=42,
+                )
+            else:
+                _decision_idx = None
+            train_decision = train[_decision_idx] if _decision_idx is not None else train
+            logger.info(
+                f"Pipeline cap: {_max_pipeline_rows:,}/{_original_train_len:,} rows "
+                f"(dynamic, targeting <{_RUNTIME_BUDGET_S}s for {n_cols} cols)"
+            )
+        else:
+            logger.info(f"Pipeline cap: no cap needed ({len(train):,} rows × {n_cols} cols fits within budget)")
 
     # --- Stage 2: Drift Detection (train vs test) ---
     with Timer("Drift detection") as drift_timer:
@@ -385,38 +391,28 @@ def main():
     with Timer("Model training") as model_timer:
         import numpy as np
 
-        # Baseline model (subsampled for comparison metrics only)
-        _MAX_BASELINE_SAMPLE = 50_000
-        train_baseline = train
-        if len(train) > _MAX_BASELINE_SAMPLE:
-            train_baseline = train.sample(n=_MAX_BASELINE_SAMPLE, seed=42)
-            logger.info(f"Baseline model: subsampling {_MAX_BASELINE_SAMPLE}/{len(train)} rows")
-        X_train_b, y_train_b, X_test_b, customer_ids = prepare_features(
-            train_baseline, test, feature_types
-        )
-        lgbm_b = train_model(X_train_b, y_train_b)
-        baseline_metrics = evaluate_and_save(
-            lgbm_b, X_train_b, y_train_b, X_test_b, customer_ids, test, feature_types,
-            tag="baseline",
-        )
-
-        # Mitigated model
+        # Mitigated model — prepare features once, reuse for baseline + tournament
         X_train_m, y_train_m, X_test_m, customer_ids = prepare_features(
             train_m, test_m, feature_types, extra_drop_cols=drop_cols
         )
 
-        # --- Feature selection: use decision sample to prune zero-importance features ---
+        # Baseline model: reuse mitigated features, subsample, uniform weights
+        _MAX_BASELINE_SAMPLE = 50_000
+        baseline_idx = np.random.RandomState(42).choice(
+            len(X_train_m), min(_MAX_BASELINE_SAMPLE, len(X_train_m)), replace=False
+        )
+        lgbm_b = train_model(X_train_m[baseline_idx], y_train_m.gather(baseline_idx.tolist()))
+        baseline_metrics = evaluate_and_save(
+            lgbm_b, X_train_m, y_train_m, X_test_m, customer_ids, test_m, feature_types,
+            tag="baseline",
+        )
+
+        # --- Feature selection: reuse baseline model importances ---
         from sklearn.metrics import average_precision_score
         from model import _encode_target
 
         try:
-            if _decision_idx is not None and len(X_train_m) > _DECISION_SAMPLE_SIZE:
-                # Reuse decision sample indices (clamped to current DataFrame size)
-                fs_idx = _decision_idx[_decision_idx < len(X_train_m)]
-                fs_model = train_model(X_train_m[fs_idx], y_train_m.gather(fs_idx.tolist()))
-            else:
-                fs_model = train_model(X_train_m, y_train_m)
-            importances = fs_model.feature_importances_
+            importances = lgbm_b.feature_importances_
             imp_by_col = dict(zip(X_train_m.columns, importances))
 
             # Drop zero-importance features
@@ -469,7 +465,7 @@ def main():
         y_test_m = _encode_target(test_m[target_col]) if has_test_labels else None
 
         # Reuse decision sample for weight tournament (larger than drift sample for stability)
-        _TOURNEY_SAMPLE_SIZE = 300_000
+        _TOURNEY_SAMPLE_SIZE = 200_000
         _tourney_idx = None
         _test_tourney_idx = None
 
@@ -487,30 +483,37 @@ def main():
             )
             logger.info(f"Weight tournament: subsampling {_TOURNEY_SAMPLE_SIZE:,}/{len(X_test_m):,} test rows")
 
+        # Pre-convert tournament subsets to pandas/numpy ONCE (avoid repeated polars→pandas)
+        if _tourney_idx is not None:
+            _X_tourney_pd = to_pandas_for_lgbm(X_train_m[_tourney_idx])
+            _y_tourney_np = y_train_m.gather(_tourney_idx.tolist()).to_numpy()
+        else:
+            _X_tourney_pd = to_pandas_for_lgbm(X_train_m)
+            _y_tourney_np = y_train_m.to_numpy()
+
+        _X_test_tourney_pd = None
+        _y_test_tourney_np = None
+        if has_test_labels:
+            if _test_tourney_idx is not None:
+                _X_test_tourney_pd = to_pandas_for_lgbm(X_test_m[_test_tourney_idx])
+                _y_test_tourney_np = y_test_m.gather(_test_tourney_idx.tolist()).to_numpy()
+            else:
+                _X_test_tourney_pd = to_pandas_for_lgbm(X_test_m)
+                _y_test_tourney_np = y_test_m.to_numpy()
+
         def _eval_candidate(label, weights):
             """Train with weights, return (label, weights, test_auprc, train_auprc)."""
-            if _tourney_idx is not None:
-                X_sub = X_train_m[_tourney_idx]
-                y_sub = y_train_m.gather(_tourney_idx.tolist())
-                w_sub = weights[_tourney_idx] if weights is not None else None
-            else:
-                X_sub, y_sub, w_sub = X_train_m, y_train_m, weights
-            m = train_model(X_sub, y_sub, sample_weight=w_sub)
-            # LightGBM predict_proba needs pandas — convert polars DataFrame
-            X_sub_pd = to_pandas_for_lgbm(X_sub) if isinstance(X_sub, pl.DataFrame) else X_sub
-            train_proba = m.predict_proba(X_sub_pd)[:, 1]
-            y_sub_np = y_sub.to_numpy() if isinstance(y_sub, pl.Series) else np.asarray(y_sub)
-            train_sc = average_precision_score(y_sub_np, train_proba)
+            w_sub = weights[_tourney_idx] if (weights is not None and _tourney_idx is not None) else weights
+            m = LGBMClassifier(
+                verbosity=-1, objective="binary", is_unbalance=True,
+                random_state=42, importance_type="gain",
+            )
+            m.fit(_X_tourney_pd, _y_tourney_np, sample_weight=w_sub)
+            train_proba = m.predict_proba(_X_tourney_pd)[:, 1]
+            train_sc = average_precision_score(_y_tourney_np, train_proba)
             if has_test_labels:
-                if _test_tourney_idx is not None:
-                    X_test_sub = X_test_m[_test_tourney_idx]
-                    y_test_sub = y_test_m.gather(_test_tourney_idx.tolist())
-                else:
-                    X_test_sub, y_test_sub = X_test_m, y_test_m
-                X_test_sub_pd = to_pandas_for_lgbm(X_test_sub) if isinstance(X_test_sub, pl.DataFrame) else X_test_sub
-                test_proba = m.predict_proba(X_test_sub_pd)[:, 1]
-                y_test_sub_np = y_test_sub.to_numpy() if isinstance(y_test_sub, pl.Series) else np.asarray(y_test_sub)
-                test_sc = average_precision_score(y_test_sub_np, test_proba)
+                test_proba = m.predict_proba(_X_test_tourney_pd)[:, 1]
+                test_sc = average_precision_score(_y_test_tourney_np, test_proba)
             else:
                 test_sc = train_sc  # fallback to train if no test labels
             logger.info(f"  {label} -> train={train_sc:.4f} test={test_sc:.4f}")
@@ -576,14 +579,14 @@ def main():
             blend_obj, blend_evals = _make_cached_objective(_build_blend, "Blend")
             logger.info("Weight tournament: optimizing Blend (Nelder-Mead)")
             minimize(blend_obj, x0=[0.5, 0.7, 0.15], method='Nelder-Mead',
-                     options={'maxiter': 8, 'maxfev': 12, 'xatol': 0.02, 'fatol': 0.0005})
+                     options={'maxiter': 6, 'maxfev': 8, 'xatol': 0.02, 'fatol': 0.0005})
             all_results.extend(blend_evals)
 
             # 3. Optimize geometric mean
             geom_obj, geom_evals = _make_cached_objective(_build_geometric, "Geometric")
             logger.info("Weight tournament: optimizing Geometric (Nelder-Mead)")
             minimize(geom_obj, x0=[0.5, 0.7, 0.15], method='Nelder-Mead',
-                     options={'maxiter': 8, 'maxfev': 12, 'xatol': 0.02, 'fatol': 0.0005})
+                     options={'maxiter': 6, 'maxfev': 8, 'xatol': 0.02, 'fatol': 0.0005})
             all_results.extend(geom_evals)
 
         elif has_domain:
@@ -633,7 +636,8 @@ def main():
         ("Mitigated", mitigated_metrics),
     ]
     print_model_performance_summary(model_results)
-    print_runtime_summary(drift_timer.elapsed, mitigation_timer.elapsed, feat_timer.elapsed, model_timer.elapsed, refine_timer.elapsed)
+    _pipeline_elapsed = time.perf_counter() - _pipeline_start
+    print_runtime_summary(ingest_timer.elapsed, drift_timer.elapsed, mitigation_timer.elapsed, feat_timer.elapsed, model_timer.elapsed, refine_timer.elapsed, _pipeline_elapsed)
 
 
 if __name__ == "__main__":

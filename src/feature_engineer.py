@@ -32,8 +32,8 @@ def engineer_features(
     """
     import pandas as pd
     _input_was_pandas = isinstance(train, pd.DataFrame)
-    train = _ensure_pl_df(train).clone()
-    test = _ensure_pl_df(test).clone()
+    train = _ensure_pl_df(train)
+    test = _ensure_pl_df(test)
 
     skip_cols = set(feature_types.get("id", []) + feature_types.get("target", []))
     if drop_cols:
