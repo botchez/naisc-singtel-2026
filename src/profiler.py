@@ -234,7 +234,7 @@ def profile_data(
             if col not in df_cols:
                 continue
             non_null = df[col].drop_nulls()
-            sample_val = non_null[0] if len(non_null) > 0 else None
+            sample_val = str(non_null[0]) if len(non_null) > 0 else None
             rows.append(
                 {
                     "column": col,
