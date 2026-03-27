@@ -431,14 +431,17 @@ def _apply_bh_correction(drift_df, ss_factor: float = 1.0):
     all_pvals = []
     pval_info = []  # (row_index, pval_col_name)
 
+    has_ks = "ks_pval" in drift_df.columns
+    has_chi2 = "chi2_pval" in drift_df.columns
+
     for i in range(n):
         ft = drift_df["feature_type"][i]
-        if ft == "numerical":
+        if ft == "numerical" and has_ks:
             ks_p = drift_df["ks_pval"][i]
             if ks_p is not None:
                 all_pvals.append(ks_p)
                 pval_info.append((i, "ks_pval"))
-        elif ft in ("categorical", "temporal"):
+        elif ft in ("categorical", "temporal") and has_chi2:
             chi2_p = drift_df["chi2_pval"][i]
             if chi2_p is not None:
                 all_pvals.append(chi2_p)
@@ -474,20 +477,18 @@ def _apply_bh_correction(drift_df, ss_factor: float = 1.0):
         miss_sev = _missingness_severity(train_null, test_null)
 
         if row_ft == "numerical":
-            ks_p = ks_bh[i] if ks_bh[i] is not None else (drift_df["ks_pval"][i] or 1.0)
-            psi = drift_df["psi"][i] or 0.0
-            w_norm = drift_df["wasserstein_norm"][i] or 0.0
-            ks_d = drift_df["ks_stat"][i] or 0.0
-            iqr_r = drift_df["iqr_ratio"][i] if "iqr_ratio" in drift_df.columns else 1.0
-            iqr_r = iqr_r or 1.0
-            t_div = drift_df["tail_divergence"][i] if "tail_divergence" in drift_df.columns else 0.0
-            t_div = t_div or 0.0
+            ks_p = ks_bh[i] if ks_bh[i] is not None else ((drift_df["ks_pval"][i] if has_ks else None) or 1.0)
+            psi = (drift_df["psi"][i] if "psi" in drift_df.columns else None) or 0.0
+            w_norm = (drift_df["wasserstein_norm"][i] if "wasserstein_norm" in drift_df.columns else None) or 0.0
+            ks_d = (drift_df["ks_stat"][i] if "ks_stat" in drift_df.columns else None) or 0.0
+            iqr_r = (drift_df["iqr_ratio"][i] if "iqr_ratio" in drift_df.columns else None) or 1.0
+            t_div = (drift_df["tail_divergence"][i] if "tail_divergence" in drift_df.columns else None) or 0.0
             sev = _numerical_severity(ks_p, psi, w_norm, ks_d, iqr_r, t_div, ss_factor)
             new_severities.append(_escalate_severity(sev, miss_sev))
         elif row_ft in ("categorical", "temporal"):
-            chi2_p = chi2_bh[i] if chi2_bh[i] is not None else (drift_df["chi2_pval"][i] or 1.0)
-            jsd = drift_df["jsd"][i] or 0.0
-            cv = drift_df["cramers_v"][i] if "cramers_v" in drift_df.columns else 0.0
+            chi2_p = chi2_bh[i] if chi2_bh[i] is not None else ((drift_df["chi2_pval"][i] if has_chi2 else None) or 1.0)
+            jsd = (drift_df["jsd"][i] if "jsd" in drift_df.columns else None) or 0.0
+            cv = (drift_df["cramers_v"][i] if "cramers_v" in drift_df.columns else None) or 0.0
             cv = cv or 0.0
             sev = _categorical_severity(chi2_p, jsd, cv, ss_factor)
             new_severities.append(_escalate_severity(sev, miss_sev))
