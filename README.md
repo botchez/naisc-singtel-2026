@@ -5,7 +5,7 @@
 ## Quick Start (Docker)
 
 ```bash
-docker build -t naisc . && docker run --rm naisc
+docker build -t naisc .; docker run --rm --cpus=2 naisc
 ```
 
 ## Setup (without Docker)
@@ -20,10 +20,10 @@ pip install -r requirements.txt
 python ./src/main.py --train_data_filepath <train_data_filepath> --test_data_filepath <test_data_filepath>
 ```
 
-Example with public data:
+Example with stress test data:
 
 ```bash
-python ./src/main.py --train_data_filepath public_data/train.csv --test_data_filepath public_data/test.csv
+python ./src/main.py --train_data_filepath stress_test_data/train.csv --test_data_filepath stress_test_data/test.csv
 ```
 
 ## Output

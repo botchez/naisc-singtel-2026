@@ -237,6 +237,10 @@ def prepare_features(
             if not pd.api.types.is_numeric_dtype(X_train[col]):
                 mode = X_train[col].mode()
                 fill_val = mode.iloc[0] if not mode.empty else 0
+                # Add fill_val to categories if column is categorical
+                for df in (X_train, X_test):
+                    if hasattr(df[col], 'cat') and fill_val not in df[col].cat.categories:
+                        df[col] = df[col].cat.add_categories(fill_val)
                 X_train[col] = X_train[col].fillna(fill_val)
                 X_test[col] = X_test[col].fillna(fill_val)
 

@@ -8,6 +8,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ src/
-COPY public_data/ public_data/
+COPY stress_test_data/ stress_test_data/
 
-CMD ["python", "./src/main.py", "--train_data_filepath", "public_data/train.csv", "--test_data_filepath", "public_data/test.csv"]
+CMD ["python", "./src/main.py", "--train_data_filepath", "stress_test_data/train.csv", "--test_data_filepath", "stress_test_data/test.csv"]
