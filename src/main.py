@@ -391,21 +391,35 @@ def main():
     with Timer("Model training") as model_timer:
         import numpy as np
 
-        # Mitigated model — prepare features once
+        # Baseline model: raw features (no mitigation) — shows value of drift handling
+        _MAX_BASELINE_SAMPLE = 50_000
+        train_baseline = train.sample(n=min(_MAX_BASELINE_SAMPLE, len(train)), seed=42) if len(train) > _MAX_BASELINE_SAMPLE else train
+        if len(train) > _MAX_BASELINE_SAMPLE:
+            logger.info(f"Baseline model: subsampling {_MAX_BASELINE_SAMPLE}/{len(train)} rows")
+        X_train_b, y_train_b, X_test_b, customer_ids = prepare_features(
+            train_baseline, test, feature_types
+        )
+        lgbm_b = train_model(X_train_b, y_train_b)
+        baseline_metrics = evaluate_and_save(
+            lgbm_b, X_train_b, y_train_b, X_test_b, customer_ids, test, feature_types,
+            tag="baseline",
+        )
+
+        # Mitigated model — prepare features with mitigation
         X_train_m, y_train_m, X_test_m, customer_ids = prepare_features(
             train_m, test_m, feature_types, extra_drop_cols=drop_cols
         )
 
-        # --- Feature selection: quick model on subsample for importances ---
+        # --- Feature selection: use decision sample for importances ---
         from sklearn.metrics import average_precision_score
         from model import _encode_target
 
         try:
-            _FS_SAMPLE = 50_000
-            fs_idx = np.random.RandomState(42).choice(
-                len(X_train_m), min(_FS_SAMPLE, len(X_train_m)), replace=False
-            )
-            fs_model = train_model(X_train_m[fs_idx], y_train_m.gather(fs_idx.tolist()))
+            if _decision_idx is not None and len(X_train_m) > _DECISION_SAMPLE_SIZE:
+                fs_idx = _decision_idx[_decision_idx < len(X_train_m)]
+                fs_model = train_model(X_train_m[fs_idx], y_train_m.gather(fs_idx.tolist()))
+            else:
+                fs_model = train_model(X_train_m, y_train_m)
             importances = fs_model.feature_importances_
             imp_by_col = dict(zip(X_train_m.columns, importances))
 
@@ -459,7 +473,7 @@ def main():
         y_test_m = _encode_target(test_m[target_col]) if has_test_labels else None
 
         # Reuse decision sample for weight tournament (larger than drift sample for stability)
-        _TOURNEY_SAMPLE_SIZE = 200_000
+        _TOURNEY_SAMPLE_SIZE = 300_000
         _tourney_idx = None
         _test_tourney_idx = None
 
@@ -478,21 +492,22 @@ def main():
             logger.info(f"Weight tournament: subsampling {_TOURNEY_SAMPLE_SIZE:,}/{len(X_test_m):,} test rows")
 
         # Pre-convert tournament subsets to pandas/numpy ONCE (avoid repeated polars→pandas)
+        from model import _to_pandas_with_categoricals, _native_cat_cols
         if _tourney_idx is not None:
-            _X_tourney_pd = to_pandas_for_lgbm(X_train_m[_tourney_idx])
+            _X_tourney_pd = _to_pandas_with_categoricals(X_train_m[_tourney_idx], _native_cat_cols)
             _y_tourney_np = y_train_m.gather(_tourney_idx.tolist()).to_numpy()
         else:
-            _X_tourney_pd = to_pandas_for_lgbm(X_train_m)
+            _X_tourney_pd = _to_pandas_with_categoricals(X_train_m, _native_cat_cols)
             _y_tourney_np = y_train_m.to_numpy()
 
         _X_test_tourney_pd = None
         _y_test_tourney_np = None
         if has_test_labels:
             if _test_tourney_idx is not None:
-                _X_test_tourney_pd = to_pandas_for_lgbm(X_test_m[_test_tourney_idx])
+                _X_test_tourney_pd = _to_pandas_with_categoricals(X_test_m[_test_tourney_idx], _native_cat_cols)
                 _y_test_tourney_np = y_test_m.gather(_test_tourney_idx.tolist()).to_numpy()
             else:
-                _X_test_tourney_pd = to_pandas_for_lgbm(X_test_m)
+                _X_test_tourney_pd = _to_pandas_with_categoricals(X_test_m, _native_cat_cols)
                 _y_test_tourney_np = y_test_m.to_numpy()
 
         def _eval_candidate(label, weights):
@@ -573,14 +588,14 @@ def main():
             blend_obj, blend_evals = _make_cached_objective(_build_blend, "Blend")
             logger.info("Weight tournament: optimizing Blend (Nelder-Mead)")
             minimize(blend_obj, x0=[0.5, 0.7, 0.15], method='Nelder-Mead',
-                     options={'maxiter': 6, 'maxfev': 8, 'xatol': 0.02, 'fatol': 0.0005})
+                     options={'maxiter': 8, 'maxfev': 12, 'xatol': 0.02, 'fatol': 0.0005})
             all_results.extend(blend_evals)
 
             # 3. Optimize geometric mean
             geom_obj, geom_evals = _make_cached_objective(_build_geometric, "Geometric")
             logger.info("Weight tournament: optimizing Geometric (Nelder-Mead)")
             minimize(geom_obj, x0=[0.5, 0.7, 0.15], method='Nelder-Mead',
-                     options={'maxiter': 6, 'maxfev': 8, 'xatol': 0.02, 'fatol': 0.0005})
+                     options={'maxiter': 8, 'maxfev': 12, 'xatol': 0.02, 'fatol': 0.0005})
             all_results.extend(geom_evals)
 
         elif has_domain:
@@ -624,7 +639,11 @@ def main():
     # --- All tables printed after all stages complete ---
     print_drift_mitigation_summary(drift_df, drop_cols, mitigation_log, norm_log)
     print_multivariate_shift_summary(shift_info, weight_status)
-    print_model_performance_summary(mitigated_metrics)
+    model_results = [
+        ("Baseline", baseline_metrics),
+        ("Mitigated", mitigated_metrics),
+    ]
+    print_model_performance_summary(model_results)
     _pipeline_elapsed = time.perf_counter() - _pipeline_start
     print_runtime_summary(ingest_timer.elapsed, drift_timer.elapsed, mitigation_timer.elapsed, feat_timer.elapsed, model_timer.elapsed, refine_timer.elapsed, _pipeline_elapsed)
 

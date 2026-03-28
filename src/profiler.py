@@ -36,8 +36,8 @@ def load_data(train_path: str, test_path: str) -> tuple[pl.DataFrame, pl.DataFra
     Applies dtype downcasting to reduce memory footprint for large datasets
     (e.g., 10M rows x 500 features).
     """
-    train = pl.read_csv(train_path, infer_schema_length=10000)
-    test = pl.read_csv(test_path, infer_schema_length=10000)
+    train = pl.read_csv(train_path, infer_schema_length=0)
+    test = pl.read_csv(test_path, infer_schema_length=0)
 
     # Polars rejects duplicate column names on read, but handle edge cases
     # where columns were auto-renamed with _duplicated_N suffix

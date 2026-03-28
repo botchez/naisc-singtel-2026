@@ -182,6 +182,10 @@ def prepare_features(
     if native_cat_cols:
         logger.info(f"Native categorical encoding for {len(native_cat_cols)} high-cardinality cols: {native_cat_cols}")
 
+    # Store native cat cols at module level so train_model can set category dtype
+    global _native_cat_cols
+    _native_cat_cols = list(native_cat_cols)
+
     # Native categorical: integer label encode (keep as Int64 for LightGBM compatibility)
     for col in native_cat_cols:
         try:
@@ -327,6 +331,21 @@ def prepare_features(
     return X_train, y_train, X_test, customer_ids
 
 
+def _to_pandas_with_categoricals(df: pl.DataFrame, cat_cols: list[str] | None = None):
+    """Convert polars DataFrame to pandas, preserving categorical dtype for LightGBM."""
+    import pandas as pd
+    pdf = to_pandas_for_lgbm(df)
+    if cat_cols:
+        for col in cat_cols:
+            if col in pdf.columns:
+                pdf[col] = pdf[col].astype("category")
+    return pdf
+
+
+# Module-level storage for categorical columns detected during prepare_features
+_native_cat_cols: list[str] = []
+
+
 def train_model(
     X_train,
     y_train,
@@ -343,7 +362,7 @@ def train_model(
     # LightGBM needs pandas/numpy — convert polars if needed
     import pandas as pd
     if isinstance(X_train, pl.DataFrame):
-        X_fit = to_pandas_for_lgbm(X_train)
+        X_fit = _to_pandas_with_categoricals(X_train, _native_cat_cols)
     elif isinstance(X_train, pd.DataFrame):
         X_fit = X_train
     else:
@@ -380,16 +399,16 @@ def evaluate_and_save(
     import pandas as pd
     suffix = f"_{tag}" if tag else ""
 
-    # Convert for LightGBM predict_proba
+    # Convert for LightGBM predict_proba (preserve category dtypes)
     if isinstance(X_train, pl.DataFrame):
-        X_train_lgbm = to_pandas_for_lgbm(X_train)
+        X_train_lgbm = _to_pandas_with_categoricals(X_train, _native_cat_cols)
     elif isinstance(X_train, pd.DataFrame):
         X_train_lgbm = X_train
     else:
         X_train_lgbm = X_train
 
     if isinstance(X_test, pl.DataFrame):
-        X_test_lgbm = to_pandas_for_lgbm(X_test)
+        X_test_lgbm = _to_pandas_with_categoricals(X_test, _native_cat_cols)
     elif isinstance(X_test, pd.DataFrame):
         X_test_lgbm = X_test
     else:
@@ -437,31 +456,45 @@ def evaluate_and_save(
 
 
 def print_model_performance_summary(
-    metrics: dict[str, float],
+    model_results: list[tuple[str, dict[str, float]]],
 ) -> None:
-    """Print model performance table for the final model."""
-    CW = (18, 16)
-    total = sum(CW) + len(CW) - 1
+    """Print model performance table comparing baseline vs mitigated."""
+    CW_metric = 18
+    CW_val = 16
+    n_models = len(model_results)
+    # Column widths: metric + one value column per model
+    total = CW_metric + CW_val * n_models + n_models
     title = "MODEL PERFORMANCE SUMMARY"
-
-    def h(l, m, r):
-        return f"{l}{'═'*CW[0]}{m}{'═'*CW[1]}{r}"
-
-    def col_row(c1, c2):
-        return f"║ {c1:<{CW[0]-2}} ║ {c2:<{CW[1]-2}} ║"
 
     metric_rows = [
         ("AU-PRC (train)", "train_auprc"),
         ("AU-PRC (test)", "test_auprc"),
     ]
 
+    def h_line(left, right):
+        line = left + "═" * CW_metric
+        for _ in range(n_models):
+            line += "╬" + "═" * CW_val
+        line += right
+        return line
+
     print()
     print(f"╔{'═' * total}╗")
     print(f"║{title:^{total}}║")
-    print(h("╠", "╦", "╣"))
-    print(col_row("Metric", "Value"))
-    print(h("╠", "╬", "╣"))
+    print(h_line("╠", "╣"))
+    # Header row
+    header = f"║ {'Metric':<{CW_metric-2}} "
+    for name, _ in model_results:
+        header += f"║ {name:<{CW_val-2}} "
+    header += "║"
+    print(header)
+    print(h_line("╠", "╣"))
+    # Data rows
     for label, key in metric_rows:
-        v = metrics.get(key)
-        print(col_row(label, f"{v:.4f}" if v is not None else "N/A"))
-    print(h("╚", "╩", "╝"))
+        row = f"║ {label:<{CW_metric-2}} "
+        for _, metrics in model_results:
+            v = metrics.get(key)
+            row += f"║ {v:<{CW_val-2}.4f} " if v is not None else f"║ {'N/A':<{CW_val-2}} "
+        row += "║"
+        print(row)
+    print(h_line("╚", "╝"))
