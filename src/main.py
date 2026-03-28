@@ -391,28 +391,22 @@ def main():
     with Timer("Model training") as model_timer:
         import numpy as np
 
-        # Mitigated model — prepare features once, reuse for baseline + tournament
+        # Mitigated model — prepare features once
         X_train_m, y_train_m, X_test_m, customer_ids = prepare_features(
             train_m, test_m, feature_types, extra_drop_cols=drop_cols
         )
 
-        # Baseline model: reuse mitigated features, subsample, uniform weights
-        _MAX_BASELINE_SAMPLE = 50_000
-        baseline_idx = np.random.RandomState(42).choice(
-            len(X_train_m), min(_MAX_BASELINE_SAMPLE, len(X_train_m)), replace=False
-        )
-        lgbm_b = train_model(X_train_m[baseline_idx], y_train_m.gather(baseline_idx.tolist()))
-        baseline_metrics = evaluate_and_save(
-            lgbm_b, X_train_m, y_train_m, X_test_m, customer_ids, test_m, feature_types,
-            tag="baseline",
-        )
-
-        # --- Feature selection: reuse baseline model importances ---
+        # --- Feature selection: quick model on subsample for importances ---
         from sklearn.metrics import average_precision_score
         from model import _encode_target
 
         try:
-            importances = lgbm_b.feature_importances_
+            _FS_SAMPLE = 50_000
+            fs_idx = np.random.RandomState(42).choice(
+                len(X_train_m), min(_FS_SAMPLE, len(X_train_m)), replace=False
+            )
+            fs_model = train_model(X_train_m[fs_idx], y_train_m.gather(fs_idx.tolist()))
+            importances = fs_model.feature_importances_
             imp_by_col = dict(zip(X_train_m.columns, importances))
 
             # Drop zero-importance features
@@ -630,12 +624,7 @@ def main():
     # --- All tables printed after all stages complete ---
     print_drift_mitigation_summary(drift_df, drop_cols, mitigation_log, norm_log)
     print_multivariate_shift_summary(shift_info, weight_status)
-
-    model_results = [
-        ("Baseline", baseline_metrics),
-        ("Mitigated", mitigated_metrics),
-    ]
-    print_model_performance_summary(model_results)
+    print_model_performance_summary(mitigated_metrics)
     _pipeline_elapsed = time.perf_counter() - _pipeline_start
     print_runtime_summary(ingest_timer.elapsed, drift_timer.elapsed, mitigation_timer.elapsed, feat_timer.elapsed, model_timer.elapsed, refine_timer.elapsed, _pipeline_elapsed)
 

@@ -437,22 +437,18 @@ def evaluate_and_save(
 
 
 def print_model_performance_summary(
-    model_results: list[tuple[str, dict[str, float]]],
+    metrics: dict[str, float],
 ) -> None:
-    """Print model performance table comparing all model variants with deltas."""
-    CW = (18, 16, 16, 16)
+    """Print model performance table for the final model."""
+    CW = (18, 16)
     total = sum(CW) + len(CW) - 1
     title = "MODEL PERFORMANCE SUMMARY"
 
     def h(l, m, r):
-        return f"{l}{'═'*CW[0]}{m}{'═'*CW[1]}{m}{'═'*CW[2]}{m}{'═'*CW[3]}{r}"
+        return f"{l}{'═'*CW[0]}{m}{'═'*CW[1]}{r}"
 
-    def col_row(c1, c2, c3, c4):
-        return f"║ {c1:<{CW[0]-2}} ║ {c2:<{CW[1]-2}} ║ {c3:<{CW[2]-2}} ║ {c4:<{CW[3]-2}} ║"
-
-    # Extract baseline (first) and mitigated (second) results
-    baseline = model_results[0][1] if len(model_results) > 0 else {}
-    mitigated = model_results[1][1] if len(model_results) > 1 else {}
+    def col_row(c1, c2):
+        return f"║ {c1:<{CW[0]-2}} ║ {c2:<{CW[1]-2}} ║"
 
     metric_rows = [
         ("AU-PRC (train)", "train_auprc"),
@@ -463,16 +459,9 @@ def print_model_performance_summary(
     print(f"╔{'═' * total}╗")
     print(f"║{title:^{total}}║")
     print(h("╠", "╦", "╣"))
-    print(col_row("Metric", "Baseline", "Mitigated", "Delta"))
+    print(col_row("Metric", "Value"))
     print(h("╠", "╬", "╣"))
     for label, key in metric_rows:
-        b = baseline.get(key)
-        m = mitigated.get(key)
-        b_v = f"{b:.4f}" if b is not None else "N/A"
-        m_v = f"{m:.4f}" if m is not None else "N/A"
-        if b is not None and m is not None:
-            delta_v = f"{m - b:+.4f}"
-        else:
-            delta_v = "N/A"
-        print(col_row(label, b_v, m_v, delta_v))
+        v = metrics.get(key)
+        print(col_row(label, f"{v:.4f}" if v is not None else "N/A"))
     print(h("╚", "╩", "╝"))

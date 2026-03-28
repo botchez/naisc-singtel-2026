@@ -76,8 +76,8 @@ def engineer_features(
             fname = f"{col}_freq"
             if fname in existing_cols:
                 continue
-            _freq_train_parts[fname] = train[col].replace_strict(freq_map, default=0.0, return_dtype=pl.Float64)
-            _freq_test_parts[fname] = test[col].replace_strict(freq_map, default=0.0, return_dtype=pl.Float64)
+            _freq_train_parts[fname] = train[col].replace_strict(freq_map, default=0.0, return_dtype=pl.Float64).fill_null(0.0)
+            _freq_test_parts[fname] = test[col].replace_strict(freq_map, default=0.0, return_dtype=pl.Float64).fill_null(0.0)
             freq_features.append(fname)
             existing_cols.add(fname)
 
