@@ -14,6 +14,39 @@ def _ensure_pl_df(df) -> pl.DataFrame:
     return df
 
 
+def _pairwise_corr_matrix(df: pl.DataFrame, cols: list[str]) -> np.ndarray:
+    """Compute pairwise-complete correlation matrix (matching pandas .corr() behavior).
+
+    For each pair of columns, uses only rows where BOTH values are non-null.
+    Returns an absolute correlation matrix as a numpy array.
+    """
+    n = len(cols)
+    corr = np.eye(n)
+    # Extract columns as numpy arrays (float64)
+    arrays = {}
+    for c in cols:
+        arrays[c] = df[c].cast(pl.Float64, strict=False).to_numpy()
+
+    for i in range(n):
+        a = arrays[cols[i]]
+        for j in range(i + 1, n):
+            b = arrays[cols[j]]
+            # Pairwise complete: use only rows where both are non-NaN
+            mask = ~(np.isnan(a) | np.isnan(b))
+            if mask.sum() < 3:
+                corr[i, j] = corr[j, i] = 0.0
+                continue
+            a_valid, b_valid = a[mask], b[mask]
+            a_std = a_valid.std()
+            b_std = b_valid.std()
+            if a_std == 0 or b_std == 0:
+                corr[i, j] = corr[j, i] = 0.0
+                continue
+            r = np.corrcoef(a_valid, b_valid)[0, 1]
+            corr[i, j] = corr[j, i] = abs(r) if not np.isnan(r) else 0.0
+    return corr
+
+
 def engineer_features(
     train,
     test,
@@ -102,19 +135,18 @@ def engineer_features(
             corr_cols = sorted(variances, key=variances.get, reverse=True)[:_MAX_CORR_COLS]
             logger.info(f"Ratio features: using top {_MAX_CORR_COLS}/{len(num_cols)} cols by variance for correlation")
 
-        # Build numeric data for correlation
+        # Build numeric data for correlation (pairwise-complete, matching pandas .corr())
         corr_train = train.select([to_numeric_coerce(train[c]).alias(c) for c in corr_cols])
         if len(corr_train) > 100_000:
             corr_train = corr_train.sample(n=100_000, seed=42)
-        arr = corr_train.fill_null(0).to_numpy().T.astype(float)
-        corr_matrix = np.abs(np.corrcoef(arr))
+        corr_matrix = _pairwise_corr_matrix(corr_train, corr_cols)
         col_idx = {c: i for i, c in enumerate(corr_cols)}
 
         pairs = []
         for i, col_a in enumerate(corr_cols):
             for col_b in corr_cols[i + 1:]:
                 c = corr_matrix[col_idx[col_a], col_idx[col_b]]
-                if not np.isnan(c) and c > 0.3:
+                if c > 0.3:
                     pairs.append((col_a, col_b, c))
 
         pairs.sort(key=lambda x: x[2], reverse=True)
@@ -207,8 +239,7 @@ def engineer_features(
             corr_data = train.select(num_feature_cols)
             if len(corr_data) > 100_000:
                 corr_data = corr_data.sample(n=100_000, seed=42)
-            arr = corr_data.fill_null(0).to_numpy().T.astype(float)
-            corr = np.abs(np.corrcoef(arr))
+            corr = _pairwise_corr_matrix(corr_data, num_feature_cols)
             col_idx = {c: i for i, c in enumerate(num_feature_cols)}
             # Find pairs with correlation > 0.98
             drop_dupes = set()
@@ -236,9 +267,11 @@ def engineer_features(
     except Exception as e:
         logger.warning(f"Duplicate column detection skipped: {e}")
 
-    # Ensure train and test have identical columns
+    # Ensure train and test have identical feature columns
+    # Preserve train-only columns (target, ID) that aren't expected in test
     common_cols = sorted(set(train.columns) & set(test.columns))
-    train = train.select(common_cols)
+    train_only_keep = [c for c in train.columns if c in skip_cols and c not in test.columns]
+    train = train.select(common_cols + train_only_keep)
     test = test.select(common_cols)
 
     # Filter to only new features that survived column alignment
