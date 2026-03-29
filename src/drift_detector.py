@@ -1,32 +1,15 @@
 import polars as pl
 import numpy as np
 from scipy import stats
-from polars_compat import to_numeric_coerce, is_numeric_col, to_pandas_for_lgbm, to_pandas_series
+from polars_compat import (
+    to_numeric_coerce, is_numeric_col, to_pandas_for_lgbm,
+    ensure_pl_df as _ensure_pl_df, ensure_pl_series as _ensure_pl_series,
+)
 
 # Maximum sample size for statistical tests. Beyond this, additional rows
 # add negligible statistical power but cost O(n log n) compute.  50K is
 # enough for KS, PSI, Chi², and Wasserstein at any practical significance level.
 _MAX_DRIFT_SAMPLE = 50_000
-
-
-def _ensure_pl_series(s) -> pl.Series:
-    """Auto-convert pandas Series to polars if needed (transition helper)."""
-    if isinstance(s, pl.Series):
-        return s
-    import pandas as pd
-    if isinstance(s, pd.Series):
-        return pl.from_pandas(s)
-    return pl.Series(values=s)
-
-
-def _ensure_pl_df(df) -> pl.DataFrame:
-    """Auto-convert pandas DataFrame to polars if needed (transition helper)."""
-    if isinstance(df, pl.DataFrame):
-        return df
-    import pandas as pd
-    if isinstance(df, pd.DataFrame):
-        return pl.from_pandas(df)
-    return df
 
 
 def _subsample_array(arr: np.ndarray, max_n: int = _MAX_DRIFT_SAMPLE, seed: int = 42) -> np.ndarray:
@@ -340,8 +323,8 @@ def _categorical_severity(chi2_pval: float, jsd: float, cramers_v: float = 0.0,
 def generate_drift_description(
     train_col: pl.Series, test_col: pl.Series, feature_type: str, drift_metrics: dict
 ) -> str:
-    train_col, test_col = _ensure_pl_series(train_col), _ensure_pl_series(test_col)
     """Generate a qualitative natural-language description of the drift observed."""
+    train_col, test_col = _ensure_pl_series(train_col), _ensure_pl_series(test_col)
     parts = []
 
     if feature_type == "numerical":
@@ -534,9 +517,8 @@ def run_drift_analysis(
     for col in feature_types["categorical"]:
         if col in train.columns and col in test.columns:
             tasks.append((col, "categorical"))
-    for col in feature_types["temporal"]:
-        if col in train.columns and col in test.columns:
-            tasks.append((col, "temporal"))
+    # Temporal columns (e.g. "25-Jan") are timestamps, not features —
+    # they *should* differ between train/test. Skip drift detection.
 
     # Parallelize when there are many features (>20)
     if len(tasks) > 20:
@@ -767,9 +749,8 @@ def detect_label_shift(
 
     try:
         from model import _encode_target
-        # _encode_target expects pandas Series
-        y_train = _encode_target(to_pandas_series(train[target_col]))
-        y_test = _encode_target(to_pandas_series(test[target_col]))
+        y_train = _encode_target(train[target_col])
+        y_test = _encode_target(test[target_col])
 
         train_rate = float(y_train.mean())
         test_rate = float(y_test.mean())

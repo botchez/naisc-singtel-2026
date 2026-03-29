@@ -5,29 +5,10 @@ from sklearn.metrics import average_precision_score
 from sklearn.model_selection import StratifiedKFold
 import joblib
 from utils import logger
-from polars_compat import to_numeric_coerce, is_numeric_col, to_pandas_for_lgbm
-
-
-# ---------------------------------------------------------------------------
-# Auto-conversion helpers (accept pandas from main.py, work in polars)
-# ---------------------------------------------------------------------------
-
-def _ensure_pl_series(s) -> pl.Series:
-    if isinstance(s, pl.Series):
-        return s
-    import pandas as pd
-    if isinstance(s, pd.Series):
-        return pl.from_pandas(s)
-    return pl.Series(values=s)
-
-
-def _ensure_pl_df(df) -> pl.DataFrame:
-    if isinstance(df, pl.DataFrame):
-        return df
-    import pandas as pd
-    if isinstance(df, pd.DataFrame):
-        return pl.from_pandas(df)
-    return df
+from polars_compat import (
+    to_numeric_coerce, is_numeric_col, to_pandas_for_lgbm,
+    ensure_pl_df as _ensure_pl_df, ensure_pl_series as _ensure_pl_series,
+)
 
 
 def _encode_target(series) -> pl.Series:
@@ -82,17 +63,6 @@ def _encode_target(series) -> pl.Series:
     return to_numeric_coerce(series).fill_null(0).cast(pl.Int64)
 
 
-def _parse_temporal_month(series: pl.Series) -> pl.Series:
-    """Parse temporal column to month number, trying multiple formats."""
-    # Title-case to restore month abbreviations after lowercase normalization
-    s_title = series.cast(pl.Utf8).str.to_titlecase()
-    for fmt in ["%y-%b", "%b-%y", "%Y-%m", "%m-%Y", "%b %Y", "%Y-%b",
-                "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"]:
-        parsed = s_title.str.to_datetime(fmt, strict=False)
-        if parsed.is_not_null().sum() > len(series) * 0.5:
-            return parsed.dt.month().fill_null(0).cast(pl.Int32)
-    return pl.Series(name=series.name, values=np.zeros(len(series), dtype=np.int32))
-
 
 def prepare_features(
     train,
@@ -130,7 +100,9 @@ def prepare_features(
         y_train = pl.Series("target", np.zeros(len(train), dtype=np.int64))
 
     # Columns to use as features (must be in both train and test)
-    drop_cols = feature_types["id"] + feature_types["target"]
+    # Temporal columns are timestamps (e.g. "25-Jan"), not predictive features —
+    # their signal is captured via recency sample weights instead.
+    drop_cols = feature_types["id"] + feature_types["target"] + feature_types.get("temporal", [])
     if extra_drop_cols:
         drop_cols = drop_cols + [c for c in extra_drop_cols if c not in drop_cols]
     feature_cols = [c for c in train.columns if c not in drop_cols and c in test.columns]
@@ -151,15 +123,9 @@ def prepare_features(
                 X_train = X_train.with_columns(to_numeric_coerce(X_train[col]).alias(col))
                 X_test = X_test.with_columns(to_numeric_coerce(X_test[col]).alias(col))
 
-    # Convert temporal columns to month number (1-12)
-    for col in feature_types["temporal"]:
-        if col in feature_cols:
-            X_train = X_train.with_columns(_parse_temporal_month(X_train[col]).alias(col))
-            X_test = X_test.with_columns(_parse_temporal_month(X_test[col]).alias(col))
-
     # Target encoding for categorical columns (k-fold to avoid leakage)
     # High-cardinality categoricals (>10 unique) use LightGBM native categorical splits
-    cat_cols = [c for c in feature_cols if X_train[c].dtype == pl.Utf8 or X_train[c].dtype == pl.Object]
+    cat_cols = [c for c in feature_cols if X_train[c].dtype in (pl.Utf8, pl.String)]
     global_mean = float(y_train.mean())
     from utils import safe_n_splits
     _single_class = y_train.n_unique() < 2
@@ -210,16 +176,9 @@ def prepare_features(
     _te_sample_idx = None
     if _te_use_sample:
         from utils import stratified_subsample_idx
-        # Temporal columns are already parsed to month numbers (1-12) at this point
-        temporal_cols = feature_types.get("temporal", [])
-        te_month_vals = None
-        for tc in temporal_cols:
-            if tc in X_train.columns and is_numeric_col(X_train[tc]):
-                te_month_vals = X_train[tc]
-                break
         _te_sample_idx = stratified_subsample_idx(
             len(X_train), _MAX_TE_SAMPLE,
-            month_values=te_month_vals, seed=42,
+            month_values=None, seed=42,
         )
         logger.info(f"Target encoding: using stratified {_MAX_TE_SAMPLE}/{len(X_train)} sample for fold means")
 

@@ -1,17 +1,7 @@
 import numpy as np
 import polars as pl
-from polars_compat import to_numeric_coerce, is_numeric_col
+from polars_compat import to_numeric_coerce, is_numeric_col, ensure_pl_df as _ensure_pl_df
 from utils import logger
-
-
-def _ensure_pl_df(df) -> pl.DataFrame:
-    """Auto-convert pandas DataFrame to polars if needed (transition helper)."""
-    if isinstance(df, pl.DataFrame):
-        return df
-    import pandas as pd
-    if isinstance(df, pd.DataFrame):
-        return pl.from_pandas(df)
-    return df
 
 
 def _pairwise_corr_matrix(df: pl.DataFrame, cols: list[str]) -> np.ndarray:

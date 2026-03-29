@@ -1,31 +1,12 @@
 import numpy as np
 import polars as pl
-from polars_compat import to_numeric_coerce, is_numeric_col
+from polars_compat import (
+    to_numeric_coerce, is_numeric_col,
+    ensure_pl_df as _ensure_pl_df, ensure_pl_series as _ensure_pl_series,
+)
 from utils import logger
 
 _MAX_EVAL_SAMPLE = 50_000
-
-
-# ── Auto-conversion helpers (transition period) ──────────────────────────
-
-def _ensure_pl_series(s) -> pl.Series:
-    """Auto-convert pandas Series to polars if needed."""
-    if isinstance(s, pl.Series):
-        return s
-    import pandas as pd
-    if isinstance(s, pd.Series):
-        return pl.from_pandas(s)
-    return pl.Series(values=s)
-
-
-def _ensure_pl_df(df) -> pl.DataFrame:
-    """Auto-convert pandas DataFrame to polars if needed."""
-    if isinstance(df, pl.DataFrame):
-        return df
-    import pandas as pd
-    if isinstance(df, pd.DataFrame):
-        return pl.from_pandas(df)
-    return df
 
 
 def _eval_subsample(train_col, test_col, max_n=_MAX_EVAL_SAMPLE, seed=42):
@@ -594,28 +575,6 @@ def mitigate_feature_progressive(
         "strategy_applied": "Drop Feature",
         "final_severity": original_severity,
     }
-
-    if feature_type == "temporal":
-        # Try cyclical encoding
-        train_sin, train_cos, test_sin, test_cos = encode_temporal_cyclical(
-            train[col], test[col]
-        )
-        sin_drift = detect_numerical_drift(train_sin, test_sin)
-        cos_drift = detect_numerical_drift(train_cos, test_cos)
-        # Accept if BOTH sin and cos are below high
-        if sin_drift["severity"] != "high" and cos_drift["severity"] != "high":
-            train = pl.concat([train.drop(col), train_sin.to_frame(), train_cos.to_frame()], how="horizontal")
-            test = pl.concat([test.drop(col), test_sin.to_frame(), test_cos.to_frame()], how="horizontal")
-            worst = sin_drift["severity"] if sin_drift["severity"] == "moderate" else cos_drift["severity"]
-            log_entry["strategy_applied"] = "Seasonality Matching"
-            log_entry["final_severity"] = worst
-            result_train = train.to_pandas() if _input_was_pandas else train
-            result_test = test.to_pandas() if _input_was_pandas else test
-            return result_train, result_test, log_entry
-        # Cyclical failed -> drop
-        result_train = train.to_pandas() if _input_was_pandas else train
-        result_test = test.to_pandas() if _input_was_pandas else test
-        return result_train, result_test, log_entry
 
     if feature_type == "numerical":
         strategies = [

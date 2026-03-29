@@ -10,7 +10,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import polars as pl
 from polars_compat import to_numeric_coerce, is_numeric_col, to_pandas_for_lgbm
-from profiler import load_data, detect_feature_types, profile_data, align_train_test_columns
+from profiler import load_data, detect_feature_types, profile_data, align_train_test_columns, downcast_dataframe
 from drift_detector import run_drift_analysis, detect_intra_training_drift
 from lightgbm import LGBMClassifier
 from model import prepare_features, train_model, evaluate_and_save, print_model_performance_summary
@@ -284,6 +284,14 @@ def main():
                 train = train.with_columns(to_numeric_coerce(train[col]).alias(col))
             if col in test.columns and not is_numeric_col(test[col]):
                 test = test.with_columns(to_numeric_coerce(test[col]).alias(col))
+
+        # Downcast numeric columns now that they have proper dtypes (Float64 -> Float32, etc.)
+        mem_before = (train.estimated_size() + test.estimated_size()) / 1e6
+        train = downcast_dataframe(train)
+        test = downcast_dataframe(test)
+        mem_after = (train.estimated_size() + test.estimated_size()) / 1e6
+        if mem_before > mem_after + 0.1:
+            logger.info(f"Downcasted numeric columns: {mem_before:.1f}MB -> {mem_after:.1f}MB")
 
         # --- Build a single decision sample for drift detection, feature selection,
         # and weight tournament. Full data flows through mitigation/FE/final model. ---

@@ -4,11 +4,14 @@ from utils import logger
 from polars_compat import is_numeric_col, to_numeric_coerce
 
 
-def _downcast_dataframe(df: pl.DataFrame) -> pl.DataFrame:
+def downcast_dataframe(df: pl.DataFrame) -> pl.DataFrame:
     """Downcast numeric columns to reduce memory usage.
 
-    float64 -> float32, int64 -> int32/int16/int8 where safe.
+    Float64 -> Float32, Int64 -> Int32/Int16/Int8 where safe.
     Essential for handling 10M+ row datasets within memory limits.
+
+    NOTE: Only affects columns that already have numeric dtypes.
+    Must be called *after* Utf8 columns have been coerced to numeric.
     """
     cast_exprs = []
     for col in df.columns:
@@ -31,10 +34,12 @@ def _downcast_dataframe(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def load_data(train_path: str, test_path: str) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Load train and test CSVs with memory optimization.
+    """Load train and test CSVs as all-Utf8 for safe type handling.
 
-    Applies dtype downcasting to reduce memory footprint for large datasets
-    (e.g., 10M rows x 500 features).
+    Uses infer_schema_length=0 to read everything as strings, avoiding
+    errors on mixed-type columns (e.g., numeric columns with blank strings).
+    Numeric type coercion and downcasting happen later in main.py after
+    feature type detection.
     """
     train = pl.read_csv(train_path, infer_schema_length=0)
     test = pl.read_csv(test_path, infer_schema_length=0)
@@ -46,13 +51,8 @@ def load_data(train_path: str, test_path: str) -> tuple[pl.DataFrame, pl.DataFra
         if dup_cols:
             logger.warning(f"Found {len(dup_cols)} auto-renamed duplicate columns in {label}: {dup_cols}")
 
-    mem_before = (train.estimated_size() + test.estimated_size()) / 1e6
-    train = _downcast_dataframe(train)
-    test = _downcast_dataframe(test)
-    mem_after = (train.estimated_size() + test.estimated_size()) / 1e6
-
-    logger.info(f"Loaded train: {train.shape}, test: {test.shape} "
-                f"(memory: {mem_before:.1f}MB -> {mem_after:.1f}MB)")
+    mem = (train.estimated_size() + test.estimated_size()) / 1e6
+    logger.info(f"Loaded train: {train.shape}, test: {test.shape} (memory: {mem:.1f}MB)")
     return train, test
 
 

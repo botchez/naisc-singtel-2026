@@ -90,3 +90,27 @@ def from_pandas_df(df: "pd.DataFrame") -> pl.DataFrame:
 def from_pandas_series(s: "pd.Series") -> pl.Series:
     """pandas Series → polars Series."""
     return pl.from_pandas(s)
+
+
+# ---------------------------------------------------------------------------
+# Auto-conversion guards (accept pandas or polars, always return polars)
+# ---------------------------------------------------------------------------
+
+def ensure_pl_df(df) -> pl.DataFrame:
+    """Auto-convert pandas DataFrame to polars if needed."""
+    if isinstance(df, pl.DataFrame):
+        return df
+    import pandas as pd
+    if isinstance(df, pd.DataFrame):
+        return pl.from_pandas(df)
+    return df
+
+
+def ensure_pl_series(s) -> pl.Series:
+    """Auto-convert pandas Series to polars if needed."""
+    if isinstance(s, pl.Series):
+        return s
+    import pandas as pd
+    if isinstance(s, pd.Series):
+        return pl.from_pandas(s)
+    return pl.Series(values=s)
