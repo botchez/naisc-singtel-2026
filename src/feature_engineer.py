@@ -85,6 +85,65 @@ def engineer_features(
         test = test.hstack(pl.DataFrame(_null_test_parts))
         logger.info(f"Added {len(new_features)} missing indicator features")
 
+    # 1b. Datetime feature extraction
+    _DATE_FORMATS = [
+        "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d",
+        "%Y-%m-%d %H:%M:%S", "%d-%m-%Y %H:%M:%S", "%m/%d/%Y %H:%M:%S",
+        "%Y%m%d", "%b %d, %Y", "%d %b %Y",
+    ]
+    dt_cols = [c for c in feature_types.get("datetime", [])
+               if c not in skip_cols and c in train.columns and c in test.columns]
+    dt_features_added = 0
+    for col in dt_cols:
+        # Parse to datetime
+        parsed_train = None
+        parsed_test = None
+        raw_train = train[col].cast(pl.Utf8)
+        raw_test = test[col].cast(pl.Utf8)
+        for fmt in _DATE_FORMATS:
+            try:
+                pt = raw_train.str.to_datetime(fmt, strict=False)
+                if pt.is_not_null().sum() > len(train) * 0.5:
+                    parsed_train = pt
+                    parsed_test = raw_test.str.to_datetime(fmt, strict=False)
+                    break
+            except Exception:
+                continue
+        if parsed_train is None:
+            continue
+
+        # Find reference date from both datasets for days_since
+        all_min = min(
+            parsed_train.drop_nulls().min() or parsed_test.drop_nulls().min(),
+            parsed_test.drop_nulls().min() or parsed_train.drop_nulls().min(),
+        )
+
+        # Extract features
+        dt_parts_train = {}
+        dt_parts_test = {}
+        for name, expr_train, expr_test in [
+            (f"{col}_month", parsed_train.dt.month(), parsed_test.dt.month()),
+            (f"{col}_dayofweek", parsed_train.dt.weekday(), parsed_test.dt.weekday()),
+            (f"{col}_day", parsed_train.dt.day(), parsed_test.dt.day()),
+            (f"{col}_days_since", (parsed_train - all_min).dt.total_days(), (parsed_test - all_min).dt.total_days()),
+        ]:
+            if name not in existing_cols:
+                dt_parts_train[name] = expr_train.cast(pl.Float64).fill_null(0)
+                dt_parts_test[name] = expr_test.cast(pl.Float64).fill_null(0)
+                new_features.append(name)
+                existing_cols.add(name)
+                dt_features_added += 1
+
+        if dt_parts_train:
+            train = train.hstack(pl.DataFrame(dt_parts_train))
+            test = test.hstack(pl.DataFrame(dt_parts_test))
+            # Drop the original string column
+            train = train.drop(col)
+            test = test.drop(col)
+
+    if dt_features_added:
+        logger.info(f"Added {dt_features_added} datetime features from {len(dt_cols)} date columns")
+
     # 2. Frequency encoding for high-cardinality categoricals
     cat_cols = [c for c in feature_types.get("categorical", [])
                 if c not in skip_cols and c in train.columns and c in test.columns]

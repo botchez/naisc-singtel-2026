@@ -573,7 +573,7 @@ def detect_multivariate_shift(
     from sklearn.model_selection import StratifiedKFold
     from sklearn.metrics import roc_auc_score
 
-    drop_cols = feature_types.get("id", []) + feature_types.get("target", [])
+    drop_cols = feature_types.get("id", []) + feature_types.get("target", []) + feature_types.get("temporal", []) + feature_types.get("datetime", [])
     if extra_drop_cols:
         drop_cols = drop_cols + [c for c in extra_drop_cols if c not in drop_cols]
     feature_cols = [c for c in train.columns if c not in drop_cols and c in test.columns]
@@ -790,17 +790,182 @@ def detect_label_shift(
         return None
 
 
+def _sliding_window_drift(
+    train: pl.DataFrame,
+    month_series: pl.Series,
+    unique_months: list[str],
+    feature_types: dict[str, list[str]],
+) -> dict[str, list[dict]]:
+    """Compute per-feature drift scores across consecutive month pairs.
+
+    Returns {feature_name: [{month_pair, psi/jsd, severity}, ...]} showing
+    how drift evolves over time for each feature.
+    """
+    from utils import logger
+
+    skip_cols = set(
+        feature_types.get("id", [])
+        + feature_types.get("target", [])
+        + feature_types.get("temporal", [])
+    )
+    _MAX_PER_MONTH = 20_000  # cap per-month sample for speed
+
+    # Pre-partition data by month
+    month_data = {}
+    for m in unique_months:
+        subset = train.filter(month_series == m)
+        if len(subset) > _MAX_PER_MONTH:
+            subset = subset.sample(n=_MAX_PER_MONTH, seed=42)
+        month_data[m] = subset
+
+    # Compute drift for each consecutive pair
+    timelines = {}  # col -> list of {pair, score, severity}
+
+    num_cols = [c for c in feature_types["numerical"] if c not in skip_cols and c in train.columns]
+    cat_cols = [c for c in feature_types["categorical"] if c not in skip_cols and c in train.columns]
+
+    for i in range(len(unique_months) - 1):
+        m_a, m_b = unique_months[i], unique_months[i + 1]
+        data_a, data_b = month_data[m_a], month_data[m_b]
+        pair_label = f"{m_a} → {m_b}"
+
+        for col in num_cols:
+            if col not in data_a.columns or col not in data_b.columns:
+                continue
+            drift = detect_numerical_drift(data_a[col], data_b[col])
+            timelines.setdefault(col, []).append({
+                "pair": pair_label,
+                "score": drift.get("psi", 0) or 0,
+                "severity": drift["severity"],
+                "type": "numerical",
+            })
+
+        for col in cat_cols:
+            if col not in data_a.columns or col not in data_b.columns:
+                continue
+            drift = detect_categorical_drift(data_a[col], data_b[col])
+            timelines.setdefault(col, []).append({
+                "pair": pair_label,
+                "score": drift.get("jsd", 0) or 0,
+                "severity": drift["severity"],
+                "type": "categorical",
+            })
+
+    # Log features with interesting patterns
+    periodic_features = set()
+    # Minimum score thresholds to avoid flagging noise
+    _MIN_PSI = 0.005  # below this, PSI differences are noise
+    _MIN_JSD = 0.005
+    for col, timeline in timelines.items():
+        scores = [t["score"] for t in timeline]
+        severities = [t["severity"] for t in timeline]
+        is_num = timeline[0]["type"] == "numerical"
+        min_score = _MIN_PSI if is_num else _MIN_JSD
+        max_score = max(scores)
+
+        # Skip features where all scores are below noise floor
+        if max_score < min_score:
+            continue
+
+        # Flag: any high-severity window
+        has_high = "high" in severities
+        # Flag: accelerating drift (last score > 2x average of prior AND above noise)
+        accelerating = False
+        if len(scores) >= 3 and scores[-1] >= min_score:
+            prior_avg = np.mean(scores[:-1]) if np.mean(scores[:-1]) > 0 else 1e-8
+            accelerating = scores[-1] / prior_avg > 2.0
+        # Flag: sudden spike (any score > 3x median AND above noise)
+        median_score = np.median(scores) if len(scores) > 0 else 0
+        spike_idx = [i for i, s in enumerate(scores)
+                     if s >= min_score and median_score > 0 and s / median_score > 3.0]
+
+        # Flag: periodic pattern (2+ non-consecutive spikes with low valleys between)
+        is_periodic = False
+        if len(spike_idx) >= 2:
+            # Check that spikes are non-consecutive (at least one low valley between)
+            for j in range(len(spike_idx) - 1):
+                gap = spike_idx[j + 1] - spike_idx[j]
+                if gap >= 2:  # at least one low valley between spikes
+                    is_periodic = True
+                    break
+
+        if is_periodic:
+            periodic_features.add(col)
+
+        if has_high or accelerating or spike_idx:
+            metric = "PSI" if is_num else "JSD"
+            score_str = " ".join(f"{s:.3f}" for s in scores)
+            flags = []
+            if has_high:
+                flags.append("HIGH")
+            if is_periodic:
+                flags.append("PERIODIC")
+            if accelerating:
+                flags.append("ACCELERATING")
+            if spike_idx and not is_periodic:
+                flags.append(f"SPIKE@{timeline[spike_idx[0]]['pair']}")
+            logger.info(f"  Sliding window {col}: {metric}=[{score_str}] [{', '.join(flags)}]")
+
+    if periodic_features:
+        logger.info(f"Periodic features detected: {sorted(periodic_features)}")
+
+    return timelines
+
+
+def find_break_point(
+    sw_timelines: dict[str, list[dict]],
+    n_pairs: int,
+) -> int | None:
+    """Find the month boundary with the most simultaneous feature shifts.
+
+    Counts how many features have a high-severity or spike at each boundary.
+    Returns the pair index (0-based) of the strongest break, or None if no
+    clear break exists.
+    """
+    if not sw_timelines or n_pairs == 0:
+        return None
+
+    _MIN_PSI = 0.01
+    _MIN_JSD = 0.01
+
+    # Count significant shifts at each boundary
+    boundary_counts = np.zeros(n_pairs)
+    for col, timeline in sw_timelines.items():
+        if len(timeline) != n_pairs:
+            continue
+        is_num = timeline[0]["type"] == "numerical"
+        min_score = _MIN_PSI if is_num else _MIN_JSD
+        scores = [t["score"] for t in timeline]
+        median_score = np.median(scores) if scores else 0
+
+        for i, t in enumerate(timeline):
+            # Count if: high severity, OR score is a spike (>3x median and above noise)
+            is_high = t["severity"] == "high"
+            is_spike = (t["score"] >= min_score and median_score > 0
+                        and t["score"] / median_score > 3.0)
+            if is_high or is_spike:
+                boundary_counts[i] += 1
+
+    # Need at least 2 features shifting at the same boundary to call it a break
+    max_count = boundary_counts.max()
+    if max_count < 2:
+        return None
+
+    break_idx = int(np.argmax(boundary_counts))
+    return break_idx
+
+
 def detect_intra_training_drift(
     train: pl.DataFrame,
     feature_types: dict[str, list[str]],
-) -> tuple[pl.DataFrame, pl.Series | None]:
-    """Detect temporal drift within training data by comparing early vs late months.
+) -> tuple[pl.DataFrame, pl.Series | None, dict[str, list[dict]] | None, int | None]:
+    """Detect temporal drift within training data.
 
-    Splits training data into early (first half of months) and late (second half)
-    based on the temporal column, then runs drift detection between the two halves.
+    Uses two complementary approaches:
+    1. Early vs late half comparison (coarse signal for drift summary)
+    2. Sliding window across consecutive months (fine-grained drift trajectory)
 
-    Returns (intra_drift_df, month_series) where month_series is the parsed month
-    ordering per row (or None if no temporal column).
+    Returns (intra_drift_df, month_rank, sw_timelines, break_idx).
     """
     train = _ensure_pl_df(train)
     from utils import logger
@@ -814,7 +979,7 @@ def detect_intra_training_drift(
 
     if temporal_col is None:
         logger.info("No temporal column found; skipping intra-training drift detection")
-        return pl.DataFrame(), None
+        return pl.DataFrame(), None, None, None
 
     # Parse temporal column to month ordering
     raw = train[temporal_col].cast(pl.Utf8).str.to_titlecase()
@@ -831,13 +996,13 @@ def detect_intra_training_drift(
 
     if month_series is None:
         logger.info(f"Could not parse temporal column '{temporal_col}'; skipping intra-training drift")
-        return pl.DataFrame(), None
+        return pl.DataFrame(), None, None, None
 
     # Sort unique months and split into early vs late halves
     unique_months = month_series.drop_nulls().unique().sort().to_list()
     if len(unique_months) < 2:
         logger.info("Only one month in training data; skipping intra-training drift")
-        return pl.DataFrame(), None
+        return pl.DataFrame(), None, None, None
 
     mid = len(unique_months) // 2
     early_months = set(unique_months[:mid])
@@ -891,11 +1056,26 @@ def detect_intra_training_drift(
     else:
         logger.info("No significant intra-training drift detected")
 
+    # Sliding window drift detection
+    logger.info(f"Sliding window: analyzing {len(unique_months)-1} consecutive month pairs")
+    sw_timelines = _sliding_window_drift(train, month_series, unique_months, feature_types)
+
+    # Find structural break point
+    n_pairs = len(unique_months) - 1
+    break_idx = find_break_point(sw_timelines, n_pairs)
+    if break_idx is not None:
+        break_after_month = unique_months[break_idx]
+        n_post = len(unique_months) - break_idx - 1
+        logger.info(f"Structural break detected after {break_after_month} "
+                    f"({n_post} post-break months out of {len(unique_months)})")
+    else:
+        logger.info("No structural break detected")
+
     # Return month_series as parsed month rank for recency weighting
     month_to_rank = {m: i for i, m in enumerate(unique_months)}
     month_rank = month_series.replace_strict(month_to_rank, default=0).cast(pl.Int64)
 
-    return intra_drift_df, month_rank
+    return intra_drift_df, month_rank, sw_timelines, break_idx
 
 
 def print_drift_summary(drift_df: pl.DataFrame) -> None:

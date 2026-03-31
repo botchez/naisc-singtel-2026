@@ -102,7 +102,7 @@ def prepare_features(
     # Columns to use as features (must be in both train and test)
     # Temporal columns are timestamps (e.g. "25-Jan"), not predictive features —
     # their signal is captured via recency sample weights instead.
-    drop_cols = feature_types["id"] + feature_types["target"] + feature_types.get("temporal", [])
+    drop_cols = feature_types["id"] + feature_types["target"] + feature_types.get("temporal", []) + feature_types.get("datetime", [])
     if extra_drop_cols:
         drop_cols = drop_cols + [c for c in extra_drop_cols if c not in drop_cols]
     feature_cols = [c for c in train.columns if c not in drop_cols and c in test.columns]

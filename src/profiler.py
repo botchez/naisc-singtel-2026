@@ -147,6 +147,7 @@ def detect_feature_types(
         "numerical": [],
         "categorical": [],
         "temporal": [],
+        "datetime": [],
         "id": [],
         "target": [],
     }
@@ -195,6 +196,12 @@ def detect_feature_types(
             types["temporal"].append(col)
             continue
 
+        # Date detection: non-numeric columns that parse as dates
+        if not is_numeric_col(df_sample[col]) and _looks_date(df_sample[col]):
+            logger.info(f"Detected date column: '{col}'")
+            types["datetime"].append(col)
+            continue
+
         # Numeric coercion: if a non-numeric column is mostly parseable as numbers,
         # treat it as numerical (e.g., TotalCharges with a few blank strings)
         if not is_numeric_col(df_sample[col]) and _looks_numeric(df_sample[col]):
@@ -208,6 +215,31 @@ def detect_feature_types(
             types["categorical"].append(col)
 
     return types
+
+
+_DATE_FORMATS = [
+    "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d",
+    "%Y-%m-%d %H:%M:%S", "%d-%m-%Y %H:%M:%S", "%m/%d/%Y %H:%M:%S",
+    "%Y%m%d", "%b %d, %Y", "%d %b %Y",
+]
+
+
+def _looks_date(series: pl.Series, threshold: float = 0.5) -> bool:
+    """Heuristic: check if a string column is mostly parseable as dates."""
+    sample = series.drop_nulls()
+    if len(sample) == 0:
+        return False
+    if len(sample) > 1000:
+        sample = sample.sample(n=1000, seed=42)
+    sample = sample.cast(pl.Utf8)
+    for fmt in _DATE_FORMATS:
+        try:
+            parsed = sample.str.to_datetime(fmt, strict=False)
+            if parsed.is_not_null().sum() >= len(sample) * threshold:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _looks_numeric(series: pl.Series, threshold: float = 0.8) -> bool:
