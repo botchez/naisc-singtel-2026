@@ -76,6 +76,42 @@ def compute_recency_weights(
     return weights
 
 
+def compute_breakpoint_weights(
+    month_rank, break_idx: int, decay: float = 0.15, pre_scale: float = 0.5
+) -> np.ndarray:
+    """Compute recency weights with a step-down at a structural break point.
+
+    Applies standard exponential decay, then multiplies pre-break months by
+    pre_scale (< 1.0) to concentrate weight on post-break data.
+
+    break_idx: month rank at/below which the break occurs (0-based).
+               Months with rank <= break_idx are pre-break.
+    pre_scale: multiplier for pre-break weights (0.0 = drop, 1.0 = no effect).
+    Returns weights normalized to mean=1.0.
+    """
+    if month_rank is None or len(month_rank) == 0:
+        return None
+
+    month_rank = _ensure_pl_series(month_rank)
+    max_rank = month_rank.max()
+    if max_rank == 0:
+        return None
+
+    arr = month_rank.to_numpy().astype(float)
+
+    # Standard exponential decay
+    weights = np.exp(decay * (arr - max_rank))
+
+    # Step-down for pre-break months
+    pre_break_mask = arr <= break_idx
+    weights[pre_break_mask] *= pre_scale
+
+    # Normalize to mean=1.0
+    weights = weights / weights.mean()
+
+    return weights
+
+
 def detect_abbreviation_mappings(
     train: pl.DataFrame, test: pl.DataFrame, col: str
 ) -> dict[str, str]:
@@ -687,7 +723,7 @@ def apply_all_mitigations(
     1. Normalize data quality (city abbreviations, lowercase, hyphen removal)
     2. Re-run drift detection on normalized data
     3. Progressive mitigation: try graduated strategies before dropping
-    4. Multivariate shift detection (diagnostic only)
+    4. Multivariate shift detection (domain weights for tournament)
 
     Returns (train_mitigated, test_mitigated, drop_cols, mitigation_log, norm_log, shift_info).
     """
@@ -913,7 +949,7 @@ def apply_all_mitigations(
                                        "original_severity": "moderate", "strategy_applied": best_strategy,
                                        "final_severity": best_sev})
 
-    # Stage 4: Multivariate shift detection (diagnostic only, no weighting)
+    # Stage 4: Multivariate shift detection (domain weights for tournament)
     from drift_detector import detect_multivariate_shift
 
     # detect_multivariate_shift auto-converts pandas->polars internally
@@ -922,12 +958,12 @@ def apply_all_mitigations(
     if shift_info["shift_detected"]:
         logger.info(
             f"Multivariate shift detected (AUC={shift_info['auc']:.4f}), "
-            f"diagnostic only — no sample reweighting applied"
+            f"domain weights passed to weight tournament"
         )
     else:
         logger.info(
             f"No significant multivariate shift (AUC={shift_info['auc']:.4f}), "
-            f"using uniform weights"
+            f"skipping domain weights"
         )
 
     if _input_was_pandas:

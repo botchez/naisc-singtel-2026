@@ -14,7 +14,7 @@ from profiler import load_data, detect_feature_types, profile_data, align_train_
 from drift_detector import run_drift_analysis, detect_intra_training_drift
 from lightgbm import LGBMClassifier
 from model import prepare_features, train_model, evaluate_and_save, print_model_performance_summary
-from mitigation import apply_all_mitigations, compute_domain_weights, compute_recency_weights
+from mitigation import apply_all_mitigations, compute_domain_weights, compute_recency_weights, compute_breakpoint_weights
 from feature_engineer import engineer_features
 from utils import Timer, logger
 
@@ -149,7 +149,7 @@ def print_drift_mitigation_summary(
 def print_multivariate_shift_summary(shift_info: dict, weight_status: str = "Uniform (1.0)") -> None:
     """Print multivariate covariate shift detection results."""
     import numpy as np
-    CW = (24, 22)
+    CW = (24, 48)
     W = sum(CW) + len(CW) - 1
     title = "MULTIVARIATE SHIFT DETECTION"
 
@@ -320,8 +320,8 @@ def main():
         # --- Dynamic pipeline cap: keep runtime under 10 minutes ---
         # Based on benchmark: 2M rows × 200 cols ≈ 230s computation.
         # Budget 480s for computation (leaving ~2 min for CSV I/O).
-        _RUNTIME_BUDGET_S = 480
-        _COST_PER_ROW_COL = 5.75e-7  # seconds per row × column (from 2M×200 benchmark)
+        _RUNTIME_BUDGET_S = 300
+        _COST_PER_ROW_COL = 8.0e-7  # seconds per row × column (from 2M×200 on 2-core Docker)
         n_cols = len(train.columns)
         _max_pipeline_rows = int(_RUNTIME_BUDGET_S / (_COST_PER_ROW_COL * max(n_cols, 1)))
         _max_pipeline_rows = max(_max_pipeline_rows, _DECISION_SAMPLE_SIZE)  # never below decision sample
@@ -362,7 +362,7 @@ def main():
         test_drift = test.sample(n=min(_DECISION_SAMPLE_SIZE, len(test)), seed=42) if len(test) > _DECISION_SAMPLE_SIZE else test
         drift_df = run_drift_analysis(train_decision, test_drift, feature_types)
         # Keep full train for month_rank (used for recency weighting across all rows)
-        intra_drift_df, month_rank = detect_intra_training_drift(train, feature_types)
+        intra_drift_df, month_rank, sw_timelines, break_idx = detect_intra_training_drift(train, feature_types)
 
     # --- Stage 3: Drift Mitigation ---
     with Timer("Drift mitigation") as mitigation_timer:
@@ -468,22 +468,9 @@ def main():
         has_domain = train_oof_proba is not None and shift_info.get("shift_detected", False)
         has_recency = month_rank is not None
 
-        # Resolve test labels for validation-guided selection
-        target_col = feature_types["target"][0] if feature_types["target"] else None
-        has_test_labels = (target_col and target_col in test_m.columns
-                          and test_m[target_col].is_not_null().any())
-        # Guard against dummy test labels (e.g. all same value) in hidden eval
-        if has_test_labels:
-            _test_target_vals = test_m[target_col].drop_nulls().unique()
-            if len(_test_target_vals) < 2:
-                logger.info(f"Test target has only 1 unique value ({_test_target_vals[0]}) — treating as dummy labels")
-                has_test_labels = False
-        y_test_m = _encode_target(test_m[target_col]) if has_test_labels else None
-
         # Reuse decision sample for weight tournament (larger than drift sample for stability)
         _TOURNEY_SAMPLE_SIZE = 300_000
         _tourney_idx = None
-        _test_tourney_idx = None
 
         if len(X_train_m) > _TOURNEY_SAMPLE_SIZE:
             _tourney_idx = stratified_subsample_idx(
@@ -492,49 +479,51 @@ def main():
             )
             logger.info(f"Weight tournament: subsampling {_TOURNEY_SAMPLE_SIZE:,}/{len(X_train_m):,} train rows")
 
-        if has_test_labels and len(X_test_m) > _TOURNEY_SAMPLE_SIZE:
-            _test_tourney_idx = stratified_subsample_idx(
-                len(X_test_m), _TOURNEY_SAMPLE_SIZE,
-                month_values=None, seed=42,
-            )
-            logger.info(f"Weight tournament: subsampling {_TOURNEY_SAMPLE_SIZE:,}/{len(X_test_m):,} test rows")
-
         # Pre-convert tournament subsets to pandas/numpy ONCE (avoid repeated polars→pandas)
         from model import _to_pandas_with_categoricals, _native_cat_cols
         if _tourney_idx is not None:
-            _X_tourney_pd = _to_pandas_with_categoricals(X_train_m[_tourney_idx], _native_cat_cols)
-            _y_tourney_np = y_train_m.gather(_tourney_idx.tolist()).to_numpy()
+            _X_tourney_all_pd = _to_pandas_with_categoricals(X_train_m[_tourney_idx], _native_cat_cols)
+            _y_tourney_all_np = y_train_m.gather(_tourney_idx.tolist()).to_numpy()
         else:
-            _X_tourney_pd = _to_pandas_with_categoricals(X_train_m, _native_cat_cols)
-            _y_tourney_np = y_train_m.to_numpy()
+            _X_tourney_all_pd = _to_pandas_with_categoricals(X_train_m, _native_cat_cols)
+            _y_tourney_all_np = y_train_m.to_numpy()
 
-        _X_test_tourney_pd = None
-        _y_test_tourney_np = None
-        if has_test_labels:
-            if _test_tourney_idx is not None:
-                _X_test_tourney_pd = _to_pandas_with_categoricals(X_test_m[_test_tourney_idx], _native_cat_cols)
-                _y_test_tourney_np = y_test_m.gather(_test_tourney_idx.tolist()).to_numpy()
-            else:
-                _X_test_tourney_pd = _to_pandas_with_categoricals(X_test_m, _native_cat_cols)
-                _y_test_tourney_np = y_test_m.to_numpy()
+        # Month-stratified train/val split for tournament evaluation (80/20)
+        _val_frac = 0.2
+        _n_all = len(_y_tourney_all_np)
+        _rng = np.random.RandomState(42)
+
+        _tourney_months = _month_vals[_tourney_idx.tolist()] if _tourney_idx is not None else _month_vals
+        if isinstance(_tourney_months, pl.Series):
+            _tourney_months = _tourney_months.to_numpy(allow_copy=True)
+
+        _val_mask = np.zeros(_n_all, dtype=bool)
+        for g in np.unique(_tourney_months):
+            g_idx = np.where(_tourney_months == g)[0]
+            n_val_g = max(1, int(len(g_idx) * _val_frac))
+            chosen = _rng.choice(g_idx, size=n_val_g, replace=False)
+            _val_mask[chosen] = True
+        _val_idx = np.where(_val_mask)[0]
+        _tr_idx = np.where(~_val_mask)[0]
+
+        _X_tourney_pd = _X_tourney_all_pd.iloc[_tr_idx]
+        _y_tourney_np = _y_tourney_all_np[_tr_idx]
+        _X_val_pd = _X_tourney_all_pd.iloc[_val_idx]
+        _y_val_np = _y_tourney_all_np[_val_idx]
+        logger.info(f"Weight tournament: train={len(_tr_idx)}, val={len(_val_idx)} (month-stratified 80/20 split)")
 
         def _eval_candidate(label, weights):
-            """Train with weights, return (label, weights, test_auprc, train_auprc)."""
-            w_sub = weights[_tourney_idx] if (weights is not None and _tourney_idx is not None) else weights
+            """Train with weights on train split, evaluate on val split."""
+            w_sub = weights[_tourney_idx[_tr_idx]] if (weights is not None and _tourney_idx is not None) else (weights[_tr_idx] if weights is not None else None)
             m = LGBMClassifier(
                 verbosity=-1, objective="binary", is_unbalance=True,
                 random_state=42, importance_type="gain",
             )
             m.fit(_X_tourney_pd, _y_tourney_np, sample_weight=w_sub)
-            train_proba = m.predict_proba(_X_tourney_pd)[:, 1]
-            train_sc = average_precision_score(_y_tourney_np, train_proba)
-            if has_test_labels:
-                test_proba = m.predict_proba(_X_test_tourney_pd)[:, 1]
-                test_sc = average_precision_score(_y_test_tourney_np, test_proba)
-            else:
-                test_sc = train_sc  # fallback to train if no test labels
-            logger.info(f"  {label} -> train={train_sc:.4f} test={test_sc:.4f}")
-            return label, weights, test_sc, train_sc
+            val_proba = m.predict_proba(_X_val_pd)[:, 1]
+            val_sc = average_precision_score(_y_val_np, val_proba)
+            logger.info(f"  {label} -> val={val_sc:.4f}")
+            return label, weights, val_sc
 
         def _build_blend(alpha, power, decay):
             """Build additive blend: alpha * domain^power + (1-alpha) * recency(decay)."""
@@ -554,6 +543,26 @@ def main():
             combined = dw ** alpha * rw ** (1 - alpha)
             return combined / combined.mean()
 
+        has_break = break_idx is not None and has_recency
+
+        def _build_bp_blend(alpha, power, decay):
+            """Blend with breakpoint-aware recency instead of smooth decay."""
+            dw = compute_domain_weights(train_oof_proba, power=power)
+            rw = compute_breakpoint_weights(month_rank, break_idx, decay=decay, pre_scale=0.5)
+            if dw is None or rw is None:
+                return None
+            blended = alpha * dw + (1 - alpha) * rw
+            return blended / blended.mean()
+
+        def _build_bp_geometric(alpha, power, decay):
+            """Geometric with breakpoint-aware recency instead of smooth decay."""
+            dw = compute_domain_weights(train_oof_proba, power=power)
+            rw = compute_breakpoint_weights(month_rank, break_idx, decay=decay, pre_scale=0.5)
+            if dw is None or rw is None:
+                return None
+            combined = dw ** alpha * rw ** (1 - alpha)
+            return combined / combined.mean()
+
         # ── Weight tournament via Nelder-Mead optimization ──
         from scipy.optimize import minimize
 
@@ -564,9 +573,19 @@ def main():
         res_uniform = _eval_candidate("Uniform", None)
         all_results.append(res_uniform)
 
-        best_label, best_weights, best_score, _ = res_uniform
+        best_label, best_weights, best_score = res_uniform
 
         if has_domain and has_recency:
+            # 2. Domain-only and recency-only candidates
+            for power in [0.3, 0.5, 0.7, 1.0]:
+                w = compute_domain_weights(train_oof_proba, power=power)
+                if w is not None:
+                    all_results.append(_eval_candidate(f"Domain(p={power})", w))
+            for decay in [0.10, 0.20, 0.40]:
+                rw = compute_recency_weights(month_rank, decay=decay)
+                if rw is not None:
+                    all_results.append(_eval_candidate(f"Recency(d={decay})", rw))
+
             def _make_cached_objective(builder, prefix):
                 """Create a cached Nelder-Mead objective for a weight family."""
                 evals = []
@@ -586,25 +605,39 @@ def main():
                     lbl = f"{prefix}(a={a:.4f},p={p:.4f},d={d:.4f})"
                     res = _eval_candidate(lbl, w)
                     evals.append(res)
-                    score = -res[2]  # minimize negative test AU-PRC
+                    score = -res[2]  # minimize negative val AU-PRC
                     _eval_cache[key] = score
                     return score
 
                 return objective, evals
 
-            # 2. Optimize additive blend
+            # 3. Optimize additive blend
             blend_obj, blend_evals = _make_cached_objective(_build_blend, "Blend")
             logger.info("Weight tournament: optimizing Blend (Nelder-Mead)")
             minimize(blend_obj, x0=[0.5, 0.7, 0.15], method='Nelder-Mead',
                      options={'maxiter': 8, 'maxfev': 12, 'xatol': 0.02, 'fatol': 0.0005})
             all_results.extend(blend_evals)
 
-            # 3. Optimize geometric mean
+            # 4. Optimize geometric mean
             geom_obj, geom_evals = _make_cached_objective(_build_geometric, "Geometric")
             logger.info("Weight tournament: optimizing Geometric (Nelder-Mead)")
             minimize(geom_obj, x0=[0.5, 0.7, 0.15], method='Nelder-Mead',
                      options={'maxiter': 8, 'maxfev': 12, 'xatol': 0.02, 'fatol': 0.0005})
             all_results.extend(geom_evals)
+
+            # 5. Breakpoint-aware variants (if a structural break was detected)
+            if has_break:
+                bp_blend_obj, bp_blend_evals = _make_cached_objective(_build_bp_blend, "BPBlend")
+                logger.info("Weight tournament: optimizing BPBlend (Nelder-Mead)")
+                minimize(bp_blend_obj, x0=[0.5, 0.7, 0.15], method='Nelder-Mead',
+                         options={'maxiter': 8, 'maxfev': 12, 'xatol': 0.02, 'fatol': 0.0005})
+                all_results.extend(bp_blend_evals)
+
+                bp_geom_obj, bp_geom_evals = _make_cached_objective(_build_bp_geometric, "BPGeometric")
+                logger.info("Weight tournament: optimizing BPGeometric (Nelder-Mead)")
+                minimize(bp_geom_obj, x0=[0.5, 0.7, 0.15], method='Nelder-Mead',
+                         options={'maxiter': 8, 'maxfev': 12, 'xatol': 0.02, 'fatol': 0.0005})
+                all_results.extend(bp_geom_evals)
 
         elif has_domain:
             # Only domain weights available — optimize power only
@@ -622,15 +655,15 @@ def main():
 
         # Pick overall winner
         all_results.sort(key=lambda x: x[2], reverse=True)
-        best_label, best_weights, best_score, _ = all_results[0]
+        best_label, best_weights, best_score = all_results[0]
 
         # Log full leaderboard
         logger.info(f"Weight tournament: {len(all_results)} total evaluations")
         logger.info("── Full leaderboard (top 20) ──")
-        for i, (lbl, _, test_sc, train_sc) in enumerate(all_results[:20]):
-            logger.info(f"  #{i+1:2d}  {test_sc:.4f} test | {train_sc:.4f} train | {lbl}")
+        for i, (lbl, _, val_sc) in enumerate(all_results[:20]):
+            logger.info(f"  #{i+1:2d}  {val_sc:.4f} val | {lbl}")
 
-        logger.info(f"Final winner: {best_label} (test AU-PRC={best_score:.4f})")
+        logger.info(f"Final winner: {best_label} (val AU-PRC={best_score:.4f})")
         weight_status = best_label
 
         # Train final model on full data with winning weights
