@@ -274,8 +274,8 @@ def engineer_features(
         if len(num_feature_cols) > _MAX_DEDUP_COLS:
             _orig_dedup = len(num_feature_cols)
             _var_sample = train.select(num_feature_cols)
-            if len(train) > 50_000:
-                _var_sample = _var_sample.sample(n=50_000, seed=42)
+            if len(train) > 100_000:
+                _var_sample = _var_sample.sample(n=100_000, seed=42)
             # Compute variance per column and pick top ones
             var_dict = {}
             for c in num_feature_cols:

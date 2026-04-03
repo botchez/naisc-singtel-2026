@@ -6,7 +6,7 @@ from polars_compat import (
 )
 from utils import logger
 
-_MAX_EVAL_SAMPLE = 50_000
+_MAX_EVAL_SAMPLE = 100_000
 
 
 def _eval_subsample(train_col, test_col, max_n=_MAX_EVAL_SAMPLE, seed=42):
@@ -76,40 +76,7 @@ def compute_recency_weights(
     return weights
 
 
-def compute_breakpoint_weights(
-    month_rank, break_idx: int, decay: float = 0.15, pre_scale: float = 0.5
-) -> np.ndarray:
-    """Compute recency weights with a step-down at a structural break point.
 
-    Applies standard exponential decay, then multiplies pre-break months by
-    pre_scale (< 1.0) to concentrate weight on post-break data.
-
-    break_idx: month rank at/below which the break occurs (0-based).
-               Months with rank <= break_idx are pre-break.
-    pre_scale: multiplier for pre-break weights (0.0 = drop, 1.0 = no effect).
-    Returns weights normalized to mean=1.0.
-    """
-    if month_rank is None or len(month_rank) == 0:
-        return None
-
-    month_rank = _ensure_pl_series(month_rank)
-    max_rank = month_rank.max()
-    if max_rank == 0:
-        return None
-
-    arr = month_rank.to_numpy().astype(float)
-
-    # Standard exponential decay
-    weights = np.exp(decay * (arr - max_rank))
-
-    # Step-down for pre-break months
-    pre_break_mask = arr <= break_idx
-    weights[pre_break_mask] *= pre_scale
-
-    # Normalize to mean=1.0
-    weights = weights / weights.mean()
-
-    return weights
 
 
 def detect_abbreviation_mappings(
@@ -122,7 +89,7 @@ def detect_abbreviation_mappings(
     Matches abbreviation to full name whose word-initial letters match.
     Ties broken by combined frequency.
     """
-    _ABB_SAMPLE = 50_000
+    _ABB_SAMPLE = 100_000
     tr_vals = train[col].drop_nulls()
     te_vals = test[col].drop_nulls()
     if len(tr_vals) > _ABB_SAMPLE:
@@ -205,7 +172,7 @@ def normalize_data_quality(
     cat_cols = set(feature_types.get("categorical", []))  # exclude temporal from normalization/fuzzy
 
     # Pre-compute subsample indices for drift comparison on large datasets
-    _NORM_SAMPLE = 50_000
+    _NORM_SAMPLE = 100_000
     rng = np.random.RandomState(42)
     _tr_norm_idx = rng.choice(
         len(train_clean), min(_NORM_SAMPLE, len(train_clean)), replace=False

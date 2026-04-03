@@ -82,8 +82,19 @@ main.py (Entry Point)
 |  2d. INTRA-TRAINING DRIFT (full pipeline-capped train):               |
 |      Split by temporal column: early months vs late months             |
 |      Same tests as 2a, reports high/moderate features                  |
-|      Returns month_rank per row (for recency weighting)               |
+|      Returns 4-tuple: (intra_drift_df, month_rank,                    |
+|                         sw_timelines, break_idx)                       |
 |      Subsampled to 100K per half                                      |
+|      SLIDING WINDOW: _sliding_window_drift() analyzes 9 consecutive   |
+|        month pairs (for 10 months), computing PSI per numerical        |
+|        feature and JSD per categorical feature                         |
+|        Noise thresholds: _MIN_PSI=0.005, _MIN_JSD=0.005               |
+|        Reports HIGH/MODERATE/SPIKE/ACCELERATING/PERIODIC per feature  |
+|      BREAK POINT: find_break_point() counts simultaneous feature       |
+|        shifts at each month boundary, returns the month index with the |
+|        most shifts (min 2 features required); None if no clean break   |
+|      Periodic/SPIKE/ACCELERATING patterns are logged per-feature       |
+|      Structural break is logged with post-break month count            |
 |                                                                       |
 |  2e. LABEL SHIFT detection (train vs test churn rate)                 |
 |      Chi-squared proportion test, severity classification             |
@@ -214,20 +225,23 @@ main.py (Entry Point)
 |                                                                       |
 |  6d. WEIGHT TOURNAMENT (Nelder-Mead optimization):                    |
 |      Inputs: train_oof_proba (from domain clf), month_rank (from      |
-|              intra-training drift), test labels (if available)         |
+|              intra-training drift), break_idx (structural break)       |
 |      Candidate weight families:                                       |
 |        - Uniform (baseline)                                           |
+|        - Domain-only: 4 power values [0.3, 0.5, 0.7, 1.0]           |
+|        - Recency-only: 3 decay values [0.10, 0.20, 0.40]             |
 |        - Blend: alpha*domain^power + (1-alpha)*recency(decay)         |
 |        - Geometric: domain^(alpha*power) * recency(decay)^(1-alpha)   |
+|        - BPBlend: alpha*domain^power + (1-alpha)*breakpoint_weights   |
+|        - BPGeometric: domain^(alpha*power) * breakpoint_weights^(1-a)|
 |      Optimization: Nelder-Mead, maxiter=8, maxfev=12 per family       |
 |        Bounds: alpha [0,1], power [0.1,2.0], decay [0.01,0.80]       |
-|      Fallback: grid search if only one weight type available           |
-|        Domain-only: powers [0.3, 0.5, 0.7, 1.0]                      |
-|        Recency-only: decays [0.10, 0.20, 0.40]                        |
-|      Evaluation: train model on subsample (300K cap), score test       |
-|      Guard: detects dummy test labels (<2 unique values)               |
+|      Domain-only and recency-only ALWAYS evaluated (not just fallback) |
+|      Evaluation: month-stratified 80/20 val split (not test labels)   |
+|        val_frac=0.20, stratified by month, seeded for reproducibility  |
+|        _eval_candidate() returns (label, weights, val_score) 3-tuple  |
 |      Caching: rounded params to avoid duplicate model trains           |
-|      Winner selection: highest test AU-PRC (or train if no labels)    |
+|      Winner selection: highest val AU-PRC (~56 total evaluations)     |
 |                                                                       |
 |  6e. FINAL MODEL:                                                     |
 |      - Train on full mitigated data with winning weights              |
@@ -261,7 +275,7 @@ main.py (Entry Point)
 src/
   main.py              Entry point, orchestrates all stages, console output tables,
                         decision sample + pipeline cap, feature selection,
-                        weight tournament (Nelder-Mead), post-FE drift check
+                        weight tournament (Nelder-Mead + val-split), post-FE drift check
   profiler.py          Stage 1: data loading, downcast, column alignment,
                                 auto feature type detection, profiling
   drift_detector.py    Stage 2: per-feature statistical drift tests, BH correction,
@@ -270,7 +284,7 @@ src/
   mitigation.py        Stage 3: data quality normalization (abbreviations, lowercase,
                                 hyphens, fuzzy matching), progressive mitigation
                                 (high + moderate), domain classifier, sample weight
-                                computation (domain + recency)
+                                computation (domain + recency + breakpoint)
   feature_engineer.py  Stage 4: missing indicators, frequency encoding, ratio features,
                                 aggregation features, duplicate detection, column alignment
   model.py             Stage 5-6: target encoding, preprocessing (prepare_features),
@@ -284,17 +298,17 @@ src/
 
 ## Current Status
 
-### Latest Results (optimize-pipeline branch, 16 Mar 2026)
+### Latest Results (polars-refactor branch, 1 Apr 2026)
 
 | Metric | Baseline | Mitigated | Delta |
 |--------|----------|-----------|-------|
-| AU-PRC (train) | 0.9297 | 0.9209 | -0.0088 |
-| AU-PRC (test) | 0.7363 | **0.8699** | **+0.1336** |
+| AU-PRC (train) | 0.9331 | 0.9192 | -0.0139 |
+| AU-PRC (test) | 0.7466 | **0.8637** | **+0.1171** |
 
-- Domain classifier AUC: 0.8313 (shift detected)
-- Sample weights: Blend(a=0.52, p=0.69, d=0.15)
-- Runtime: ~24s total (1s drift, 4s mitigation, 1s FE, 18s model+tournament)
-- Weight tournament: Nelder-Mead optimization, ~25 evaluations, 300K subsample cap
+- Domain classifier AUC: 0.8300 (shift detected)
+- Sample weights: BPGeometric(a=0.5125, p=0.7175, d=0.1500) won tournament
+- Runtime: ~63s total (0.8s ingestion, 3.0s drift, 6.3s mitigation, 1.9s FE, 50.8s model+tournament)
+- Weight tournament: 56 evaluations (4 families + domain/recency point evals), val-split scoring
 - Scalability: 2M rows x 93 cols runs in ~95s (well within 10 min budget)
 - Top-8 feature interactions: +0.0011 test AU-PRC
 
@@ -325,6 +339,12 @@ src/
 - [x] Benjamini-Hochberg FDR correction for multiple testing
 - [x] Drift severity classification (multi-metric with BH-corrected p-values)
 - [x] Intra-training drift detection (early vs late months)
+- [x] Sliding window intra-training drift detection (9 consecutive month pairs)
+- [x] Structural break detection (most simultaneous feature shifts)
+- [x] Breakpoint-aware sample weights (exponential decay + step-down at break)
+- [x] BPBlend and BPGeometric weight families in tournament
+- [x] Domain-only and recency-only always evaluated (not just as fallback)
+- [x] Month-stratified 80/20 val split for tournament evaluation (avoids dummy test label corruption)
 - [x] Multivariate shift detection (domain classifier, 3-fold CV)
 - [x] Data quality normalization (abbreviations, conditional lowercase, hyphens)
 - [x] Fuzzy matching for unseen test categories (two-tier cutoff: 0.6 then 0.45)
@@ -382,7 +402,7 @@ src/
 - **Calibration (Platt/Isotonic)** — AU-PRC is rank-based metric; calibration preserves ordering so cannot help.
 - **Categorical drift robustness** — improved fuzzy matching (two-tier cutoff 0.6/0.45) already implemented. Phonetic matching adds complexity without clear benefit on this dataset type.
 - **Unseen category handling** — NaN-native handling already implemented (LightGBM handles missing natively, better than sentinel codes).
-- **Polars rewrite** — benchmarked 16 Mar. Not worth the complexity.
+- **Polars rewrite** — completed (polars-refactor branch). Pipeline fully polars-native.
 - **Mitigation refinement (Stage 4b)** — was doing up to 160 model trains + 160 DataFrame copies. Removed for performance. Stage 3 progressive mitigation + Stage 6 weight tournament cover this.
 
 ### What Worked
@@ -395,8 +415,8 @@ src/
 - Bug fixes: BH correction, rare category NaN, feature eng using dropped cols
 
 ### Known Issues
-- Weight tournament adds ~18s (Nelder-Mead: ~25 model trains total)
-- Pipeline uses test labels for weight/strategy selection — optimal for known test, may not generalize identically to hidden dataset
+- Weight tournament adds ~35s (56 evaluations across 4 families + point evals vs ~25 previously)
+- Tournament now uses month-stratified val split (20%) rather than test labels — avoids dummy label corruption but adds overhead
 - Complete temporal split: train=Jan-Oct 2025, test=Nov-Dec 2025
 - Baseline model uses 50K subsample (comparison not perfectly fair, but output is always mitigated)
 

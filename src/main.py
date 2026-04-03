@@ -14,7 +14,7 @@ from profiler import load_data, detect_feature_types, profile_data, align_train_
 from drift_detector import run_drift_analysis, detect_intra_training_drift
 from lightgbm import LGBMClassifier
 from model import prepare_features, train_model, evaluate_and_save, print_model_performance_summary
-from mitigation import apply_all_mitigations, compute_domain_weights, compute_recency_weights, compute_breakpoint_weights
+from mitigation import apply_all_mitigations, compute_domain_weights, compute_recency_weights
 from feature_engineer import engineer_features
 from utils import Timer, logger
 
@@ -362,7 +362,7 @@ def main():
         test_drift = test.sample(n=min(_DECISION_SAMPLE_SIZE, len(test)), seed=42) if len(test) > _DECISION_SAMPLE_SIZE else test
         drift_df = run_drift_analysis(train_decision, test_drift, feature_types)
         # Keep full train for month_rank (used for recency weighting across all rows)
-        intra_drift_df, month_rank, sw_timelines, break_idx = detect_intra_training_drift(train, feature_types)
+        intra_drift_df, month_rank = detect_intra_training_drift(train, feature_types)
 
     # --- Stage 3: Drift Mitigation ---
     with Timer("Drift mitigation") as mitigation_timer:
@@ -400,7 +400,7 @@ def main():
         import numpy as np
 
         # Baseline model: raw features (no mitigation) — shows value of drift handling
-        _MAX_BASELINE_SAMPLE = 50_000
+        _MAX_BASELINE_SAMPLE = 100_000
         train_baseline = train.sample(n=min(_MAX_BASELINE_SAMPLE, len(train)), seed=42) if len(train) > _MAX_BASELINE_SAMPLE else train
         if len(train) > _MAX_BASELINE_SAMPLE:
             logger.info(f"Baseline model: subsampling {_MAX_BASELINE_SAMPLE}/{len(train)} rows")
@@ -543,26 +543,6 @@ def main():
             combined = dw ** alpha * rw ** (1 - alpha)
             return combined / combined.mean()
 
-        has_break = break_idx is not None and has_recency
-
-        def _build_bp_blend(alpha, power, decay):
-            """Blend with breakpoint-aware recency instead of smooth decay."""
-            dw = compute_domain_weights(train_oof_proba, power=power)
-            rw = compute_breakpoint_weights(month_rank, break_idx, decay=decay, pre_scale=0.5)
-            if dw is None or rw is None:
-                return None
-            blended = alpha * dw + (1 - alpha) * rw
-            return blended / blended.mean()
-
-        def _build_bp_geometric(alpha, power, decay):
-            """Geometric with breakpoint-aware recency instead of smooth decay."""
-            dw = compute_domain_weights(train_oof_proba, power=power)
-            rw = compute_breakpoint_weights(month_rank, break_idx, decay=decay, pre_scale=0.5)
-            if dw is None or rw is None:
-                return None
-            combined = dw ** alpha * rw ** (1 - alpha)
-            return combined / combined.mean()
-
         # ── Weight tournament via Nelder-Mead optimization ──
         from scipy.optimize import minimize
 
@@ -624,20 +604,6 @@ def main():
             minimize(geom_obj, x0=[0.5, 0.7, 0.15], method='Nelder-Mead',
                      options={'maxiter': 8, 'maxfev': 12, 'xatol': 0.02, 'fatol': 0.0005})
             all_results.extend(geom_evals)
-
-            # 5. Breakpoint-aware variants (if a structural break was detected)
-            if has_break:
-                bp_blend_obj, bp_blend_evals = _make_cached_objective(_build_bp_blend, "BPBlend")
-                logger.info("Weight tournament: optimizing BPBlend (Nelder-Mead)")
-                minimize(bp_blend_obj, x0=[0.5, 0.7, 0.15], method='Nelder-Mead',
-                         options={'maxiter': 8, 'maxfev': 12, 'xatol': 0.02, 'fatol': 0.0005})
-                all_results.extend(bp_blend_evals)
-
-                bp_geom_obj, bp_geom_evals = _make_cached_objective(_build_bp_geometric, "BPGeometric")
-                logger.info("Weight tournament: optimizing BPGeometric (Nelder-Mead)")
-                minimize(bp_geom_obj, x0=[0.5, 0.7, 0.15], method='Nelder-Mead',
-                         options={'maxiter': 8, 'maxfev': 12, 'xatol': 0.02, 'fatol': 0.0005})
-                all_results.extend(bp_geom_evals)
 
         elif has_domain:
             # Only domain weights available — optimize power only
