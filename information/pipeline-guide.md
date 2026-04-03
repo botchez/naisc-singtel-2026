@@ -307,22 +307,24 @@ When testing 40+ features simultaneously, some will appear significant by chance
 
 ### 5.6 Intra-Training Drift Detection
 
-#### `detect_intra_training_drift(train, feature_types) -> (intra_drift_df, month_rank)`
+#### `detect_intra_training_drift(train, feature_types) -> (intra_drift_df, month_rank, sw_timelines, break_idx)`
 
 | Parameter | Type | Description |
 |---|---|---|
 | `train` | `pl.DataFrame` | Full (post-cap) training data |
 | `feature_types` | `dict` | Feature type classification |
-| **Returns** | `tuple[pl.DataFrame, pl.Series \| None]` | Intra-training drift results + per-row month rank ordering |
+| **Returns** | `tuple[pl.DataFrame, pl.Series \| None, dict, int \| None]` | Intra-training drift results + per-row month rank + sliding-window timelines + structural break index |
 
 **Logic:**
 1. Finds the temporal column and parses it into month periods (tries 11 date formats via `str.to_datetime` with `str.to_titlecase()` to restore month abbreviations after lowercase normalization).
 2. Sorts unique months chronologically, splits into early (first half) and late (second half).
-3. Runs the same drift detection between early and late halves — this reveals **temporal drift within the training data itself**.
-4. Returns only high/moderate-drift features.
-5. Builds `month_rank`: a Series mapping each row to its month's ordinal rank (0 = earliest month, N-1 = latest month) via `pl.Series.replace_strict()`. This is used by `compute_recency_weights()` in Stage 6.
+3. Runs the same drift detection between early and late halves (the primary drift signal for `intra_drift_df`). Returns only high/moderate-drift features.
+4. Builds `month_rank`: a Series mapping each row to its month's ordinal rank (0 = earliest month, N-1 = latest month) via `pl.Series.replace_strict()`. Used by `compute_recency_weights()` and `compute_breakpoint_weights()` in Stage 6.
+5. **Sliding window analysis** via `_sliding_window_drift()`: analyzes 9 consecutive month pairs (for 10 months). For each pair, computes PSI per numerical feature and JSD per categorical feature. Noise thresholds: `_MIN_PSI = 0.005`, `_MIN_JSD = 0.005`. Classifies each feature's drift pattern as HIGH / MODERATE / SPIKE / ACCELERATING / PERIODIC. Results (`sw_timelines`) are used for logging and for break-point detection.
+6. **Structural break detection** via `find_break_point()`: counts how many features shift simultaneously at each month boundary. Returns the month index with the most simultaneous shifts (minimum 2 features required). Returns `None` if no clean break is found. Logged as: "Structural break detected after {month} ({N} post-break months out of {total})".
+7. Per-feature patterns (PERIODIC / SPIKE / ACCELERATING) are logged only — not used for different mitigation.
 
-**Rationale:** If a feature is shifting within training data, it's likely to shift further in the test data (which is from a later time period). The `month_rank` enables recency weighting — giving more importance to recent training rows that are more representative of test conditions.
+**Rationale:** The simple early/late split provides the primary drift signal. The sliding window adds temporal resolution — detecting whether drift is gradual, sudden (spike), or periodic. The structural break index enables `compute_breakpoint_weights()` to step down the importance of pre-break training data that may no longer be representative.
 
 ### 5.7 Multivariate Shift Detection
 
@@ -507,6 +509,17 @@ Exponential decay weighting by temporal recency. Recent months get weight ~1.0; 
 1. `weights = exp(decay * (rank - max_rank))`. The most recent month gets exp(0) = 1.0. Older months decay exponentially.
 2. Normalize to mean=1.0.
 
+#### `compute_breakpoint_weights(month_rank, break_idx, decay=0.15, pre_scale=0.5) -> ndarray`
+
+Breakpoint-aware recency weighting. Applies standard exponential recency decay, then additionally steps down the weight of all months before the structural break.
+
+**Logic:**
+1. Compute standard exponential recency weights: `weights = exp(decay * (rank - max_rank))`.
+2. Multiply all rows whose month rank is less than `break_idx` by `pre_scale` (default 0.5) — effectively halving the contribution of pre-break training data.
+3. Normalize to mean=1.0 (so total effective sample size is preserved).
+
+**Rationale:** If a structural break (detected by `find_break_point()`) exists in the training data, the post-break months are fundamentally more representative of test conditions. The step-down ensures pre-break rows are down-weighted even beyond what recency decay alone would achieve.
+
 ---
 
 ## 7. Stage 4: Feature Engineering (feature_engineer.py)
@@ -644,38 +657,43 @@ Using the mitigated data:
 
 ### 9.3 Weight Tournament
 
-The weight tournament finds the optimal blend of domain weights (from the domain classifier) and recency weights (from month rank). It evaluates candidates via `_eval_candidate()` by training a model with each weight configuration and measuring test AU-PRC (or train AU-PRC if test labels unavailable).
+The weight tournament finds the optimal blend of domain weights (from the domain classifier) and recency/breakpoint weights (from month rank and structural break). It evaluates candidates via `_eval_candidate()` by training a model with each weight configuration and measuring **validation AU-PRC** on a month-stratified 80/20 val split.
+
+**Validation split:** From the tournament subsample (300K cap), 20% of each month's rows are held out for scoring (`val_frac=0.20`, stratified by month, seeded for reproducibility). This avoids dependency on test labels — which may be dummy values in the hidden evaluation dataset. `_eval_candidate()` returns a 3-tuple: `(label, weights, val_score)`.
 
 **Pre-conversion optimization:** Tournament subsets are converted to pandas/numpy ONCE before the optimization loop via `_to_pandas_with_categoricals()`, avoiding repeated polars→pandas conversions in each candidate evaluation.
 
-**Two weight families are optimized:**
+**Four weight families are optimized via Nelder-Mead, plus point evaluations:**
 
 1. **Additive Blend** (`_build_blend()`): `w = alpha * domain^power + (1-alpha) * recency(decay)`
-   - `alpha` controls the domain/recency mix
-   - `power` dampens domain weights
-   - `decay` controls recency steepness
+   - `alpha` controls the domain/recency mix; `power` dampens domain weights; `decay` controls recency steepness
 
 2. **Geometric Mean** (`_build_geometric()`): `w = domain^(alpha*power) * recency^(1-alpha)`
    - Multiplicative combination — a row must score well on **both** dimensions to get high weight
 
-**Optimization** (`_make_cached_objective()`): Each family uses **Nelder-Mead** (simplex method) starting from `x0=[0.5, 0.7, 0.15]`, with at most 12 function evaluations. A parameter cache (`_eval_cache`) prevents duplicate model trains when the optimizer revisits rounded parameter values.
+3. **BPBlend** (`_build_bp_blend()`): `w = alpha * domain^power + (1-alpha) * breakpoint_weights(decay)`
+   - Same as Blend but uses `compute_breakpoint_weights()` (recency + step-down at structural break) instead of plain recency
+
+4. **BPGeometric** (`_build_bp_geometric()`): `w = domain^(alpha*power) * breakpoint_weights^(1-alpha)`
+   - Geometric combination using breakpoint weights
+
+**Optimization** (`_make_cached_objective()`): Each of the 4 families uses **Nelder-Mead** (simplex method) starting from `x0=[0.5, 0.7, 0.15]`, with at most 12 function evaluations. A parameter cache (`_eval_cache`) prevents duplicate model trains when the optimizer revisits rounded parameter values.
 
 **Tournament structure:**
 ```
-1. Evaluate Uniform (no weights) -> baseline score
-2. Optimize Blend (Nelder-Mead, ~12 evals)
-3. Optimize Geometric (Nelder-Mead, ~12 evals)
-4. Pick overall winner across all ~25 candidates
+1.   Evaluate Uniform (no weights) -> baseline score
+2-5. Domain-only point evaluations: power in [0.3, 0.5, 0.7, 1.0]
+6-8. Recency-only point evaluations: decay in [0.10, 0.20, 0.40]
+9.   Optimize Blend (Nelder-Mead, ~12 evals)
+10.  Optimize Geometric (Nelder-Mead, ~12 evals)
+11.  Optimize BPBlend (Nelder-Mead, ~12 evals)
+12.  Optimize BPGeometric (Nelder-Mead, ~12 evals)
+     -> Pick overall winner across all ~56 candidates
 ```
 
-**Fallback modes:**
-- If only domain weights available (no temporal column): grid search over power values [0.3, 0.5, 0.7, 1.0].
-- If only recency weights available (no domain shift): grid search over decay values [0.10, 0.20, 0.40].
-- If neither: Uniform weights (no tournament).
+Domain-only and recency-only point evaluations are **always run** (not just as fallbacks). They serve as cheap anchors and may win if the combined families overfit.
 
 **Subsampling** (`_TOURNEY_SAMPLE_SIZE=300_000`): For datasets >300K rows, the tournament uses a stratified 300K-row subsample for each model train. The final model (after the winner is selected) is trained on full data.
-
-**Dummy test labels guard:** If test labels exist but have only 1 unique value (judges may provide dummy labels), `has_test_labels` is set to False and the tournament optimizes on train score instead.
 
 ### 9.4 Model Training
 
