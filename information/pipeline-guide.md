@@ -51,6 +51,8 @@ train.csv, test.csv
     |
 [3] Drift Mitigation  -->  train_m, test_m (cleaned) + drop_cols + shift_info (domain classifier)
     |
+[3b] Drop Validation (temporal holdout)  -->  drop_cols validated via model-based add-back test
+    |
 [4] Feature Engineering  -->  train_m, test_m (enriched with new features)
     |
 [5] Preprocessing  -->  X_train, y_train, X_test (model-ready matrices)
@@ -184,15 +186,15 @@ For datasets larger than 100K rows, many operations (drift detection, feature se
 For extremely large datasets, the full pipeline (mitigation, feature engineering, model training) must complete within 10 minutes.
 
 **Logic:**
-1. Compute `_max_pipeline_rows = 480 / (5.75e-7 * n_cols)`. This formula is calibrated from benchmarks: at 2M rows x 200 cols, the pipeline takes ~230s.
+1. Compute `_max_pipeline_rows = 300 / (8.0e-7 * n_cols)`. This formula is calibrated from benchmarks (2M rows x 200 cols on 2-core Docker). The cap is floored at `_DECISION_SAMPLE_SIZE` (100K) to never go below the decision sample.
 2. If `len(train) > _max_pipeline_rows`: subsample train using stratified temporal sampling, then **recompute** `_month_vals`, `_decision_idx`, and `train_decision` on the capped data — the pre-cap indices are now invalid.
 
 **Example scaling:**
 | Dataset | Max Rows | Cap Needed? |
 |---|---|---|
-| 70K x 45 (public) | ~18.5M | No |
-| 2M x 200 | ~4.2M | No |
-| 10M x 500 | ~1.67M | Yes, capped to 1.67M |
+| 70K x 45 (public) | ~8.3M | No |
+| 2M x 200 | ~1.9M | No |
+| 10M x 500 | ~750K | Yes, capped to 750K |
 
 ---
 
@@ -239,7 +241,7 @@ Drift detection identifies features whose distributions differ between train and
 | **IQR ratio** | Spread changes | `test_IQR / train_IQR`. Ratio > 2 or < 0.5 = significant spread change. |
 | **Tail divergence** | Extreme value shifts | Max shift in 1st/99th percentiles, normalized by train std. Catches tail behavior changes missed by histogram-based PSI. |
 
-**Subsampling:** Both columns are subsampled to 50K rows via `_subsample_array()` before testing. The cap is `_MAX_DRIFT_SAMPLE = 50_000`. Beyond this, additional rows add negligible statistical power but cost O(n log n) compute.
+**Subsampling:** Both columns are subsampled to 100K rows via `_subsample_array()` before testing. The cap is `_MAX_DRIFT_SAMPLE = 100_000`. Beyond this, additional rows add negligible statistical power but cost O(n log n) compute.
 
 **Severity classification** (`_numerical_severity()`):
 - **High**: PSI >= 0.25, or (PSI >= 0.15 and KS p < 0.001), or (Wasserstein_norm >= 1.0 and PSI >= 0.1), or (IQR ratio > 2x and PSI >= 0.1), or (tail_div > 2 and PSI >= 0.05).
@@ -307,24 +309,22 @@ When testing 40+ features simultaneously, some will appear significant by chance
 
 ### 5.6 Intra-Training Drift Detection
 
-#### `detect_intra_training_drift(train, feature_types) -> (intra_drift_df, month_rank, sw_timelines, break_idx)`
+#### `detect_intra_training_drift(train, feature_types) -> (intra_drift_df, month_rank)`
 
 | Parameter | Type | Description |
 |---|---|---|
 | `train` | `pl.DataFrame` | Full (post-cap) training data |
 | `feature_types` | `dict` | Feature type classification |
-| **Returns** | `tuple[pl.DataFrame, pl.Series \| None, dict, int \| None]` | Intra-training drift results + per-row month rank + sliding-window timelines + structural break index |
+| **Returns** | `tuple[pl.DataFrame, pl.Series \| None]` | Intra-training drift results + per-row month rank |
 
 **Logic:**
 1. Finds the temporal column and parses it into month periods (tries 11 date formats via `str.to_datetime` with `str.to_titlecase()` to restore month abbreviations after lowercase normalization).
 2. Sorts unique months chronologically, splits into early (first half) and late (second half).
-3. Runs the same drift detection between early and late halves (the primary drift signal for `intra_drift_df`). Returns only high/moderate-drift features.
-4. Builds `month_rank`: a Series mapping each row to its month's ordinal rank (0 = earliest month, N-1 = latest month) via `pl.Series.replace_strict()`. Used by `compute_recency_weights()` and `compute_breakpoint_weights()` in Stage 6.
-5. **Sliding window analysis** via `_sliding_window_drift()`: analyzes 9 consecutive month pairs (for 10 months). For each pair, computes PSI per numerical feature and JSD per categorical feature. Noise thresholds: `_MIN_PSI = 0.005`, `_MIN_JSD = 0.005`. Classifies each feature's drift pattern as HIGH / MODERATE / SPIKE / ACCELERATING / PERIODIC. Results (`sw_timelines`) are used for logging and for break-point detection.
-6. **Structural break detection** via `find_break_point()`: counts how many features shift simultaneously at each month boundary. Returns the month index with the most simultaneous shifts (minimum 2 features required). Returns `None` if no clean break is found. Logged as: "Structural break detected after {month} ({N} post-break months out of {total})".
-7. Per-feature patterns (PERIODIC / SPIKE / ACCELERATING) are logged only — not used for different mitigation.
+3. Subsamples each half to 100K rows (`_MAX_INTRA_SAMPLE = 100_000`) for efficiency.
+4. Runs the same drift detection between early and late halves (the primary drift signal for `intra_drift_df`). Returns only high/moderate-drift features.
+5. Builds `month_rank`: a Series mapping each row to its month's ordinal rank (0 = earliest month, N-1 = latest month) via `pl.Series.replace_strict()`. Used by `compute_recency_weights()` in Stage 6.
 
-**Rationale:** The simple early/late split provides the primary drift signal. The sliding window adds temporal resolution — detecting whether drift is gradual, sudden (spike), or periodic. The structural break index enables `compute_breakpoint_weights()` to step down the importance of pre-break training data that may no longer be representative.
+**Rationale:** The early/late split provides the primary intra-training drift signal — identifying features whose distributions shift over time within training data. The `month_rank` output feeds into recency weighting, which allows the model to emphasize recent (more test-representative) training months.
 
 ### 5.7 Multivariate Shift Detection
 
@@ -386,6 +386,7 @@ This is a **domain classifier** approach. Instead of testing each feature indepe
 3c. Progressive mitigation for high-drift features
 3d. Progressive mitigation for moderate-drift features (capped at top 50)
 3e. Multivariate shift detection (domain classifier)
+3f. Drop validation via temporal holdout (main.py)
 ```
 
 ### 6.2 Data Quality Normalization (Stage 3a)
@@ -404,7 +405,7 @@ This stage fixes surface-level data quality issues that masquerade as drift.
    - *Why this matters:* If train has "Los Angeles" but test has "LA", the model would treat them as different categories, losing signal.
 
 2. **Conditional lowercase + hyphen removal**:
-   - For each categorical column, computes JSD **before** and **after** lowercasing + hyphen removal (on a 50K subsample for efficiency).
+   - For each categorical column, computes JSD **before** and **after** lowercasing + hyphen removal (on a 100K subsample for efficiency).
    - Only applies if normalization reduces or maintains JSD — i.e., doesn't increase drift.
    - Uses `pl.col(col).cast(pl.Utf8).str.to_lowercase().str.replace_all("-", " ", literal=True)`.
    - *Why conditional:* Some columns have meaningful case distinctions. Blindly lowercasing "Yes"/"No" -> "yes"/"no" wouldn't help. The JSD check ensures normalization only happens when it genuinely closes the gap.
@@ -444,7 +445,7 @@ For each high-drift feature, tries a sequence of increasingly aggressive strateg
 5. Discretization (quantile binning using train edges)
 6. Rank transform (percentile rank based on train CDF)
 
-Each strategy is first evaluated on a 50K subsample via `_eval_subsample()`. If it reduces severity, it's applied to full data. This subsample-then-apply pattern saves computation when strategies fail.
+Each strategy is first evaluated on a 100K subsample via `_eval_subsample()`. If it reduces severity, it's applied to full data. This subsample-then-apply pattern saves computation when strategies fail.
 
 **Categorical features:**
 1. Group rare categories (below 1% frequency -> `_other`)
@@ -487,7 +488,25 @@ The best-improving strategy is applied even if severity stays "moderate" — par
 | Frequency encode | `frequency_encode_mitigation()` | cat, cat | float, float | Replace category with train-set frequency (0-1) via `pl.Series.replace_strict()`. Converts categorical -> numerical. |
 | Cyclical encode | `encode_temporal_cyclical()` | temporal, temporal | sin+cos, sin+cos | Parse month -> sin(2pi*m/12), cos(2pi*m/12). Captures seasonality without ordinal bias. |
 
-### 6.7 Sample Weight Functions
+### 6.7 Drop Validation via Temporal Holdout (Stage 3f, main.py)
+
+After `apply_all_mitigations()` returns `drop_cols`, the pipeline validates each drop decision using a model-based check rather than relying solely on drift statistics.
+
+**Motivation:** Drift statistics tell you a feature's distribution shifted, but not whether dropping it actually helps the model. A feature with high PSI may still carry predictive signal that outweighs the distribution gap. Conversely, a feature that barely crosses the "all strategies failed" threshold might genuinely be harmful. This stage answers: "Does removing this feature improve validation AU-PRC?"
+
+**Logic:**
+1. Subsample training data to 50K rows (`_DROP_VAL_SAMPLE`).
+2. **Temporal holdout split**: Hold out the last ~20% of months as the validation set. This simulates the train→test temporal shift — the val set contains more recent data, making it more representative of test conditions than a random split.
+   - Falls back to random 20% split if no temporal column is available.
+3. Train a quick LightGBM (fixed hyperparameters, no sample weights) with **all drops applied** — this is the baseline score.
+4. For each drop candidate, train with that feature **added back** (all other drops still applied).
+5. If add-back improves val AU-PRC by more than **0.005** (the noise threshold), the feature is rescued — removed from `drop_cols` and its mitigation log entry updated to "Kept (validated)".
+
+**Threshold rationale:** A delta of 0.005 filters out noise from subsample variation. On public data, `NumberofReferrals` showed +0.0037 on temporal holdout (below threshold) and was correctly kept as a drop — adding it back would have regressed test AU-PRC by ~8 points due to its severe train-vs-test distribution shift.
+
+**Cost:** `len(drop_cols) + 1` model trains on a 50K subsample (~1s each). Typically 2-5 features, so 3-6 seconds total.
+
+### 6.8 Sample Weight Functions
 
 These don't modify the data — they produce per-row weights used in Stage 6.
 
@@ -508,17 +527,6 @@ Exponential decay weighting by temporal recency. Recent months get weight ~1.0; 
 **Logic:**
 1. `weights = exp(decay * (rank - max_rank))`. The most recent month gets exp(0) = 1.0. Older months decay exponentially.
 2. Normalize to mean=1.0.
-
-#### `compute_breakpoint_weights(month_rank, break_idx, decay=0.15, pre_scale=0.5) -> ndarray`
-
-Breakpoint-aware recency weighting. Applies standard exponential recency decay, then additionally steps down the weight of all months before the structural break.
-
-**Logic:**
-1. Compute standard exponential recency weights: `weights = exp(decay * (rank - max_rank))`.
-2. Multiply all rows whose month rank is less than `break_idx` by `pre_scale` (default 0.5) — effectively halving the contribution of pre-break training data.
-3. Normalize to mean=1.0 (so total effective sample size is preserved).
-
-**Rationale:** If a structural break (detected by `find_break_point()`) exists in the training data, the post-break months are fundamentally more representative of test conditions. The step-down ensures pre-break rows are down-weighted even beyond what recency decay alone would achieve.
 
 ---
 
@@ -646,7 +654,7 @@ Each row's encoding comes from data it was never part of, eliminating leakage.
 
 ### 9.1 Baseline Model
 
-A model trained on unmitigated data with uniform weights, using the raw `train` and `test` DataFrames. Subsampled to 50K rows (`_MAX_BASELINE_SAMPLE`) for speed (it's only for comparison metrics). Saved as `prediction_baseline.csv` and `model_baseline.joblib`.
+A model trained on unmitigated data with uniform weights, using the raw `train` and `test` DataFrames. Subsampled to 100K rows (`_MAX_BASELINE_SAMPLE`) for speed (it's only for comparison metrics). Saved as `prediction_baseline.csv` and `model_baseline.joblib`.
 
 ### 9.2 Feature Selection
 
@@ -657,13 +665,13 @@ Using the mitigated data:
 
 ### 9.3 Weight Tournament
 
-The weight tournament finds the optimal blend of domain weights (from the domain classifier) and recency/breakpoint weights (from month rank and structural break). It evaluates candidates via `_eval_candidate()` by training a model with each weight configuration and measuring **validation AU-PRC** on a month-stratified 80/20 val split.
+The weight tournament finds the optimal blend of domain weights (from the domain classifier) and recency weights (from month rank). It evaluates candidates via `_eval_candidate()` by training a model with each weight configuration and measuring **validation AU-PRC** on a month-stratified 80/20 val split.
 
 **Validation split:** From the tournament subsample (300K cap), 20% of each month's rows are held out for scoring (`val_frac=0.20`, stratified by month, seeded for reproducibility). This avoids dependency on test labels — which may be dummy values in the hidden evaluation dataset. `_eval_candidate()` returns a 3-tuple: `(label, weights, val_score)`.
 
 **Pre-conversion optimization:** Tournament subsets are converted to pandas/numpy ONCE before the optimization loop via `_to_pandas_with_categoricals()`, avoiding repeated polars→pandas conversions in each candidate evaluation.
 
-**Four weight families are optimized via Nelder-Mead, plus point evaluations:**
+**Two weight families are optimized via Nelder-Mead, plus point evaluations:**
 
 1. **Additive Blend** (`_build_blend()`): `w = alpha * domain^power + (1-alpha) * recency(decay)`
    - `alpha` controls the domain/recency mix; `power` dampens domain weights; `decay` controls recency steepness
@@ -671,13 +679,7 @@ The weight tournament finds the optimal blend of domain weights (from the domain
 2. **Geometric Mean** (`_build_geometric()`): `w = domain^(alpha*power) * recency^(1-alpha)`
    - Multiplicative combination — a row must score well on **both** dimensions to get high weight
 
-3. **BPBlend** (`_build_bp_blend()`): `w = alpha * domain^power + (1-alpha) * breakpoint_weights(decay)`
-   - Same as Blend but uses `compute_breakpoint_weights()` (recency + step-down at structural break) instead of plain recency
-
-4. **BPGeometric** (`_build_bp_geometric()`): `w = domain^(alpha*power) * breakpoint_weights^(1-alpha)`
-   - Geometric combination using breakpoint weights
-
-**Optimization** (`_make_cached_objective()`): Each of the 4 families uses **Nelder-Mead** (simplex method) starting from `x0=[0.5, 0.7, 0.15]`, with at most 12 function evaluations. A parameter cache (`_eval_cache`) prevents duplicate model trains when the optimizer revisits rounded parameter values.
+**Optimization** (`_make_cached_objective()`): Each of the 2 families uses **Nelder-Mead** (simplex method) starting from `x0=[0.5, 0.7, 0.15]`, with at most 12 function evaluations. A parameter cache (`_eval_cache`) prevents duplicate model trains when the optimizer revisits rounded parameter values.
 
 **Tournament structure:**
 ```
@@ -686,9 +688,7 @@ The weight tournament finds the optimal blend of domain weights (from the domain
 6-8. Recency-only point evaluations: decay in [0.10, 0.20, 0.40]
 9.   Optimize Blend (Nelder-Mead, ~12 evals)
 10.  Optimize Geometric (Nelder-Mead, ~12 evals)
-11.  Optimize BPBlend (Nelder-Mead, ~12 evals)
-12.  Optimize BPGeometric (Nelder-Mead, ~12 evals)
-     -> Pick overall winner across all ~56 candidates
+     -> Pick overall winner across all ~32 candidates
 ```
 
 Domain-only and recency-only point evaluations are **always run** (not just as fallbacks). They serve as cheap anchors and may win if the combined families overfit.
@@ -823,6 +823,15 @@ Centralizes all polars ↔ pandas/numpy boundary conversions. External libraries
               |                         |                                     |
     train_m, test_m, drop_cols,         |                                     |
     shift_info (train_oof_proba)        |                                     |
+              |                         |                                     |
+              v                         |                                     |
+    Drop validation (temporal holdout)  |                                     |
+    ├─ hold out last ~20% months as val |                                     |
+    ├─ baseline: model with all drops   |                                     |
+    ├─ per-drop: add-back test          |                                     |
+    └─ rescue if delta > 0.005          |                                     |
+              |                         |                                     |
+         drop_cols (validated)          |                                     |
               |                         |                                     |
               v                         |                                     |
     engineer_features() ────────────────┤                                     |

@@ -6,6 +6,11 @@
 
 ```bash
 docker build -t naisc . && docker run --rm naisc
+
+# Build once (or after code changes)                                                                                                                                                                                                                                                docker build -t naisc .                                                                                                                                                                                                                                             
+                                                                                                                                                                                                                                                                      
+# Run as many times as you want — no reinstall
+  docker run --cpus=2 -v ${PWD}/stress_test_data:/app/stress_test_data naisc python ./src/main.py --train_data_filepath stress_test_data/train.csv --test_data_filepath stress_test_data/test.csv
 ```
 
 ## Setup (without Docker)
