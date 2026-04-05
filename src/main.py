@@ -370,7 +370,90 @@ def main():
             train, test, drift_df, feature_types
         )
 
+    # --- Stage 3b: Validate drop decisions via internal CV ---
+    if drop_cols:
+        from sklearn.metrics import average_precision_score
+        from model import _encode_target
+        import numpy as np
+
+        logger.info(f"Drop validation: checking {len(drop_cols)} candidates via temporal holdout")
+
+        # Use latest month(s) as val to simulate train→test temporal shift
+        _DROP_VAL_SAMPLE = min(50_000, len(train_m))
+        _dv_data = train_m.sample(n=_DROP_VAL_SAMPLE, seed=42) if len(train_m) > _DROP_VAL_SAMPLE else train_m
+
+        _dv_months = None
+        _dv_temporal_col = None
+        for tc in feature_types.get("temporal", []):
+            if tc in _dv_data.columns:
+                _dv_months = _parse_month_labels(_dv_data[tc])
+                if _dv_months is not None:
+                    _dv_temporal_col = tc
+                    break
+
+        if _dv_months is not None:
+            if isinstance(_dv_months, pl.Series):
+                _dv_months_np = _dv_months.to_numpy(allow_copy=True)
+            else:
+                _dv_months_np = _dv_months
+            # Hold out the last ~20% of months as val (mimics train→test shift)
+            unique_months = sorted(np.unique(_dv_months_np))
+            n_val_months = max(1, len(unique_months) // 5)
+            val_months = set(unique_months[-n_val_months:])
+            _dv_val_mask = np.isin(_dv_months_np, list(val_months))
+            logger.info(f"  Temporal holdout: val months={sorted(val_months)}")
+        else:
+            # Fallback: random 20% split
+            _dv_rng = np.random.RandomState(99)
+            _dv_n = len(_dv_data)
+            _dv_val_mask = np.zeros(_dv_n, dtype=bool)
+            _dv_val_mask[_dv_rng.choice(_dv_n, size=max(1, _dv_n // 5), replace=False)] = True
+
+        _dv_train_split = _dv_data.filter(~pl.Series(values=_dv_val_mask))
+        _dv_val_split = _dv_data.filter(pl.Series(values=_dv_val_mask))
+
+        target_col = feature_types["target"][0]
+        _dv_y_val = _encode_target(_dv_val_split[target_col]).to_numpy()
+
+        def _dv_score(extra_drops):
+            X_tr, y_tr, X_va, _ = prepare_features(
+                _dv_train_split, _dv_val_split, feature_types, extra_drop_cols=extra_drops
+            )
+            m = LGBMClassifier(
+                verbosity=-1, objective="binary", is_unbalance=True,
+                random_state=42, importance_type="gain",
+            )
+            X_tr_pd = X_tr.to_pandas() if hasattr(X_tr, 'to_pandas') else X_tr
+            X_va_pd = X_va.to_pandas() if hasattr(X_va, 'to_pandas') else X_va
+            m.fit(X_tr_pd, y_tr.to_numpy() if hasattr(y_tr, 'to_numpy') else y_tr)
+            return average_precision_score(_dv_y_val, m.predict_proba(X_va_pd)[:, 1])
+
+        base_score = _dv_score(drop_cols)
+        logger.info(f"  All drops applied: val AU-PRC={base_score:.4f}")
+
+        validated_drops = []
+        for col in drop_cols:
+            keep_score = _dv_score([c for c in drop_cols if c != col])
+            delta = keep_score - base_score
+            if delta > 0.005:
+                logger.info(f"  {col}: rescued (add-back +{delta:.4f}, {keep_score:.4f} > {base_score:.4f})")
+            else:
+                validated_drops.append(col)
+                logger.info(f"  {col}: confirmed drop (add-back {delta:+.4f})")
+
+        if len(validated_drops) != len(drop_cols):
+            removed = set(drop_cols) - set(validated_drops)
+            logger.info(f"Drop validation: rescued {len(removed)} features: {sorted(removed)}")
+            drop_cols = validated_drops
+            for entry in mitigation_log:
+                if entry["column"] in removed and entry["strategy_applied"] == "Drop Feature":
+                    entry["strategy_applied"] = "Kept (validated)"
+
     # --- Stage 4: Feature Engineering ---
+    # Save pre-FE mitigated data for later comparison (FE may not help)
+    train_m_no_fe, test_m_no_fe = train_m, test_m
+    drop_cols_no_fe = list(drop_cols)
+
     with Timer("Feature engineering") as feat_timer:
         train_m, test_m, new_feature_names = engineer_features(train_m, test_m, feature_types, drop_cols=drop_cols)
 
@@ -631,6 +714,73 @@ def main():
 
         logger.info(f"Final winner: {best_label} (val AU-PRC={best_score:.4f})")
         weight_status = best_label
+
+        # --- FE validation: compare with-FE vs without-FE on val split ---
+        # If FE hurts validation score, fall back to mitigation-only features.
+        try:
+            X_train_nofe, y_train_nofe, X_test_nofe, _ = prepare_features(
+                train_m_no_fe, test_m_no_fe, feature_types, extra_drop_cols=drop_cols_no_fe
+            )
+            # Apply same zero-importance pruning + interactions on no-FE set
+            _nofe_fs = train_model(X_train_nofe, y_train_nofe)
+            _nofe_imps = dict(zip(X_train_nofe.columns, _nofe_fs.feature_importances_))
+            _nofe_zero = [c for c, imp in _nofe_imps.items() if imp == 0]
+            if _nofe_zero and len(_nofe_zero) < len(X_train_nofe.columns):
+                X_train_nofe = X_train_nofe.drop(_nofe_zero)
+                X_test_nofe = X_test_nofe.drop(_nofe_zero)
+            _nofe_remaining = {c: _nofe_imps[c] for c in X_train_nofe.columns if c in _nofe_imps}
+            _nofe_top = [c for c in sorted(_nofe_remaining, key=lambda c: _nofe_remaining[c], reverse=True)[:8]
+                         if is_numeric_col(X_train_nofe[c])]
+            _nofe_int_tr, _nofe_int_te = [], []
+            for i, ca in enumerate(_nofe_top):
+                for cb in _nofe_top[i+1:]:
+                    fn = f"{ca}_x_{cb}"
+                    if fn not in X_train_nofe.columns:
+                        _nofe_int_tr.append((pl.col(ca) * pl.col(cb)).alias(fn))
+                        _nofe_int_te.append((pl.col(ca) * pl.col(cb)).alias(fn))
+            if _nofe_int_tr:
+                X_train_nofe = X_train_nofe.with_columns(_nofe_int_tr)
+                X_test_nofe = X_test_nofe.with_columns(_nofe_int_te)
+
+            # Evaluate no-FE on the same val split with winning weights
+            _nofe_pd = _to_pandas_with_categoricals(X_train_nofe, _native_cat_cols)
+            _nofe_y = y_train_nofe.to_numpy()
+            # Rebuild val split for no-FE data (same seed → same split)
+            _nofe_rng = np.random.RandomState(42)
+            _nofe_n = len(_nofe_y)
+            _nofe_val_mask = np.zeros(_nofe_n, dtype=bool)
+            _nofe_months = _month_vals
+            if isinstance(_nofe_months, pl.Series):
+                _nofe_months = _nofe_months.to_numpy(allow_copy=True)
+            if _nofe_months is not None:
+                for g in np.unique(_nofe_months):
+                    g_idx = np.where(_nofe_months == g)[0]
+                    n_val_g = max(1, int(len(g_idx) * _val_frac))
+                    chosen = _nofe_rng.choice(g_idx, size=n_val_g, replace=False)
+                    _nofe_val_mask[chosen] = True
+            _nofe_tr_idx = np.where(~_nofe_val_mask)[0]
+            _nofe_va_idx = np.where(_nofe_val_mask)[0]
+
+            _nofe_w = best_weights[_nofe_tr_idx] if best_weights is not None else None
+            _nofe_mdl = LGBMClassifier(
+                verbosity=-1, objective="binary", is_unbalance=True,
+                random_state=42, importance_type="gain",
+            )
+            _nofe_mdl.fit(_nofe_pd.iloc[_nofe_tr_idx], _nofe_y[_nofe_tr_idx], sample_weight=_nofe_w)
+            _nofe_val_sc = average_precision_score(
+                _nofe_y[_nofe_va_idx],
+                _nofe_mdl.predict_proba(_nofe_pd.iloc[_nofe_va_idx])[:, 1],
+            )
+
+            logger.info(f"FE validation: with_FE={best_score:.4f}, without_FE={_nofe_val_sc:.4f}")
+            if _nofe_val_sc > best_score:
+                logger.info(f"FE validation: dropping FE features (without_FE wins by {_nofe_val_sc - best_score:.4f})")
+                X_train_m, y_train_m, X_test_m = X_train_nofe, y_train_nofe, X_test_nofe
+                test_m = test_m_no_fe
+            else:
+                logger.info(f"FE validation: keeping FE features (with_FE wins by {best_score - _nofe_val_sc:.4f})")
+        except Exception as e:
+            logger.warning(f"FE validation skipped: {e}")
 
         # Train final model on full data with winning weights
         lgbm_m = train_model(X_train_m, y_train_m, sample_weight=best_weights)

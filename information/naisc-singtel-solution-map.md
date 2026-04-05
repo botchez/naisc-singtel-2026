@@ -37,8 +37,8 @@ main.py (Entry Point)
 |  - Build decision sample (100K rows, stratified by temporal month)    |
 |    Used for: drift detection, feature selection, weight tournament     |
 |  - Dynamic pipeline cap based on runtime budget:                      |
-|    Budget=480s, cost model=5.75e-7 s/row*col                          |
-|    Cap = 480 / (cost * n_cols), minimum = decision sample size        |
+|    Budget=300s, cost model=8.0e-7 s/row*col                           |
+|    Cap = 300 / (cost * n_cols), minimum = decision sample size        |
 |    If train > cap: stratified subsample, reset_index                  |
 |  - Parse temporal column for month labels (stratification key)        |
 +-----------------------------------------------------------------------+
@@ -82,19 +82,10 @@ main.py (Entry Point)
 |  2d. INTRA-TRAINING DRIFT (full pipeline-capped train):               |
 |      Split by temporal column: early months vs late months             |
 |      Same tests as 2a, reports high/moderate features                  |
-|      Returns 4-tuple: (intra_drift_df, month_rank,                    |
-|                         sw_timelines, break_idx)                       |
+|      Returns 2-tuple: (intra_drift_df, month_rank)                    |
 |      Subsampled to 100K per half                                      |
-|      SLIDING WINDOW: _sliding_window_drift() analyzes 9 consecutive   |
-|        month pairs (for 10 months), computing PSI per numerical        |
-|        feature and JSD per categorical feature                         |
-|        Noise thresholds: _MIN_PSI=0.005, _MIN_JSD=0.005               |
-|        Reports HIGH/MODERATE/SPIKE/ACCELERATING/PERIODIC per feature  |
-|      BREAK POINT: find_break_point() counts simultaneous feature       |
-|        shifts at each month boundary, returns the month index with the |
-|        most shifts (min 2 features required); None if no clean break   |
-|      Periodic/SPIKE/ACCELERATING patterns are logged per-feature       |
-|      Structural break is logged with post-break month count            |
+|      month_rank: ordinal rank per row (0=earliest, N-1=latest)        |
+|      Used by compute_recency_weights() in weight tournament            |
 |                                                                       |
 |  2e. LABEL SHIFT detection (train vs test churn rate)                 |
 |      Chi-squared proportion test, severity classification             |
@@ -115,7 +106,7 @@ main.py (Entry Point)
 |      - Fuzzy match unseen test categories to train (difflib,          |
 |        two-tier cutoff 0.6 then 0.45, skips high-cardinality >200)    |
 |      - Skips ID, target, and temporal columns                         |
-|      Subsampled: 50K for drift comparison during normalization        |
+|      Subsampled: 100K for drift comparison during normalization       |
 |                                                                       |
 |  3b. RE-CHECK DRIFT only for modified columns (not full re-run)       |
 |      Re-applies BH correction after update                            |
@@ -126,7 +117,7 @@ main.py (Entry Point)
 |                   quantile_bin -> rank_transform -> drop               |
 |      Categorical: group_rare -> freq_encode -> freq+clip ->           |
 |                   freq+rank -> freq+quantile -> drop                   |
-|      Evaluated on 50K subsample, applied to full data if accepted     |
+|      Evaluated on 100K subsample, applied to full data if accepted    |
 |      Accept if severity drops below "high"                            |
 |                                                                       |
 |  3d. PROGRESSIVE MITIGATION for MODERATE-drift features:              |
@@ -210,7 +201,7 @@ main.py (Entry Point)
 |  STAGE 6: Model Training & Prediction     [model.py, main.py] DONE    |
 |                                                                       |
 |  6a. BASELINE MODEL (for comparison only):                            |
-|      - Trained on raw data (pre-mitigation), 50K subsample            |
+|      - Trained on raw data (pre-mitigation), 100K subsample           |
 |      - Uses prepare_features on unmitigated train/test                |
 |      - Saves prediction_baseline.csv, model_baseline.joblib           |
 |                                                                       |
@@ -225,15 +216,13 @@ main.py (Entry Point)
 |                                                                       |
 |  6d. WEIGHT TOURNAMENT (Nelder-Mead optimization):                    |
 |      Inputs: train_oof_proba (from domain clf), month_rank (from      |
-|              intra-training drift), break_idx (structural break)       |
+|              intra-training drift)                                     |
 |      Candidate weight families:                                       |
 |        - Uniform (baseline)                                           |
 |        - Domain-only: 4 power values [0.3, 0.5, 0.7, 1.0]           |
 |        - Recency-only: 3 decay values [0.10, 0.20, 0.40]             |
 |        - Blend: alpha*domain^power + (1-alpha)*recency(decay)         |
 |        - Geometric: domain^(alpha*power) * recency(decay)^(1-alpha)   |
-|        - BPBlend: alpha*domain^power + (1-alpha)*breakpoint_weights   |
-|        - BPGeometric: domain^(alpha*power) * breakpoint_weights^(1-a)|
 |      Optimization: Nelder-Mead, maxiter=8, maxfev=12 per family       |
 |        Bounds: alpha [0,1], power [0.1,2.0], decay [0.01,0.80]       |
 |      Domain-only and recency-only ALWAYS evaluated (not just fallback) |
@@ -241,7 +230,7 @@ main.py (Entry Point)
 |        val_frac=0.20, stratified by month, seeded for reproducibility  |
 |        _eval_candidate() returns (label, weights, val_score) 3-tuple  |
 |      Caching: rounded params to avoid duplicate model trains           |
-|      Winner selection: highest val AU-PRC (~56 total evaluations)     |
+|      Winner selection: highest val AU-PRC (~32 total evaluations)     |
 |                                                                       |
 |  6e. FINAL MODEL:                                                     |
 |      - Train on full mitigated data with winning weights              |
@@ -279,12 +268,12 @@ src/
   profiler.py          Stage 1: data loading, downcast, column alignment,
                                 auto feature type detection, profiling
   drift_detector.py    Stage 2: per-feature statistical drift tests, BH correction,
-                                intra-training drift, label shift, multivariate
+                                intra-training drift (early/late split), multivariate
                                 shift detection (domain classifier), drift descriptions
   mitigation.py        Stage 3: data quality normalization (abbreviations, lowercase,
                                 hyphens, fuzzy matching), progressive mitigation
-                                (high + moderate), domain classifier, sample weight
-                                computation (domain + recency + breakpoint)
+                                (high + moderate), sample weight computation
+                                (domain + recency)
   feature_engineer.py  Stage 4: missing indicators, frequency encoding, ratio features,
                                 aggregation features, duplicate detection, column alignment
   model.py             Stage 5-6: target encoding, preprocessing (prepare_features),
@@ -298,17 +287,17 @@ src/
 
 ## Current Status
 
-### Latest Results (polars-refactor branch, 1 Apr 2026)
+### Latest Results (polars-refactor branch, 4 Apr 2026)
 
 | Metric | Baseline | Mitigated | Delta |
 |--------|----------|-----------|-------|
-| AU-PRC (train) | 0.9331 | 0.9192 | -0.0139 |
-| AU-PRC (test) | 0.7466 | **0.8637** | **+0.1171** |
+| AU-PRC (train) | — | 0.9192 | — |
+| AU-PRC (test) | 0.7552 | **0.8668** | **+0.1116** |
 
-- Domain classifier AUC: 0.8300 (shift detected)
-- Sample weights: BPGeometric(a=0.5125, p=0.7175, d=0.1500) won tournament
-- Runtime: ~63s total (0.8s ingestion, 3.0s drift, 6.3s mitigation, 1.9s FE, 50.8s model+tournament)
-- Weight tournament: 56 evaluations (4 families + domain/recency point evals), val-split scoring
+- Domain classifier AUC: 0.8314 (shift detected)
+- Sample weights: Blend(a=0.5062, p=0.7000, d=0.1556) won tournament
+- Runtime: ~26s total
+- Weight tournament: ~32 evaluations (2 families + domain/recency point evals), val-split scoring
 - Scalability: 2M rows x 93 cols runs in ~95s (well within 10 min budget)
 - Top-8 feature interactions: +0.0011 test AU-PRC
 
@@ -339,10 +328,6 @@ src/
 - [x] Benjamini-Hochberg FDR correction for multiple testing
 - [x] Drift severity classification (multi-metric with BH-corrected p-values)
 - [x] Intra-training drift detection (early vs late months)
-- [x] Sliding window intra-training drift detection (9 consecutive month pairs)
-- [x] Structural break detection (most simultaneous feature shifts)
-- [x] Breakpoint-aware sample weights (exponential decay + step-down at break)
-- [x] BPBlend and BPGeometric weight families in tournament
 - [x] Domain-only and recency-only always evaluated (not just as fallback)
 - [x] Month-stratified 80/20 val split for tournament evaluation (avoids dummy test label corruption)
 - [x] Multivariate shift detection (domain classifier, 3-fold CV)
@@ -388,6 +373,8 @@ src/
    - **Conclusion**: tournament-optimized weights are likely near-optimal here
 
 ### Already Exhausted (don't retry)
+- **Sliding window drift detection** — ~260 lines of complexity for ~0.001 AU-PRC improvement. Early/late split + domain classifier already capture temporal patterns. Removed Apr 2026.
+- **Breakpoint weights (BPBlend/BPGeometric)** — structural break detection + step-down weights. Added complexity to tournament without consistent improvement. Removed Apr 2026.
 - Feature additions: polynomials (C2), aggregations (C4, C5), group std/count — all reverted
 - **Difference features (a-b)** — tested 16 Mar, 0.8679 vs 0.8699 without. Adds noise, hurts generalization.
 - **Expanded ratio pairs (10 instead of 5)** — tested 16 Mar, 0.8678. Too many noisy ratios dilute signal.
@@ -415,10 +402,10 @@ src/
 - Bug fixes: BH correction, rare category NaN, feature eng using dropped cols
 
 ### Known Issues
-- Weight tournament adds ~35s (56 evaluations across 4 families + point evals vs ~25 previously)
-- Tournament now uses month-stratified val split (20%) rather than test labels — avoids dummy label corruption but adds overhead
+- Weight tournament adds ~15s (~32 evaluations across 2 families + point evals)
+- Tournament uses month-stratified val split (20%) rather than test labels — avoids dummy label corruption but adds overhead
 - Complete temporal split: train=Jan-Oct 2025, test=Nov-Dec 2025
-- Baseline model uses 50K subsample (comparison not perfectly fair, but output is always mitigated)
+- Baseline model uses 100K subsample (comparison not perfectly fair, but output is always mitigated)
 
 ---
 
@@ -432,7 +419,7 @@ src/
 6. **model.joblib in repo root** — trained model post-mitigation
 7. **Python 3.12, CPU only** — no GPU
 8. **Domain classifiers are utility models** — fixed hyperparameter constraint does NOT apply
-9. **Hidden dataset: up to 10M rows, 500 features, <10 min runtime limit**
+9. **Hidden dataset: same ~45 cols/dtypes as public, column names renamed (except CustomerID/Month/ChurnStatus), OOT test, <10 min runtime limit**
 
 ---
 
