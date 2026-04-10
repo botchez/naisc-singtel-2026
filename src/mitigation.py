@@ -21,62 +21,6 @@ def _eval_subsample(train_col, test_col, max_n=_MAX_EVAL_SAMPLE, seed=42):
     return tr, te
 
 
-def compute_domain_weights(
-    train_oof_proba: np.ndarray, power: float = 0.5
-) -> np.ndarray:
-    """Convert domain classifier P(test) probabilities to sample weights.
-
-    Higher P(test) = training row looks more like test = more important.
-    Power dampening (default 0.5) prevents extreme weight ratios.
-
-    Returns weights normalized to mean=1.0.
-    """
-    if train_oof_proba is None or len(train_oof_proba) == 0:
-        return None
-
-    # Clip to avoid zero weights
-    proba = np.clip(train_oof_proba, 1e-6, 1.0 - 1e-6)
-
-    # Power dampening: soften the weight distribution
-    weights = proba ** power
-
-    # Clip extreme values at 99th percentile
-    cap = np.percentile(weights, 99)
-    weights = np.clip(weights, None, cap)
-
-    # Normalize to mean=1.0
-    weights = weights / weights.mean()
-
-    return weights
-
-
-def compute_recency_weights(
-    month_rank, decay: float = 0.15
-) -> np.ndarray:
-    """Compute recency weights from month rank using exponential decay.
-
-    Most recent months get weight ~1.0; older months decay down.
-    Returns weights normalized to mean=1.0.
-    """
-    if month_rank is None or len(month_rank) == 0:
-        return None
-
-    month_rank = _ensure_pl_series(month_rank)
-    max_rank = month_rank.max()
-    if max_rank == 0:
-        return None
-
-    # Exponential decay: recent rows weighted higher
-    arr = month_rank.to_numpy().astype(float)
-    weights = np.exp(decay * (arr - max_rank))
-
-    # Normalize to mean=1.0
-    weights = weights / weights.mean()
-
-    return weights
-
-
-
 
 
 def detect_abbreviation_mappings(
@@ -683,6 +627,7 @@ def apply_all_mitigations(
     test,
     drift_df,
     feature_types: dict[str, list[str]],
+    drop_only: bool = False,
 ):
     """Run all mitigation stages in order.
 
@@ -690,9 +635,8 @@ def apply_all_mitigations(
     1. Normalize data quality (city abbreviations, lowercase, hyphen removal)
     2. Re-run drift detection on normalized data
     3. Progressive mitigation: try graduated strategies before dropping
-    4. Multivariate shift detection (domain weights for tournament)
 
-    Returns (train_mitigated, test_mitigated, drop_cols, mitigation_log, norm_log, shift_info).
+    Returns (train_mitigated, test_mitigated, drop_cols, mitigation_log, norm_log).
     """
     import pandas as pd
     _input_was_pandas = isinstance(train, pd.DataFrame)
@@ -701,6 +645,21 @@ def apply_all_mitigations(
     drift_df = _ensure_pl_df(drift_df)
 
     from drift_detector import _analyze_single_feature, _small_sample_factor, _apply_bh_correction
+
+    # drop_only mode: skip all transforms, drop every high/moderate-drift feature
+    if drop_only:
+        drop_cols = []
+        if len(drift_df) > 0:
+            for sev in ("high", "moderate"):
+                sev_rows = drift_df.filter(pl.col("severity") == sev)
+                for i in range(len(sev_rows)):
+                    col = sev_rows["column"][i]
+                    if col in train.columns:
+                        drop_cols.append(col)
+        logger.info(f"drop_only mode: dropping {len(drop_cols)} high/moderate-drift features, no transforms")
+        if _input_was_pandas:
+            return train.to_pandas(), test.to_pandas(), drop_cols, [], {}
+        return train, test, drop_cols, [], {}
 
     # Stage 1: Data quality normalization
     # normalize_data_quality now works internally with polars; pass polars in, get polars out
@@ -916,23 +875,6 @@ def apply_all_mitigations(
                                        "original_severity": "moderate", "strategy_applied": best_strategy,
                                        "final_severity": best_sev})
 
-    # Stage 4: Multivariate shift detection (domain weights for tournament)
-    from drift_detector import detect_multivariate_shift
-
-    # detect_multivariate_shift auto-converts pandas->polars internally
-    shift_info = detect_multivariate_shift(train_m, test_m, feature_types, extra_drop_cols=drop_cols)
-
-    if shift_info["shift_detected"]:
-        logger.info(
-            f"Multivariate shift detected (AUC={shift_info['auc']:.4f}), "
-            f"domain weights passed to weight tournament"
-        )
-    else:
-        logger.info(
-            f"No significant multivariate shift (AUC={shift_info['auc']:.4f}), "
-            f"skipping domain weights"
-        )
-
     if _input_was_pandas:
-        return train_m.to_pandas(), test_m.to_pandas(), drop_cols, mitigation_log, norm_log, shift_info
-    return train_m, test_m, drop_cols, mitigation_log, norm_log, shift_info
+        return train_m.to_pandas(), test_m.to_pandas(), drop_cols, mitigation_log, norm_log
+    return train_m, test_m, drop_cols, mitigation_log, norm_log
