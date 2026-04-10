@@ -14,14 +14,15 @@ This document is a complete walkthrough of the automated drift detection and mit
 4. [Stage 1b: Decision Sample & Pipeline Cap (main.py)](#4-stage-1b-decision-sample--pipeline-cap-mainpy)
 5. [Stage 2: Drift Detection (drift_detector.py)](#5-stage-2-drift-detection-drift_detectorpy)
 6. [Stage 3: Drift Mitigation (mitigation.py)](#6-stage-3-drift-mitigation-mitigationpy)
-7. [Stage 4: Feature Engineering (feature_engineer.py)](#7-stage-4-feature-engineering-feature_engineerpy)
-8. [Stage 5: Preprocessing & Encoding (model.py)](#8-stage-5-preprocessing--encoding-modelpy)
-9. [Stage 6: Model Training & Weight Tournament (main.py + model.py)](#9-stage-6-model-training--weight-tournament-mainpy--modelpy)
-10. [Stage 7: Evaluation & Output (model.py + main.py)](#10-stage-7-evaluation--output-modelpy--mainpy)
-11. [Shared Utilities (utils.py)](#11-shared-utilities-utilspy)
-12. [Polars Compatibility Layer (polars_compat.py)](#12-polars-compatibility-layer-polars_compatpy)
-13. [Data Flow Diagram](#13-data-flow-diagram)
-14. [Key Design Principles](#14-key-design-principles)
+7. [Stage 3b: Feature Strategy Tournament (main.py)](#7-stage-3b-feature-strategy-tournament-mainpy)
+8. [Stage 4: Feature Engineering (feature_engineer.py)](#8-stage-4-feature-engineering-feature_engineerpy)
+9. [Stage 5: Preprocessing & Encoding (model.py)](#9-stage-5-preprocessing--encoding-modelpy)
+10. [Stage 6: Model Training & Prediction (main.py + model.py)](#10-stage-6-model-training--prediction-mainpy--modelpy)
+11. [Stage 7: Evaluation & Output (model.py + main.py)](#11-stage-7-evaluation--output-modelpy--mainpy)
+12. [Shared Utilities (utils.py)](#12-shared-utilities-utilspy)
+13. [Polars Compatibility Layer (polars_compat.py)](#13-polars-compatibility-layer-polars_compatpy)
+14. [Data Flow Diagram](#14-data-flow-diagram)
+15. [Key Design Principles](#15-key-design-principles)
 
 ---
 
@@ -43,23 +44,24 @@ The evaluation metric is **AU-PRC** (Area Under Precision-Recall Curve), which r
 train.csv, test.csv
     |
     v
-[1] Load & Profile  -->  feature_types dict
+[1]  Load & Profile  -->  feature_types dict
     |
 [1b] Decision Sample + Pipeline Cap
     |
-[2] Drift Detection  -->  drift_df (per-feature severity) + month_rank (recency ordering)
+[2]  Drift Detection  -->  drift_df (per-feature severity) + month_rank
     |
-[3] Drift Mitigation  -->  train_m, test_m (cleaned) + drop_cols + shift_info (domain classifier)
+[3]  Drift Mitigation  -->  train_m, test_m (cleaned) + drop_cols
     |
-[3b] Drop Validation (temporal holdout)  -->  drop_cols validated via model-based add-back test
+[3b] Feature Strategy Tournament  -->  per-feature {current, raw, drop} evaluation
     |
-[4] Feature Engineering  -->  train_m, test_m (enriched with new features)
+[4]  Feature Engineering  -->  train_m, test_m (enriched with new features)
     |
-[5] Preprocessing  -->  X_train, y_train, X_test (model-ready matrices)
+[5]  Preprocessing  -->  X_train, y_train, X_test (model-ready matrices)
     |
-[6] Weight Tournament  -->  best_weights (optimal sample weighting scheme)
-    |
-[7] Final Model + Evaluation  -->  prediction.csv, model.joblib
+[6]  Model Training  -->  feature selection, FE validation gate,
+     |                     iterative mitigation, self-training
+     v
+[7]  Evaluation & Output  -->  prediction.csv, model.joblib
 ```
 
 ---
@@ -71,7 +73,8 @@ train.csv, test.csv
 **Key orchestration decisions:**
 
 - **Two models are always trained**: a _baseline_ (no mitigation, uniform weights) and a _mitigated_ (full pipeline). Both are saved, and the mitigated version is copied to the final `prediction.csv` / `model.joblib`.
-- **State carries forward**: `feature_types` (from Stage 1) flows through every subsequent stage as the universal schema reference. `drift_df` (from Stage 2) drives Stage 3's mitigation strategy selection. `shift_info` (from Stage 3) provides domain classifier probabilities for Stage 6's weighting.
+- **State carries forward**: `feature_types` (from Stage 1) flows through every subsequent stage as the universal schema reference. `drift_df` (from Stage 2) drives Stage 3's mitigation strategy selection.
+- **Uniform sample weights**: Domain classifier weighting and weight tournament are disabled. All models train with uniform weights.
 - **Display functions** (`print_drift_mitigation_summary`, `print_multivariate_shift_summary`, `print_runtime_summary`) are called only after all computation completes, so the console output is clean and grouped.
 
 ---
@@ -326,35 +329,13 @@ When testing 40+ features simultaneously, some will appear significant by chance
 
 **Rationale:** The early/late split provides the primary intra-training drift signal — identifying features whose distributions shift over time within training data. The `month_rank` output feeds into recency weighting, which allows the model to emphasize recent (more test-representative) training months.
 
-### 5.7 Multivariate Shift Detection
+### 5.7 Multivariate Shift Detection (DISABLED)
 
 #### `detect_multivariate_shift(train, test, feature_types, extra_drop_cols, n_splits) -> dict`
 
-| Parameter | Type | Description |
-|---|---|---|
-| `train` | `pl.DataFrame` | Mitigated training data |
-| `test` | `pl.DataFrame` | Mitigated test data |
-| `feature_types` | `dict` | Feature type classification |
-| `extra_drop_cols` | `list[str] \| None` | Columns to exclude (dropped features) |
-| `n_splits` | `int` | CV folds (default 3) |
-| **Returns** | `dict` | `{auc, fold_aucs, shift_detected, train_oof_proba, top_shift_features}` |
+**Status:** This function exists in `drift_detector.py` but is **not called** by the current pipeline. `apply_all_mitigations()` returns a stub `shift_info = {auc: 0.0, shift_detected: False, ...}`. The domain classifier was disabled because its sample weights did not improve AU-PRC on the public dataset — the univariate drift mitigation and feature strategy tournament proved more effective.
 
-This is a **domain classifier** approach. Instead of testing each feature independently, it asks: "Can a model tell whether a row came from train or test?"
-
-**Logic:**
-1. Prepares features: drops id/target/extra_drop, caps at 100 features by variance (`_MAX_DOMAIN_FEATURES = 100`), encodes string categoricals as integers via `replace_strict()` with a dict mapping, fills NaN with median (numeric) or 0 (non-numeric via `to_numeric_coerce`).
-2. Concatenates train and test via `pl.concat`, labels train as 0 and test as 1.
-3. Subsamples each split to 100K rows (`_MAX_DOMAIN_SAMPLE`).
-4. Converts to pandas for LightGBM via `to_pandas_for_lgbm()`.
-5. Trains a lightweight LightGBM (50 trees) with **stratified k-fold CV** (k adapted by `safe_n_splits`).
-6. Computes **out-of-fold AUC** (area under ROC curve for domain classification).
-   - AUC ~ 0.5 = no shift (model can't distinguish train from test).
-   - AUC ~ 1.0 = extreme shift (train and test are trivially separable).
-   - AUC > 0.65 = shift detected.
-7. **Extracts per-training-row P(test)**: the probability that each training row "looks like" a test row. If train was subsampled for the domain classifier, the last fold's classifier scores the full training set (using saved encoding mappings from `_cat_maps` and `_fill_vals`).
-8. Logs top-5 features driving the shift (by feature importance gain).
-
-**Rationale:** Univariate tests can miss drift that only appears in feature interactions. The domain classifier captures **multivariate covariate shift**. The per-row P(test) probabilities become sample weights in Stage 6 — training rows that resemble test data are upweighted.
+The function trains a LightGBM domain classifier to distinguish train from test rows, producing per-row P(test) probabilities that could be used as sample weights. It remains available if weight-based approaches are re-enabled.
 
 ---
 
@@ -385,9 +366,9 @@ This is a **domain classifier** approach. Instead of testing each feature indepe
 3b. Re-check drift for normalized columns only
 3c. Progressive mitigation for high-drift features
 3d. Progressive mitigation for moderate-drift features (capped at top 50)
-3e. Multivariate shift detection (domain classifier)
-3f. Drop validation via temporal holdout (main.py)
 ```
+
+Note: Domain classifier / multivariate shift detection is disabled. `shift_info` is returned as a stub (`auc=0.0, shift_detected=False`).
 
 ### 6.2 Data Quality Normalization (Stage 3a)
 
@@ -488,49 +469,46 @@ The best-improving strategy is applied even if severity stays "moderate" — par
 | Frequency encode | `frequency_encode_mitigation()` | cat, cat | float, float | Replace category with train-set frequency (0-1) via `pl.Series.replace_strict()`. Converts categorical -> numerical. |
 | Cyclical encode | `encode_temporal_cyclical()` | temporal, temporal | sin+cos, sin+cos | Parse month -> sin(2pi*m/12), cos(2pi*m/12). Captures seasonality without ordinal bias. |
 
-### 6.7 Drop Validation via Temporal Holdout (Stage 3f, main.py)
+---
 
-After `apply_all_mitigations()` returns `drop_cols`, the pipeline validates each drop decision using a model-based check rather than relying solely on drift statistics.
+## 7. Stage 3b: Feature Strategy Tournament (main.py)
 
-**Motivation:** Drift statistics tell you a feature's distribution shifted, but not whether dropping it actually helps the model. A feature with high PSI may still carry predictive signal that outweighs the distribution gap. Conversely, a feature that barely crosses the "all strategies failed" threshold might genuinely be harmful. This stage answers: "Does removing this feature improve validation AU-PRC?"
+After `apply_all_mitigations()` returns, each **transformed** feature (those that had a mitigation strategy applied, not just normalization or drops) is evaluated in a three-way tournament: keep the current transform, revert to the raw (unmitigated) column, or drop the feature entirely.
 
-**Logic:**
-1. Subsample training data to 50K rows (`_DROP_VAL_SAMPLE`).
-2. **Temporal holdout split**: Hold out the last ~20% of months as the validation set. This simulates the train→test temporal shift — the val set contains more recent data, making it more representative of test conditions than a random split.
-   - Falls back to random 20% split if no temporal column is available.
-3. Train a quick LightGBM (fixed hyperparameters, no sample weights) with **all drops applied** — this is the baseline score.
-4. For each drop candidate, train with that feature **added back** (all other drops still applied).
-5. If add-back improves val AU-PRC by more than **0.005** (the noise threshold), the feature is rescued — removed from `drop_cols` and its mitigation log entry updated to "Kept (validated)".
+**Motivation:** Progressive mitigation picks strategies that reduce drift statistics, but lower drift doesn't always mean better predictions. A transform might reduce PSI but destroy predictive signal. This stage answers: "Does this transform actually help AU-PRC?"
 
-**Threshold rationale:** A delta of 0.005 filters out noise from subsample variation. On public data, `NumberofReferrals` showed +0.0037 on temporal holdout (below threshold) and was correctly kept as a drop — adding it back would have regressed test AU-PRC by ~8 points due to its severe train-vs-test distribution shift.
-
-**Cost:** `len(drop_cols) + 1` model trains on a 50K subsample (~1s each). Typically 2-5 features, so 3-6 seconds total.
-
-### 6.8 Sample Weight Functions
-
-These don't modify the data — they produce per-row weights used in Stage 6.
-
-#### `compute_domain_weights(train_oof_proba, power) -> ndarray`
-
-Converts domain classifier P(test) into sample weights. Training rows that look more like test data get higher weight.
+**Which features enter the tournament:**
+- Only features where `strategy_applied` is a transform (e.g., "Quantile matching", "Robust Scaling", "Rank Transform").
+- Features that were only normalized (lowercased, abbreviation-mapped) are excluded — those are safe corrections.
+- Features that were dropped (all strategies failed) are excluded — trusted as correct.
+- Frequency encoding is excluded — it fundamentally changes the feature type.
 
 **Logic:**
-1. Clip probabilities to [1e-6, 1-1e-6].
-2. Apply power dampening: `weights = proba^power`. Power < 1 (default 0.5) compresses the weight distribution — preventing a few "very test-like" rows from dominating.
-3. Cap extreme values at 99th percentile.
-4. Normalize to mean=1.0 (so total effective sample size is preserved).
+1. Subsample mitigated training data to 50K rows (`_FST_SAMPLE`), keeping a mapping to original (raw) training data at the same row positions.
+2. **Temporal holdout split**: Hold out the last ~20% of months as the validation set. Falls back to random 20% split if no temporal column is available.
+3. For each tournament feature, evaluate three strategies with **3-seed averaging** (seeds 42, 123, 456) for stability:
+   - **Current**: the mitigated data as-is.
+   - **Drop**: exclude the feature entirely.
+   - **Raw**: swap the mitigated column with the original unmitigated column.
+4. Pick the winner. Require a **0.005 improvement** over current to switch — this filters out noise from subsample variation.
 
-#### `compute_recency_weights(month_rank, decay) -> ndarray`
+**Outcomes:**
+- If **drop** wins: feature is added to `drop_cols`, mitigation log updated to "Drop Feature (tournament)".
+- If **raw** wins: the mitigated column is replaced with the original in both `train_m` and `test_m`, mitigation log updated to "Reverted to raw (tournament)".
+- If **current** wins (or no alternative exceeds +0.005): transform is kept as-is.
 
-Exponential decay weighting by temporal recency. Recent months get weight ~1.0; older months decay.
+**Cost:** `3 strategies x 3 seeds x N features` model trains on a 50K subsample. Typically 2-5 tournament features, so 18-45 model trains (~15-30 seconds total).
 
-**Logic:**
-1. `weights = exp(decay * (rank - max_rank))`. The most recent month gets exp(0) = 1.0. Older months decay exponentially.
-2. Normalize to mean=1.0.
+### 6.7 Sample Weight Functions
+
+These functions exist in `mitigation.py` but are **currently unused** — all models train with uniform weights. They remain available if weight-based approaches are re-enabled.
+
+- `compute_domain_weights(train_oof_proba, power)` — converts domain classifier P(test) into sample weights with power dampening and mean=1.0 normalization.
+- `compute_recency_weights(month_rank, decay)` — exponential decay by temporal recency, normalized to mean=1.0.
 
 ---
 
-## 7. Stage 4: Feature Engineering (feature_engineer.py)
+## 8. Stage 4: Feature Engineering (feature_engineer.py)
 
 #### `engineer_features(train, test, feature_types, drop_cols) -> (train_enriched, test_enriched, new_feature_names)`
 
@@ -544,17 +522,17 @@ Exponential decay weighting by temporal recency. Recent months get weight ~1.0; 
 
 All feature engineering is **dynamic** — no hardcoded column names. Features are derived from the `feature_types` dict and statistical properties of the data. A name collision guard (`existing_cols`) prevents duplicate feature names across all stages.
 
-### 7.1 Missing Value Indicators
+### 8.1 Missing Value Indicators
 
 For columns with >1% null rate, adds a binary `{col}_is_null` feature via `pl.Series.is_null().cast(pl.Int32)`. New columns are attached via `pl.DataFrame.hstack()`. This lets the model learn from missingness patterns — e.g., if `TotalCharges` is null for new customers with 0 tenure, that pattern is predictive.
 
-### 7.2 Frequency Encoding
+### 8.2 Frequency Encoding
 
 For high-cardinality categoricals (>10 unique values), adds `{col}_freq` — the training-set frequency of each category value via `pl.Series.replace_strict(freq_map, default=0.0, return_dtype=pl.Float64)`. This provides a numerical representation that captures category popularity without the dimensionality explosion of one-hot encoding.
 
 Low-cardinality categoricals (<= 10 unique) are handled later by target encoding in Stage 5.
 
-### 7.3 Ratio Features
+### 8.3 Ratio Features
 
 Finds the top-5 most correlated numerical pairs (|r| > 0.3) and creates `{col_a}_div_{col_b}` = a / (b + 1). The +1 prevents division by zero.
 
@@ -564,7 +542,7 @@ Finds the top-5 most correlated numerical pairs (|r| > 0.3) and creates `{col_a}
 
 **Rationale:** Ratio features capture relationships that tree models can technically learn but require many splits to approximate. `TotalCharges / TotalRevenue` is a single feature expressing relative spending efficiency.
 
-### 7.4 Aggregation Features
+### 8.4 Aggregation Features
 
 Groups `mean(numerical)` by `categorical`, creating features like `MonthlyCharge_mean_by_Contract`.
 
@@ -574,21 +552,21 @@ Groups `mean(numerical)` by `categorical`, creating features like `MonthlyCharge
 
 **Rationale:** Aggregation features encode group-level patterns. If customers on "Month-to-Month" contracts have higher average MonthlyCharge, this feature makes that pattern directly accessible to the model.
 
-### 7.5 Near-Duplicate Removal
+### 8.5 Near-Duplicate Removal
 
 After all features are added, computes the correlation matrix among all numerical features via `_pairwise_corr_matrix()` and drops one of any pair with |corr| > 0.98. When choosing which to drop, engineered features are preferred over originals (keep the raw signal, discard the derivative).
 
 **Column cap** (`_MAX_DEDUP_COLS=200`): For >200 numerical features, only the top-200 by variance are checked (avoiding O(m^2) on 500+ columns).
 
-### 7.6 Post-Engineering Drift Check (main.py)
+### 8.6 Post-Engineering Drift Check (main.py)
 
 Back in `main.py`, each newly engineered feature is tested for drift via `detect_numerical_drift()`. Any engineered feature with "high" drift is dropped — it would confuse the model more than help.
 
 ---
 
-## 8. Stage 5: Preprocessing & Encoding (model.py)
+## 9. Stage 5: Preprocessing & Encoding (model.py)
 
-### 8.1 Feature Preparation
+### 9.1 Feature Preparation
 
 #### `prepare_features(train, test, feature_types, extra_drop_cols) -> (X_train, y_train, X_test, customer_ids)`
 
@@ -636,7 +614,7 @@ Back in `main.py`, each newly engineered feature is tested for drift via `detect
 
 8. **NaN handling**: Numeric NaN is left as-is (LightGBM handles it natively). Non-numeric NaN is filled with mode via `pl.Series.mode()`.
 
-### 8.2 Target Encoding: Why K-Fold?
+### 9.2 Target Encoding: Why K-Fold?
 
 Naive target encoding (computing category mean directly from training data) leaks the target — each row's encoding includes information from its own label. K-fold encoding fixes this:
 
@@ -650,52 +628,50 @@ Each row's encoding comes from data it was never part of, eliminating leakage.
 
 ---
 
-## 9. Stage 6: Model Training & Weight Tournament (main.py + model.py)
+## 10. Stage 6: Model Training & Prediction (main.py + model.py)
 
-### 9.1 Baseline Model
+### 10.1 Baseline Model
 
 A model trained on unmitigated data with uniform weights, using the raw `train` and `test` DataFrames. Subsampled to 100K rows (`_MAX_BASELINE_SAMPLE`) for speed (it's only for comparison metrics). Saved as `prediction_baseline.csv` and `model_baseline.joblib`.
 
-### 9.2 Feature Selection
+### 10.2 Feature Selection
 
 Using the mitigated data:
 1. Train an initial model on decision sample if data is large.
 2. **Drop zero-importance features**: Features that LightGBM never split on. These add noise without predictive value.
 3. **Add top-feature interactions**: Take the top-8 features by importance, create all pairwise products (`col_a * col_b` via `pl.col(ca) * pl.col(cb)`). This gives the model explicit access to interaction effects.
 
-### 9.3 Weight Tournament
+### 10.3 FE Validation Gate
 
-The weight tournament finds the optimal blend of domain weights (from the domain classifier) and recency weights (from month rank). It evaluates candidates via `_eval_candidate()` by training a model with each weight configuration and measuring **validation AU-PRC** on a month-stratified 80/20 val split.
+Compares the pipeline **with** feature engineering vs **without** (mitigated data only, no engineered features). Both paths go through zero-importance pruning and top-feature interactions independently.
 
-**Validation split:** From the tournament subsample (300K cap), 20% of each month's rows are held out for scoring (`val_frac=0.20`, stratified by month, seeded for reproducibility). This avoids dependency on test labels — which may be dummy values in the hidden evaluation dataset. `_eval_candidate()` returns a 3-tuple: `(label, weights, val_score)`.
+**Logic:**
+1. Prepare both variants: `X_train_m` (with FE) and `X_train_nofe` (without FE, from saved `train_m_no_fe`).
+2. Each variant gets its own zero-importance pruning and top-feature interactions (since importances differ).
+3. Month-stratified 80/20 validation split (same seed for both).
+4. Train LightGBM on each, compare validation AU-PRC.
+5. If without-FE wins, swap `X_train_m` / `X_test_m` to the no-FE variant and update `test_m`.
 
-**Pre-conversion optimization:** Tournament subsets are converted to pandas/numpy ONCE before the optimization loop via `_to_pandas_with_categoricals()`, avoiding repeated polars→pandas conversions in each candidate evaluation.
+**Rationale:** Feature engineering can hurt when it introduces noise or high-drift features. On the public dataset, FE is sometimes dropped (when it adds <0.002 AU-PRC improvement) because the engineered features don't generalize well to the shifted test distribution.
 
-**Two weight families are optimized via Nelder-Mead, plus point evaluations:**
+### 10.4 Iterative Mitigation (importance-aware)
 
-1. **Additive Blend** (`_build_blend()`): `w = alpha * domain^power + (1-alpha) * recency(decay)`
-   - `alpha` controls the domain/recency mix; `power` dampens domain weights; `decay` controls recency steepness
+After feature selection and FE validation, a second-pass mitigation targets features that are **both high-importance AND still drifted**. This focuses compute on what actually affects predictions.
 
-2. **Geometric Mean** (`_build_geometric()`): `w = domain^(alpha*power) * recency^(1-alpha)`
-   - Multiplicative combination — a row must score well on **both** dimensions to get high weight
+**Logic:**
+1. Train a model on the current `X_train_m` to get feature importances.
+2. Identify features above the **50th percentile** of non-zero importances.
+3. For each high-importance feature, re-run `detect_numerical_drift()` on the model-ready data.
+4. If severity is "high" or "moderate", try:
+   - **Quantile matching** first (preserves scale, aligns CDFs).
+   - **Rank transform** as fallback (converts to percentile rank, distribution-agnostic).
+5. Apply whichever reduces drift.
 
-**Optimization** (`_make_cached_objective()`): Each of the 2 families uses **Nelder-Mead** (simplex method) starting from `x0=[0.5, 0.7, 0.15]`, with at most 12 function evaluations. A parameter cache (`_eval_cache`) prevents duplicate model trains when the optimizer revisits rounded parameter values.
+**Why this matters:** First-pass mitigation (Stage 3) operates on raw features before encoding and interactions. By Stage 6, the model-ready data includes encoded categoricals, interaction terms, and aggregation features — some of which may have drift that wasn't visible at the raw feature level. This second pass catches those cases, but only for features the model actually relies on.
 
-**Tournament structure:**
-```
-1.   Evaluate Uniform (no weights) -> baseline score
-2-5. Domain-only point evaluations: power in [0.3, 0.5, 0.7, 1.0]
-6-8. Recency-only point evaluations: decay in [0.10, 0.20, 0.40]
-9.   Optimize Blend (Nelder-Mead, ~12 evals)
-10.  Optimize Geometric (Nelder-Mead, ~12 evals)
-     -> Pick overall winner across all ~32 candidates
-```
+**Cost:** One extra model train for importances + 2 drift-check + transform operations per qualifying feature. Typically <1 second.
 
-Domain-only and recency-only point evaluations are **always run** (not just as fallbacks). They serve as cheap anchors and may win if the combined families overfit.
-
-**Subsampling** (`_TOURNEY_SAMPLE_SIZE=300_000`): For datasets >300K rows, the tournament uses a stratified 300K-row subsample for each model train. The final model (after the winner is selected) is trained on full data.
-
-### 9.4 Model Training
+### 10.5 Model Training
 
 #### `train_model(X_train, y_train, sample_weight) -> LGBMClassifier`
 
@@ -706,15 +682,33 @@ Domain-only and recency-only point evaluations are **always run** (not just as f
 | `sample_weight` | `ndarray \| None` | Per-row weights (None = uniform) |
 | **Returns** | `LGBMClassifier` | Trained model |
 
-Uses the fixed hyperparameters. The only knob is `sample_weight`, which is how all the drift detection work manifests in the model — rows more representative of test conditions get higher weight.
+Uses the fixed hyperparameters. Currently always called with `sample_weight=None` (uniform weights).
 
 **Polars→pandas conversion:** `X_train` is converted via `_to_pandas_with_categoricals()` which calls `to_pandas_for_lgbm()` from `polars_compat.py` and then sets native categorical columns to pandas `category` dtype. `y_train` is converted via `.to_numpy()`.
 
+### 10.6 Self-Training (pseudo-labeling)
+
+After the final model is trained, high-confidence test predictions are used to augment the training data, adapting the model to the test distribution.
+
+**Logic:**
+1. Score test data with the current model.
+2. Select high-confidence predictions: P(churn) >= 0.95 → pseudo-label 1, P(churn) <= 0.05 → pseudo-label 0.
+3. Concatenate pseudo-labeled test rows with original training data.
+4. Retrain the model on the augmented dataset.
+5. Single iteration only (`_ST_MAX_ITERS=1`) to avoid confirmation bias.
+
+**Safeguards:**
+- Minimum 10 confident samples required, otherwise self-training is skipped.
+- Only extreme confidence thresholds (95%/5%) are used — moderate-confidence predictions would introduce noise.
+- Single iteration prevents the model from reinforcing its own mistakes.
+
+**Rationale:** The test distribution may differ from training in ways that sample weighting can't fix. By incorporating confidently-predicted test rows, the model's decision boundaries shift toward the test distribution. This is particularly helpful when the test population has a different class balance or feature composition.
+
 ---
 
-## 10. Stage 7: Evaluation & Output (model.py + main.py)
+## 11. Stage 7: Evaluation & Output (model.py + main.py)
 
-### 10.1 Evaluation and Saving
+### 11.1 Evaluation and Saving
 
 #### `evaluate_and_save(model, X_train, y_train, X_test, customer_ids, test, feature_types, tag) -> metrics`
 
@@ -724,7 +718,7 @@ Uses the fixed hyperparameters. The only knob is `sample_weight`, which is how a
 4. Saves `prediction_{tag}.csv` via `pl.DataFrame.write_csv()` with columns `[CustomerID, probability_score]`.
 5. Saves `model_{tag}.joblib` via `joblib.dump()`.
 
-### 10.2 Final Output
+### 11.2 Final Output
 
 The mitigated model's outputs are copied to the final filenames:
 ```
@@ -732,7 +726,7 @@ prediction_mitigated.csv -> prediction.csv
 model_mitigated.joblib -> model.joblib
 ```
 
-### 10.3 Console Summary Tables
+### 11.3 Console Summary Tables
 
 Four tables are printed after all computation completes:
 
@@ -743,7 +737,7 @@ Four tables are printed after all computation completes:
 
 ---
 
-## 11. Shared Utilities (utils.py)
+## 12. Shared Utilities (utils.py)
 
 ### `safe_n_splits(n_samples, desired, min_per_fold) -> int`
 Returns a safe number of CV folds: `max(2, min(desired, n_samples // min_per_fold))`. Prevents errors when datasets are too small for the desired fold count.
@@ -765,7 +759,7 @@ Context manager that records elapsed wall-clock time via `time.perf_counter()`. 
 
 ---
 
-## 12. Polars Compatibility Layer (polars_compat.py)
+## 13. Polars Compatibility Layer (polars_compat.py)
 
 Centralizes all polars ↔ pandas/numpy boundary conversions. External libraries (LightGBM, scikit-learn, scipy) do not accept polars objects directly.
 
@@ -785,7 +779,7 @@ Centralizes all polars ↔ pandas/numpy boundary conversions. External libraries
 
 ---
 
-## 13. Data Flow Diagram
+## 14. Data Flow Diagram
 
 ```
                         train.csv                    test.csv
@@ -793,14 +787,12 @@ Centralizes all polars ↔ pandas/numpy boundary conversions. External libraries
                      pl.read_csv()                 pl.read_csv()
                      (infer_schema_length=0)       (all Utf8)
                            |                            |
-                     _downcast_dataframe()         _downcast_dataframe()
-                     (no-op: all Utf8)             (no-op: all Utf8)
-                           |                            |
                      align_train_test_columns()----------+
                            |                            |
                      detect_feature_types(train, test_df=test)
                            |
                      Numeric coercion (main.py: Utf8 -> Float64)
+                     downcast_dataframe() (Float64 -> Float32, etc.)
                            |
                       feature_types dict ─────────────────────────────────────┐
                            |                                                  |
@@ -812,78 +804,74 @@ Centralizes all polars ↔ pandas/numpy boundary conversions. External libraries
    run_drift_analysis()    detect_intra_training_drift()                      |
               |                         |                                     |
          drift_df                  month_rank                                 |
-              |                         |                                     |
-              v                         |                                     |
-   apply_all_mitigations() ─────────────┤                                     |
-    ├─ normalize_data_quality()         |                                     |
-    ├─ re-check drift                   |                                     |
-    ├─ progressive high-drift           |                                     |
-    ├─ progressive moderate-drift       |                                     |
-    └─ detect_multivariate_shift()      |                                     |
-              |                         |                                     |
-    train_m, test_m, drop_cols,         |                                     |
-    shift_info (train_oof_proba)        |                                     |
-              |                         |                                     |
-              v                         |                                     |
-    Drop validation (temporal holdout)  |                                     |
-    ├─ hold out last ~20% months as val |                                     |
-    ├─ baseline: model with all drops   |                                     |
-    ├─ per-drop: add-back test          |                                     |
-    └─ rescue if delta > 0.005          |                                     |
-              |                         |                                     |
-         drop_cols (validated)          |                                     |
-              |                         |                                     |
-              v                         |                                     |
-    engineer_features() ────────────────┤                                     |
-    ├─ missing indicators               |                                     |
-    ├─ frequency encoding               |                                     |
-    ├─ ratio features                   |                                     |
-    ├─ aggregation features             |                                     |
-    └─ near-duplicate removal           |                                     |
-              |                         |                                     |
-              v                         |                                     |
-    post-engineering drift check        |                                     |
-              |                         |                                     |
-              v                         |                                     |
-  ┌─── prepare_features() ──────────────┤──────────────────────────────── uses |
-  |   (target encoding, temporal parse, |                                     |
-  |    categorical encoding, dtype fix) |                                     |
-  |           |                         |                                     |
-  |    X_train_m, y_train_m,            |                                     |
-  |    X_test_m, customer_ids           |                                     |
-  |    (all polars DataFrames/Series)   |                                     |
-  |           |                         |                                     |
-  |    Feature selection                |                                     |
-  |    ├─ zero-importance pruning       |                                     |
-  |    └─ top-feature interactions      |                                     |
-  |           |                         |                                     |
-  |    Weight tournament ───────────────┘
-  |    ├─ Uniform baseline         train_oof_proba + month_rank
-  |    ├─ Blend (Nelder-Mead)      -> domain_weights + recency_weights
-  |    └─ Geometric (Nelder-Mead)  -> blended/geometric weights
-  |           |
-  |    Pre-convert to pandas ONCE for tournament
-  |    (_to_pandas_with_categoricals)
-  |           |
-  |    best_weights (winner)
-  |           |
-  |    train_model(X_train_m, y_train_m, sample_weight=best_weights)
-  |    (converts polars→pandas for LightGBM internally)
-  |           |
-  |    evaluate_and_save()
-  |           |
-  |    prediction_mitigated.csv -> prediction.csv
-  |    model_mitigated.joblib   -> model.joblib
-  |
-  └─── Baseline path (separate):
-       prepare_features(train, test)  # unmitigated
-       train_model(X_train_b, y_train_b)  # uniform weights
-       evaluate_and_save(tag="baseline")
+              |                                                               |
+              v                                                               |
+   apply_all_mitigations()                                                    |
+    ├─ normalize_data_quality()                                               |
+    ├─ re-check drift (modified cols only)                                    |
+    ├─ progressive high-drift mitigation                                      |
+    └─ progressive moderate-drift mitigation                                  |
+              |                                                               |
+    train_m, test_m, drop_cols                                                |
+              |                                                               |
+              v                                                               |
+    Feature Strategy Tournament                                               |
+    ├─ temporal holdout (last ~20% months)                                    |
+    ├─ per-feature: {current, raw, drop}                                      |
+    └─ 3-seed averaging, +0.005 threshold                                     |
+              |                                                               |
+         drop_cols (updated)                                                  |
+              |                                                               |
+              v                                                               |
+    engineer_features() ──────────────────────────────────────────────── uses  |
+    ├─ missing indicators                                                     |
+    ├─ frequency encoding                                                     |
+    ├─ ratio features                                                         |
+    ├─ aggregation features                                                   |
+    └─ near-duplicate removal                                                 |
+              |                                                               |
+    post-engineering drift check (drop high-drift engineered features)        |
+              |                                                               |
+              v                                                               |
+  ┌─── prepare_features() ───────────────────────────────────────────── uses  |
+  |   (target encoding, temporal parse,                                       |
+  |    categorical encoding, dtype fix)                                       |
+  |           |                                                               |
+  |    X_train_m, y_train_m, X_test_m                                         |
+  |           |                                                               |
+  |    Feature selection                                                      |
+  |    ├─ zero-importance pruning                                             |
+  |    └─ top-8 feature interactions                                          |
+  |           |                                                               |
+  |    FE validation gate                                                     |
+  |    ├─ compare with-FE vs without-FE on holdout                            |
+  |    └─ swap to no-FE if it wins                                            |
+  |           |                                                               |
+  |    Iterative mitigation (importance-aware)                                |
+  |    ├─ train model -> get importances                                      |
+  |    ├─ find high-importance + still-drifted features                       |
+  |    └─ quantile match or rank transform                                    |
+  |           |                                                               |
+  |    Train final model (uniform weights)                                    |
+  |           |                                                               |
+  |    Self-training (pseudo-labeling)                                        |
+  |    ├─ score test, select P>=0.95 or P<=0.05                               |
+  |    └─ retrain on augmented data (1 iteration)                             |
+  |           |                                                               |
+  |    evaluate_and_save()                                                    |
+  |           |                                                               |
+  |    prediction_mitigated.csv -> prediction.csv                             |
+  |    model_mitigated.joblib   -> model.joblib                               |
+  |                                                                           |
+  └─── Baseline path (separate):                                             |
+       prepare_features(train, test)  # unmitigated                           |
+       train_model(X_train_b, y_train_b)  # uniform weights                  |
+       evaluate_and_save(tag="baseline")                                      |
 ```
 
 ---
 
-## 14. Key Design Principles
+## 15. Key Design Principles
 
 ### No Hardcoded Column Names
 
@@ -897,7 +885,7 @@ Every column reference flows through `feature_types`. The three default names (`
 
 ### No Row Filtering
 
-Mitigation and feature engineering only modify or add/drop **columns**, never rows. This preserves index alignment: `month_rank`, `train_oof_proba`, `best_weights`, and `X_train_m` all have exactly `len(train)` rows throughout.
+Mitigation and feature engineering only modify or add/drop **columns**, never rows. This preserves index alignment: `month_rank` and `X_train_m` all have exactly `len(train)` rows throughout. (Exception: self-training appends pseudo-labeled test rows to `X_train_m` for the final retrain.)
 
 ### Subsample-Then-Apply
 
@@ -909,10 +897,9 @@ Strategies are only applied if they demonstrably reduce drift (measured by re-ru
 
 ### Fixed Model, Variable Data
 
-Since the LightGBM hyperparameters are frozen, all pipeline value comes from three levers:
-1. **What the model sees** (feature engineering + feature selection)
+Since the LightGBM hyperparameters are frozen, all pipeline value comes from two levers:
+1. **What the model sees** (feature engineering + feature selection + self-training augmentation)
 2. **How clean the data is** (mitigation strategies reducing train/test distribution gaps)
-3. **What the model emphasizes** (sample weights from domain classifier + recency)
 
 ### Polars-First with Pandas at Boundaries
 

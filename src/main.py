@@ -11,10 +11,10 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import polars as pl
 from polars_compat import to_numeric_coerce, is_numeric_col, to_pandas_for_lgbm
 from profiler import load_data, detect_feature_types, profile_data, align_train_test_columns, downcast_dataframe
-from drift_detector import run_drift_analysis, detect_intra_training_drift
+from drift_detector import run_drift_analysis
 from lightgbm import LGBMClassifier
 from model import prepare_features, train_model, evaluate_and_save, print_model_performance_summary
-from mitigation import apply_all_mitigations, compute_domain_weights, compute_recency_weights
+from mitigation import apply_all_mitigations
 from feature_engineer import engineer_features
 from utils import Timer, logger
 
@@ -146,36 +146,6 @@ def print_drift_mitigation_summary(
     print(h_line("╚", "╩", "╝"))
 
 
-def print_multivariate_shift_summary(shift_info: dict, weight_status: str = "Uniform (1.0)") -> None:
-    """Print multivariate covariate shift detection results."""
-    import numpy as np
-    CW = (24, 48)
-    W = sum(CW) + len(CW) - 1
-    title = "MULTIVARIATE SHIFT DETECTION"
-
-    def h(l, m, r):
-        return f"{l}{'═'*CW[0]}{m}{'═'*CW[1]}{r}"
-
-    def col_row(c1, c2):
-        return f"║ {c1:<{CW[0]-2}} ║ {c2:<{CW[1]-2}} ║"
-
-    print()
-    print(f"╔{'═' * W}╗")
-    print(f"║{title:^{W}}║")
-    print(h("╠", "╦", "╣"))
-    print(col_row("Metric", "Value"))
-    print(h("╠", "╬", "╣"))
-    print(col_row("Domain Clf AUC", f"{shift_info['auc']:.4f}"))
-    fold_aucs = shift_info.get("fold_aucs", [])
-    if fold_aucs:
-        fold_std = np.std(fold_aucs)
-        print(col_row("Fold AUC Std", f"{fold_std:.4f}"))
-    status = "Yes" if shift_info["shift_detected"] else "No"
-    print(col_row("Shift Detected", status))
-    print(col_row("Sample Weights", weight_status))
-    print(h("╚", "╩", "╝"))
-
-
 def print_runtime_summary(
     ingest_time: float,
     drift_time: float,
@@ -257,6 +227,8 @@ def main():
     parser = argparse.ArgumentParser(description="NAISC Singtel 2026 - Drift Detection & Churn Prediction")
     parser.add_argument("--train_data_filepath", required=True, help="Path to training CSV")
     parser.add_argument("--test_data_filepath", required=True, help="Path to test CSV")
+    parser.add_argument("--drop_only", action="store_true",
+                        help="Skip all transforms: drop every high/moderate drift feature instead")
     args = parser.parse_args()
 
     # --- Splash banner ---
@@ -361,93 +333,132 @@ def main():
         # Use decision sample for drift analysis — statistical tests converge at 100K
         test_drift = test.sample(n=min(_DECISION_SAMPLE_SIZE, len(test)), seed=42) if len(test) > _DECISION_SAMPLE_SIZE else test
         drift_df = run_drift_analysis(train_decision, test_drift, feature_types)
-        # Keep full train for month_rank (used for recency weighting across all rows)
-        intra_drift_df, month_rank = detect_intra_training_drift(train, feature_types)
 
     # --- Stage 3: Drift Mitigation ---
     with Timer("Drift mitigation") as mitigation_timer:
-        train_m, test_m, drop_cols, mitigation_log, norm_log, shift_info = apply_all_mitigations(
-            train, test, drift_df, feature_types
+        train_m, test_m, drop_cols, mitigation_log, norm_log = apply_all_mitigations(
+            train, test, drift_df, feature_types, drop_only=args.drop_only
         )
 
-    # --- Stage 3b: Validate drop decisions via internal CV ---
-    if drop_cols:
+    # --- Stage 3b: Feature Strategy Tournament ---
+    # For each drifted feature, evaluate {current, raw, drop} by AU-PRC
+    # on temporal holdout with 3-seed averaging. Replaces drop validation
+    # and weight tournament — spend compute where it matters most.
+    _STRATEGY_SEEDS = [42, 123, 456]
+
+    # Collect only transformed features (skip normalization-only and drops).
+    # Drops are trusted — if all 6 progressive strategies failed on a high-drift
+    # feature, internal validation can't reliably second-guess that decision.
+    _skip = {"Lowercased, hyphens removed", "Abbreviations standardized, lowercased, hyphens removed",
+             "Abbreviations standardized", "Frequency encoding", "Drop Feature"}
+    _tourney_features = [] if args.drop_only else [
+        e for e in mitigation_log
+        if e["strategy_applied"] not in _skip
+    ]
+
+    if _tourney_features:
         from sklearn.metrics import average_precision_score
         from model import _encode_target
         import numpy as np
 
-        logger.info(f"Drop validation: checking {len(drop_cols)} candidates via temporal holdout")
+        logger.info(f"Feature strategy tournament: {len(_tourney_features)} features to evaluate")
 
-        # Use latest month(s) as val to simulate train→test temporal shift
-        _DROP_VAL_SAMPLE = min(50_000, len(train_m))
-        _dv_data = train_m.sample(n=_DROP_VAL_SAMPLE, seed=42) if len(train_m) > _DROP_VAL_SAMPLE else train_m
+        # Subsample + temporal holdout setup
+        _FST_SAMPLE = min(50_000, len(train_m))
+        if len(train_m) > _FST_SAMPLE:
+            # Add row index before sampling so we can match rows in original data
+            _fst_indexed = train_m.with_row_index("__fst_idx__").sample(n=_FST_SAMPLE, seed=42)
+            _fst_row_idx = _fst_indexed["__fst_idx__"].to_list()
+            _fst_mitigated = _fst_indexed.drop("__fst_idx__")
+            _fst_original = train[_fst_row_idx]
+        else:
+            _fst_mitigated = train_m
+            _fst_original = train
 
-        _dv_months = None
-        _dv_temporal_col = None
+        # Parse temporal column for holdout
+        _fst_months = None
         for tc in feature_types.get("temporal", []):
-            if tc in _dv_data.columns:
-                _dv_months = _parse_month_labels(_dv_data[tc])
-                if _dv_months is not None:
-                    _dv_temporal_col = tc
+            if tc in _fst_mitigated.columns:
+                _fst_months = _parse_month_labels(_fst_mitigated[tc])
+                if _fst_months is not None:
                     break
 
-        if _dv_months is not None:
-            if isinstance(_dv_months, pl.Series):
-                _dv_months_np = _dv_months.to_numpy(allow_copy=True)
-            else:
-                _dv_months_np = _dv_months
-            # Hold out the last ~20% of months as val (mimics train→test shift)
-            unique_months = sorted(np.unique(_dv_months_np))
+        if _fst_months is not None:
+            _fst_months_np = _fst_months.to_numpy(allow_copy=True) if isinstance(_fst_months, pl.Series) else _fst_months
+            unique_months = sorted(np.unique(_fst_months_np))
             n_val_months = max(1, len(unique_months) // 5)
             val_months = set(unique_months[-n_val_months:])
-            _dv_val_mask = np.isin(_dv_months_np, list(val_months))
+            _fst_val_mask = np.isin(_fst_months_np, list(val_months))
             logger.info(f"  Temporal holdout: val months={sorted(val_months)}")
         else:
-            # Fallback: random 20% split
-            _dv_rng = np.random.RandomState(99)
-            _dv_n = len(_dv_data)
-            _dv_val_mask = np.zeros(_dv_n, dtype=bool)
-            _dv_val_mask[_dv_rng.choice(_dv_n, size=max(1, _dv_n // 5), replace=False)] = True
+            _fst_rng = np.random.RandomState(99)
+            _fst_n = len(_fst_mitigated)
+            _fst_val_mask = np.zeros(_fst_n, dtype=bool)
+            _fst_val_mask[_fst_rng.choice(_fst_n, size=max(1, _fst_n // 5), replace=False)] = True
 
-        _dv_train_split = _dv_data.filter(~pl.Series(values=_dv_val_mask))
-        _dv_val_split = _dv_data.filter(pl.Series(values=_dv_val_mask))
+        _fst_train_m = _fst_mitigated.filter(~pl.Series(values=_fst_val_mask))
+        _fst_val_m = _fst_mitigated.filter(pl.Series(values=_fst_val_mask))
+        _fst_train_raw = _fst_original.filter(~pl.Series(values=_fst_val_mask))
+        _fst_val_raw = _fst_original.filter(pl.Series(values=_fst_val_mask))
 
         target_col = feature_types["target"][0]
-        _dv_y_val = _encode_target(_dv_val_split[target_col]).to_numpy()
+        _fst_y_val = _encode_target(_fst_val_m[target_col]).to_numpy()
 
-        def _dv_score(extra_drops):
-            X_tr, y_tr, X_va, _ = prepare_features(
-                _dv_train_split, _dv_val_split, feature_types, extra_drop_cols=extra_drops
-            )
-            m = LGBMClassifier(
-                verbosity=-1, objective="binary", is_unbalance=True,
-                random_state=42, importance_type="gain",
-            )
-            X_tr_pd = X_tr.to_pandas() if hasattr(X_tr, 'to_pandas') else X_tr
-            X_va_pd = X_va.to_pandas() if hasattr(X_va, 'to_pandas') else X_va
-            m.fit(X_tr_pd, y_tr.to_numpy() if hasattr(y_tr, 'to_numpy') else y_tr)
-            return average_precision_score(_dv_y_val, m.predict_proba(X_va_pd)[:, 1])
+        def _fst_score(train_data, val_data, extra_drops, seeds=_STRATEGY_SEEDS):
+            """AU-PRC averaged over multiple seeds for stability."""
+            scores = []
+            for seed in seeds:
+                X_tr, y_tr, X_va, _ = prepare_features(
+                    train_data, val_data, feature_types, extra_drop_cols=extra_drops
+                )
+                m = LGBMClassifier(
+                    verbosity=-1, objective="binary", is_unbalance=True,
+                    random_state=seed, importance_type="gain",
+                )
+                X_tr_pd = X_tr.to_pandas() if hasattr(X_tr, 'to_pandas') else X_tr
+                X_va_pd = X_va.to_pandas() if hasattr(X_va, 'to_pandas') else X_va
+                m.fit(X_tr_pd, y_tr.to_numpy() if hasattr(y_tr, 'to_numpy') else y_tr)
+                scores.append(average_precision_score(_fst_y_val, m.predict_proba(X_va_pd)[:, 1]))
+            return np.mean(scores)
 
-        base_score = _dv_score(drop_cols)
-        logger.info(f"  All drops applied: val AU-PRC={base_score:.4f}")
+        # Evaluate each transformed feature: current transform vs raw vs drop
+        for entry in _tourney_features:
+            col = entry["column"]
+            strategy = entry["strategy_applied"]
 
-        validated_drops = []
-        for col in drop_cols:
-            keep_score = _dv_score([c for c in drop_cols if c != col])
-            delta = keep_score - base_score
-            if delta > 0.005:
-                logger.info(f"  {col}: rescued (add-back +{delta:.4f}, {keep_score:.4f} > {base_score:.4f})")
+            # --- Strategy: current (transform as-is) ---
+            current_score = _fst_score(_fst_train_m, _fst_val_m, drop_cols)
+
+            # --- Strategy: drop ---
+            drop_score = _fst_score(_fst_train_m, _fst_val_m, list(drop_cols) + [col])
+
+            # --- Strategy: raw (swap transformed column with original) ---
+            if col in _fst_train_raw.columns and col in _fst_val_raw.columns:
+                raw_train = _fst_train_m.with_columns(_fst_train_raw[col].alias(col))
+                raw_val = _fst_val_m.with_columns(_fst_val_raw[col].alias(col))
+                raw_score = _fst_score(raw_train, raw_val, drop_cols)
             else:
-                validated_drops.append(col)
-                logger.info(f"  {col}: confirmed drop (add-back {delta:+.4f})")
+                raw_score = -1.0
 
-        if len(validated_drops) != len(drop_cols):
-            removed = set(drop_cols) - set(validated_drops)
-            logger.info(f"Drop validation: rescued {len(removed)} features: {sorted(removed)}")
-            drop_cols = validated_drops
-            for entry in mitigation_log:
-                if entry["column"] in removed and entry["strategy_applied"] == "Drop Feature":
-                    entry["strategy_applied"] = "Kept (validated)"
+            # Pick winner (require 0.005 improvement over current to switch)
+            candidates = [("current", current_score), ("drop", drop_score), ("raw", raw_score)]
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            best_name, best_sc = candidates[0]
+
+            if best_name == "current" or best_sc <= current_score + 0.005:
+                logger.info(f"  {col}: keep {strategy} (current={current_score:.4f}, drop={drop_score:.4f}, raw={raw_score:.4f})")
+            elif best_name == "drop":
+                drop_cols.append(col)
+                entry["strategy_applied"] = "Drop Feature (tournament)"
+                logger.info(f"  {col}: SWITCH to drop (current={current_score:.4f}, drop={drop_score:.4f}, raw={raw_score:.4f})")
+            elif best_name == "raw":
+                if col in train.columns:
+                    train_m = train_m.with_columns(train[col].alias(col))
+                    test_m = test_m.with_columns(test[col].alias(col))
+                    entry["strategy_applied"] = "Reverted to raw (tournament)"
+                logger.info(f"  {col}: SWITCH to raw (current={current_score:.4f}, drop={drop_score:.4f}, raw={raw_score:.4f})")
+
+        logger.info(f"Feature strategy tournament complete. Final drops: {drop_cols}")
 
     # --- Stage 4: Feature Engineering ---
     # Save pre-FE mitigated data for later comparison (FE may not help)
@@ -546,182 +557,12 @@ def main():
         except Exception as e:
             logger.warning(f"Feature selection skipped: {e}")
 
-        # --- Sample weight tournament: two-stage search ---
-        train_oof_proba = shift_info.get("train_oof_proba")
-        has_domain = train_oof_proba is not None and shift_info.get("shift_detected", False)
-        has_recency = month_rank is not None
-
-        # Reuse decision sample for weight tournament (larger than drift sample for stability)
-        _TOURNEY_SAMPLE_SIZE = 300_000
-        _tourney_idx = None
-
-        if len(X_train_m) > _TOURNEY_SAMPLE_SIZE:
-            _tourney_idx = stratified_subsample_idx(
-                len(X_train_m), _TOURNEY_SAMPLE_SIZE,
-                month_values=_month_vals, seed=42,
-            )
-            logger.info(f"Weight tournament: subsampling {_TOURNEY_SAMPLE_SIZE:,}/{len(X_train_m):,} train rows")
-
-        # Pre-convert tournament subsets to pandas/numpy ONCE (avoid repeated polars→pandas)
+        # --- FE validation: compare with-FE vs without-FE ---
         from model import _to_pandas_with_categoricals, _native_cat_cols
-        if _tourney_idx is not None:
-            _X_tourney_all_pd = _to_pandas_with_categoricals(X_train_m[_tourney_idx], _native_cat_cols)
-            _y_tourney_all_np = y_train_m.gather(_tourney_idx.tolist()).to_numpy()
-        else:
-            _X_tourney_all_pd = _to_pandas_with_categoricals(X_train_m, _native_cat_cols)
-            _y_tourney_all_np = y_train_m.to_numpy()
-
-        # Month-stratified train/val split for tournament evaluation (80/20)
-        _val_frac = 0.2
-        _n_all = len(_y_tourney_all_np)
-        _rng = np.random.RandomState(42)
-
-        _tourney_months = _month_vals[_tourney_idx.tolist()] if _tourney_idx is not None else _month_vals
-        if isinstance(_tourney_months, pl.Series):
-            _tourney_months = _tourney_months.to_numpy(allow_copy=True)
-
-        _val_mask = np.zeros(_n_all, dtype=bool)
-        for g in np.unique(_tourney_months):
-            g_idx = np.where(_tourney_months == g)[0]
-            n_val_g = max(1, int(len(g_idx) * _val_frac))
-            chosen = _rng.choice(g_idx, size=n_val_g, replace=False)
-            _val_mask[chosen] = True
-        _val_idx = np.where(_val_mask)[0]
-        _tr_idx = np.where(~_val_mask)[0]
-
-        _X_tourney_pd = _X_tourney_all_pd.iloc[_tr_idx]
-        _y_tourney_np = _y_tourney_all_np[_tr_idx]
-        _X_val_pd = _X_tourney_all_pd.iloc[_val_idx]
-        _y_val_np = _y_tourney_all_np[_val_idx]
-        logger.info(f"Weight tournament: train={len(_tr_idx)}, val={len(_val_idx)} (month-stratified 80/20 split)")
-
-        def _eval_candidate(label, weights):
-            """Train with weights on train split, evaluate on val split."""
-            w_sub = weights[_tourney_idx[_tr_idx]] if (weights is not None and _tourney_idx is not None) else (weights[_tr_idx] if weights is not None else None)
-            m = LGBMClassifier(
-                verbosity=-1, objective="binary", is_unbalance=True,
-                random_state=42, importance_type="gain",
-            )
-            m.fit(_X_tourney_pd, _y_tourney_np, sample_weight=w_sub)
-            val_proba = m.predict_proba(_X_val_pd)[:, 1]
-            val_sc = average_precision_score(_y_val_np, val_proba)
-            logger.info(f"  {label} -> val={val_sc:.4f}")
-            return label, weights, val_sc
-
-        def _build_blend(alpha, power, decay):
-            """Build additive blend: alpha * domain^power + (1-alpha) * recency(decay)."""
-            dw = compute_domain_weights(train_oof_proba, power=power)
-            rw = compute_recency_weights(month_rank, decay=decay)
-            if dw is None or rw is None:
-                return None
-            blended = alpha * dw + (1 - alpha) * rw
-            return blended / blended.mean()
-
-        def _build_geometric(alpha, power, decay):
-            """Build geometric mean: domain^(alpha*power) * recency(decay)^(1-alpha)."""
-            dw = compute_domain_weights(train_oof_proba, power=power)
-            rw = compute_recency_weights(month_rank, decay=decay)
-            if dw is None or rw is None:
-                return None
-            combined = dw ** alpha * rw ** (1 - alpha)
-            return combined / combined.mean()
-
-        # ── Weight tournament via Nelder-Mead optimization ──
-        from scipy.optimize import minimize
-
-        all_results = []  # collect all evaluated candidates
-        _eval_cache = {}  # cache rounded params → result to skip duplicate trains
-
-        # 1. Uniform baseline
-        res_uniform = _eval_candidate("Uniform", None)
-        all_results.append(res_uniform)
-
-        best_label, best_weights, best_score = res_uniform
-
-        if has_domain and has_recency:
-            # 2. Domain-only and recency-only candidates
-            for power in [0.3, 0.5, 0.7, 1.0]:
-                w = compute_domain_weights(train_oof_proba, power=power)
-                if w is not None:
-                    all_results.append(_eval_candidate(f"Domain(p={power})", w))
-            for decay in [0.10, 0.20, 0.40]:
-                rw = compute_recency_weights(month_rank, decay=decay)
-                if rw is not None:
-                    all_results.append(_eval_candidate(f"Recency(d={decay})", rw))
-
-            def _make_cached_objective(builder, prefix):
-                """Create a cached Nelder-Mead objective for a weight family."""
-                evals = []
-
-                def objective(params):
-                    a, p, d = params
-                    if not (0.0 <= a <= 1.0 and 0.1 <= p <= 2.0 and 0.01 <= d <= 0.80):
-                        return 0.0  # bad score for out-of-bounds
-                    # Round to 4 decimals — use rounded values for BOTH cache and weights
-                    a, p, d = round(a, 4), round(p, 4), round(d, 4)
-                    key = (prefix, a, p, d)
-                    if key in _eval_cache:
-                        return _eval_cache[key]
-                    w = builder(a, p, d)
-                    if w is None:
-                        return 0.0
-                    lbl = f"{prefix}(a={a:.4f},p={p:.4f},d={d:.4f})"
-                    res = _eval_candidate(lbl, w)
-                    evals.append(res)
-                    score = -res[2]  # minimize negative val AU-PRC
-                    _eval_cache[key] = score
-                    return score
-
-                return objective, evals
-
-            # 3. Optimize additive blend
-            blend_obj, blend_evals = _make_cached_objective(_build_blend, "Blend")
-            logger.info("Weight tournament: optimizing Blend (Nelder-Mead)")
-            minimize(blend_obj, x0=[0.5, 0.7, 0.15], method='Nelder-Mead',
-                     options={'maxiter': 8, 'maxfev': 12, 'xatol': 0.02, 'fatol': 0.0005})
-            all_results.extend(blend_evals)
-
-            # 4. Optimize geometric mean
-            geom_obj, geom_evals = _make_cached_objective(_build_geometric, "Geometric")
-            logger.info("Weight tournament: optimizing Geometric (Nelder-Mead)")
-            minimize(geom_obj, x0=[0.5, 0.7, 0.15], method='Nelder-Mead',
-                     options={'maxiter': 8, 'maxfev': 12, 'xatol': 0.02, 'fatol': 0.0005})
-            all_results.extend(geom_evals)
-
-        elif has_domain:
-            # Only domain weights available — optimize power only
-            for power in [0.3, 0.5, 0.7, 1.0]:
-                w = compute_domain_weights(train_oof_proba, power=power)
-                if w is not None:
-                    all_results.append(_eval_candidate(f"Domain(p={power})", w))
-
-        elif has_recency:
-            # Only recency weights available — optimize decay only
-            for decay in [0.10, 0.20, 0.40]:
-                rw = compute_recency_weights(month_rank, decay=decay)
-                if rw is not None:
-                    all_results.append(_eval_candidate(f"Recency(d={decay})", rw))
-
-        # Pick overall winner
-        all_results.sort(key=lambda x: x[2], reverse=True)
-        best_label, best_weights, best_score = all_results[0]
-
-        # Log full leaderboard
-        logger.info(f"Weight tournament: {len(all_results)} total evaluations")
-        logger.info("── Full leaderboard (top 20) ──")
-        for i, (lbl, _, val_sc) in enumerate(all_results[:20]):
-            logger.info(f"  #{i+1:2d}  {val_sc:.4f} val | {lbl}")
-
-        logger.info(f"Final winner: {best_label} (val AU-PRC={best_score:.4f})")
-        weight_status = best_label
-
-        # --- FE validation: compare with-FE vs without-FE on val split ---
-        # If FE hurts validation score, fall back to mitigation-only features.
         try:
             X_train_nofe, y_train_nofe, X_test_nofe, _ = prepare_features(
                 train_m_no_fe, test_m_no_fe, feature_types, extra_drop_cols=drop_cols_no_fe
             )
-            # Apply same zero-importance pruning + interactions on no-FE set
             _nofe_fs = train_model(X_train_nofe, y_train_nofe)
             _nofe_imps = dict(zip(X_train_nofe.columns, _nofe_fs.feature_importances_))
             _nofe_zero = [c for c, imp in _nofe_imps.items() if imp == 0]
@@ -742,48 +583,145 @@ def main():
                 X_train_nofe = X_train_nofe.with_columns(_nofe_int_tr)
                 X_test_nofe = X_test_nofe.with_columns(_nofe_int_te)
 
-            # Evaluate no-FE on the same val split with winning weights
+            # Month-stratified 80/20 split for FE validation
+            _val_frac = 0.2
             _nofe_pd = _to_pandas_with_categoricals(X_train_nofe, _native_cat_cols)
+            _fe_pd = _to_pandas_with_categoricals(X_train_m, _native_cat_cols)
             _nofe_y = y_train_nofe.to_numpy()
-            # Rebuild val split for no-FE data (same seed → same split)
+            _fe_y = y_train_m.to_numpy()
+
+            _fe_rng = np.random.RandomState(42)
+            _fe_months = _month_vals
+            if isinstance(_fe_months, pl.Series):
+                _fe_months = _fe_months.to_numpy(allow_copy=True)
+
+            # Build val mask for FE data
+            _fe_val_mask = np.zeros(len(_fe_y), dtype=bool)
+            if _fe_months is not None:
+                for g in np.unique(_fe_months):
+                    g_idx = np.where(_fe_months == g)[0]
+                    n_val_g = max(1, int(len(g_idx) * _val_frac))
+                    chosen = _fe_rng.choice(g_idx, size=n_val_g, replace=False)
+                    _fe_val_mask[chosen] = True
+            _fe_tr = np.where(~_fe_val_mask)[0]
+            _fe_va = np.where(_fe_val_mask)[0]
+
+            _fe_mdl = LGBMClassifier(verbosity=-1, objective="binary", is_unbalance=True, random_state=42, importance_type="gain")
+            _fe_mdl.fit(_fe_pd.iloc[_fe_tr], _fe_y[_fe_tr])
+            _fe_sc = average_precision_score(_fe_y[_fe_va], _fe_mdl.predict_proba(_fe_pd.iloc[_fe_va])[:, 1])
+
+            # Build val mask for no-FE data (same seed)
             _nofe_rng = np.random.RandomState(42)
-            _nofe_n = len(_nofe_y)
-            _nofe_val_mask = np.zeros(_nofe_n, dtype=bool)
-            _nofe_months = _month_vals
-            if isinstance(_nofe_months, pl.Series):
-                _nofe_months = _nofe_months.to_numpy(allow_copy=True)
-            if _nofe_months is not None:
-                for g in np.unique(_nofe_months):
-                    g_idx = np.where(_nofe_months == g)[0]
+            _nofe_val_mask = np.zeros(len(_nofe_y), dtype=bool)
+            if _fe_months is not None:
+                for g in np.unique(_fe_months):
+                    g_idx = np.where(_fe_months == g)[0]
                     n_val_g = max(1, int(len(g_idx) * _val_frac))
                     chosen = _nofe_rng.choice(g_idx, size=n_val_g, replace=False)
                     _nofe_val_mask[chosen] = True
-            _nofe_tr_idx = np.where(~_nofe_val_mask)[0]
-            _nofe_va_idx = np.where(_nofe_val_mask)[0]
+            _nofe_tr = np.where(~_nofe_val_mask)[0]
+            _nofe_va = np.where(_nofe_val_mask)[0]
 
-            _nofe_w = best_weights[_nofe_tr_idx] if best_weights is not None else None
-            _nofe_mdl = LGBMClassifier(
-                verbosity=-1, objective="binary", is_unbalance=True,
-                random_state=42, importance_type="gain",
-            )
-            _nofe_mdl.fit(_nofe_pd.iloc[_nofe_tr_idx], _nofe_y[_nofe_tr_idx], sample_weight=_nofe_w)
-            _nofe_val_sc = average_precision_score(
-                _nofe_y[_nofe_va_idx],
-                _nofe_mdl.predict_proba(_nofe_pd.iloc[_nofe_va_idx])[:, 1],
-            )
+            _nofe_mdl = LGBMClassifier(verbosity=-1, objective="binary", is_unbalance=True, random_state=42, importance_type="gain")
+            _nofe_mdl.fit(_nofe_pd.iloc[_nofe_tr], _nofe_y[_nofe_tr])
+            _nofe_sc = average_precision_score(_nofe_y[_nofe_va], _nofe_mdl.predict_proba(_nofe_pd.iloc[_nofe_va])[:, 1])
 
-            logger.info(f"FE validation: with_FE={best_score:.4f}, without_FE={_nofe_val_sc:.4f}")
-            if _nofe_val_sc > best_score:
-                logger.info(f"FE validation: dropping FE features (without_FE wins by {_nofe_val_sc - best_score:.4f})")
+            logger.info(f"FE validation: with_FE={_fe_sc:.4f}, without_FE={_nofe_sc:.4f}")
+            if _nofe_sc > _fe_sc:
+                logger.info(f"FE validation: dropping FE features (without_FE wins by {_nofe_sc - _fe_sc:.4f})")
                 X_train_m, y_train_m, X_test_m = X_train_nofe, y_train_nofe, X_test_nofe
                 test_m = test_m_no_fe
             else:
-                logger.info(f"FE validation: keeping FE features (with_FE wins by {best_score - _nofe_val_sc:.4f})")
+                logger.info(f"FE validation: keeping FE features (with_FE wins by {_fe_sc - _nofe_sc:.4f})")
         except Exception as e:
             logger.warning(f"FE validation skipped: {e}")
 
-        # Train final model on full data with winning weights
-        lgbm_m = train_model(X_train_m, y_train_m, sample_weight=best_weights)
+        # --- Stage 5a: Iterative Mitigation (importance-aware) ---
+        # Train a quick model to get importances, then re-mitigate features
+        # that are both high-importance AND still have residual drift.
+        # This focuses compute on what actually affects predictions.
+        from drift_detector import detect_numerical_drift
+        from mitigation import rank_transform, quantile_match
+        try:
+            _iter_model = train_model(X_train_m, y_train_m)
+            _iter_imps = dict(zip(X_train_m.columns, _iter_model.feature_importances_))
+            _nonzero_imps = [v for v in _iter_imps.values() if v > 0]
+            _imp_threshold = np.percentile(_nonzero_imps, 50) if _nonzero_imps else 0
+
+            # Check top important numeric features for residual drift
+            _iter_sorted = sorted(_iter_imps.items(), key=lambda x: x[1], reverse=True)
+            _iter_count = 0
+            for col, imp in _iter_sorted:
+                if imp < _imp_threshold:
+                    break
+                if col not in X_train_m.columns or col not in X_test_m.columns:
+                    continue
+                if not is_numeric_col(X_train_m[col]):
+                    continue
+                drift = detect_numerical_drift(X_train_m[col], X_test_m[col])
+                if drift["severity"] in ("high", "moderate"):
+                    # Try quantile match first (preserves scale), fall back to rank transform
+                    tr_qm, te_qm = quantile_match(X_train_m[col], X_test_m[col])
+                    qm_drift = detect_numerical_drift(tr_qm, te_qm)
+                    if qm_drift["severity"] == "low":
+                        X_train_m = X_train_m.with_columns(tr_qm.alias(col))
+                        X_test_m = X_test_m.with_columns(te_qm.alias(col))
+                        logger.info(f"  Iterative mitigation: {col} (imp={imp:.0f}, {drift['severity']}) → quantile match → low")
+                    else:
+                        tr_rk, te_rk = rank_transform(X_train_m[col], X_test_m[col])
+                        X_train_m = X_train_m.with_columns(tr_rk.alias(col))
+                        X_test_m = X_test_m.with_columns(te_rk.alias(col))
+                        logger.info(f"  Iterative mitigation: {col} (imp={imp:.0f}, {drift['severity']}) → rank transform")
+                    _iter_count += 1
+            if _iter_count:
+                logger.info(f"Iterative mitigation: re-mitigated {_iter_count} high-importance drifted features")
+            else:
+                logger.info("Iterative mitigation: no high-importance features with residual drift")
+        except Exception as e:
+            logger.warning(f"Iterative mitigation skipped: {e}")
+
+        # Train final model on full data with uniform weights
+        lgbm_m = train_model(X_train_m, y_train_m)
+
+        # --- Stage 5b: Self-Training (pseudo-labeling) ---
+        # Use high-confidence test predictions to augment training data,
+        # adapting the model to the test distribution without needing test labels.
+        _ST_CONF_HIGH = 0.95   # P(churn) above this → pseudo-label 1
+        _ST_CONF_LOW  = 0.05   # P(churn) below this → pseudo-label 0
+        _ST_MAX_ITERS = 1      # single iteration to avoid confirmation bias
+
+        X_test_lgbm = to_pandas_for_lgbm(X_test_m) if isinstance(X_test_m, pl.DataFrame) else X_test_m
+        for col in _native_cat_cols:
+            if col in X_test_lgbm.columns:
+                X_test_lgbm[col] = X_test_lgbm[col].astype("category")
+
+        for st_iter in range(_ST_MAX_ITERS):
+            test_proba = lgbm_m.predict_proba(X_test_lgbm)[:, 1]
+
+            # Select high-confidence predictions
+            confident_mask = (test_proba >= _ST_CONF_HIGH) | (test_proba <= _ST_CONF_LOW)
+            n_pseudo = confident_mask.sum()
+
+            if n_pseudo < 10:
+                logger.info(f"Self-training iter {st_iter+1}: only {n_pseudo} confident samples, stopping")
+                break
+
+            pseudo_labels = (test_proba[confident_mask] >= 0.5).astype(np.int64)
+            pseudo_X = X_test_m.filter(pl.Series(values=confident_mask))
+
+            # Concatenate with original training data
+            X_aug = pl.concat([X_train_m, pseudo_X], how="vertical_relaxed")
+            y_aug = pl.concat([y_train_m, pl.Series(name=y_train_m.name, values=pseudo_labels)])
+
+            # Retrain on augmented data
+            lgbm_m = train_model(X_aug, y_aug)
+
+            pos_pseudo = pseudo_labels.sum()
+            logger.info(
+                f"Self-training iter {st_iter+1}: {n_pseudo} pseudo-labeled samples "
+                f"({pos_pseudo} pos, {n_pseudo - pos_pseudo} neg), "
+                f"augmented train size: {len(X_aug)}"
+            )
 
         mitigated_metrics = evaluate_and_save(
             lgbm_m, X_train_m, y_train_m, X_test_m, customer_ids, test_m, feature_types,
@@ -795,7 +733,6 @@ def main():
 
     # --- All tables printed after all stages complete ---
     print_drift_mitigation_summary(drift_df, drop_cols, mitigation_log, norm_log)
-    print_multivariate_shift_summary(shift_info, weight_status)
     model_results = [
         ("Baseline", baseline_metrics),
         ("Mitigated", mitigated_metrics),
