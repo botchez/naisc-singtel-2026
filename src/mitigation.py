@@ -234,18 +234,26 @@ def log_transform(
 def quantile_bin(
     train_col, test_col, n_bins: int = 10
 ):
-    """Discretize into quantile bins defined by train edges."""
+    """Discretize into quantile bins defined by train edges. Nulls stay null."""
     vals = to_numeric_coerce(train_col).drop_nulls().to_numpy().astype(float)
     # Adapt bins to sample size
     n_bins = min(n_bins, max(2, len(vals) // 20))
     percentiles = np.linspace(0, 100, n_bins + 1)[1:-1]
     edges = np.percentile(vals, percentiles)
     edges = np.unique(edges)
-    tr_arr = to_numeric_coerce(train_col).to_numpy()
-    te_arr = to_numeric_coerce(test_col).to_numpy()
+    tr_arr = to_numeric_coerce(train_col).to_numpy().astype(float)
+    te_arr = to_numeric_coerce(test_col).to_numpy().astype(float)
+    # np.digitize silently returns 0 for NaN (merging nulls with the smallest
+    # bin). Mask nulls, digitize the rest, then write NaN back.
+    tr_nan = np.isnan(tr_arr)
+    te_nan = np.isnan(te_arr)
+    tr_bins = np.digitize(np.where(tr_nan, 0.0, tr_arr), edges).astype(np.float64)
+    te_bins = np.digitize(np.where(te_nan, 0.0, te_arr), edges).astype(np.float64)
+    tr_bins[tr_nan] = np.nan
+    te_bins[te_nan] = np.nan
     return (
-        pl.Series(name=train_col.name, values=np.digitize(tr_arr, edges)),
-        pl.Series(name=test_col.name, values=np.digitize(te_arr, edges)),
+        pl.Series(name=train_col.name, values=tr_bins),
+        pl.Series(name=test_col.name, values=te_bins),
     )
 
 

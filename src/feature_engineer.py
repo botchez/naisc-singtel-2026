@@ -200,12 +200,28 @@ def engineer_features(
             fname = f"{col_a}_div_{col_b}"
             if fname in existing_cols:
                 continue
-            a_train = to_numeric_coerce(train[col_a]).fill_null(0)
-            b_train = to_numeric_coerce(train[col_b]).fill_null(0)
-            a_test = to_numeric_coerce(test[col_a]).fill_null(0)
-            b_test = to_numeric_coerce(test[col_b]).fill_null(0)
-            _ratio_train_parts[fname] = (a_train / (b_train + 1)).alias(fname)
-            _ratio_test_parts[fname] = (a_test / (b_test + 1)).alias(fname)
+            # Safe ratio: preserve nulls, mask zero/near-zero denominators.
+            # The old `a / (b + 1)` form blew up when b == -1 and made the
+            # ratio unit-dependent (the +1 offset dominates small-magnitude
+            # columns and disappears in large-magnitude ones).
+            a_tr = to_numeric_coerce(train[col_a]).cast(pl.Float64, strict=False).to_numpy().astype(float)
+            b_tr = to_numeric_coerce(train[col_b]).cast(pl.Float64, strict=False).to_numpy().astype(float)
+            a_te = to_numeric_coerce(test[col_a]).cast(pl.Float64, strict=False).to_numpy().astype(float)
+            b_te = to_numeric_coerce(test[col_b]).cast(pl.Float64, strict=False).to_numpy().astype(float)
+            eps = 1e-12
+            with np.errstate(divide="ignore", invalid="ignore"):
+                tr_ratio = np.divide(
+                    a_tr, b_tr,
+                    out=np.full_like(a_tr, np.nan),
+                    where=np.abs(b_tr) > eps,
+                )
+                te_ratio = np.divide(
+                    a_te, b_te,
+                    out=np.full_like(a_te, np.nan),
+                    where=np.abs(b_te) > eps,
+                )
+            _ratio_train_parts[fname] = pl.Series(name=fname, values=tr_ratio)
+            _ratio_test_parts[fname] = pl.Series(name=fname, values=te_ratio)
             ratio_features.append(fname)
             existing_cols.add(fname)
 
