@@ -395,12 +395,20 @@ def main():
             # Check top important numeric features for residual drift
             _iter_sorted = sorted(_iter_imps.items(), key=lambda x: x[1], reverse=True)
             _iter_count = 0
+            _native_cat_set = set(_native_cat_cols)
             for col, imp in _iter_sorted:
                 if imp < _imp_threshold:
                     break
                 if col not in X_train_m.columns or col not in X_test_m.columns:
                     continue
                 if not is_numeric_col(X_train_m[col]):
+                    continue
+                # Integer-encoded native categoricals pass is_numeric_col but
+                # must not be rank/quantile-transformed — doing so turns them
+                # into continuous floats that later get re-cast to pandas
+                # category dtype with near-n_rows unique levels, destroying the
+                # native-cat signal at train/predict time.
+                if col in _native_cat_set:
                     continue
                 drift = detect_numerical_drift(X_train_m[col], X_test_m[col])
                 if drift["severity"] in ("high", "moderate"):
@@ -453,8 +461,20 @@ def main():
             pseudo_labels = (test_proba[confident_mask] >= 0.5).astype(np.int64)
             pseudo_X = X_test_m.filter(pl.Series(values=confident_mask))
 
-            # Concatenate with original training data
-            X_aug = pl.concat([X_train_m, pseudo_X], how="vertical_relaxed")
+            # Align pseudo_X to X_train_m: same column order and dtypes.
+            # `vertical_relaxed` would aggregate by name and silently upcast
+            # mismatched dtypes, which can reshape how LightGBM treats a
+            # native-cat column between the pre- and post-augment fits.
+            pseudo_X = pseudo_X.select(X_train_m.columns)
+            _cast_exprs = [
+                pseudo_X[c].cast(X_train_m[c].dtype, strict=False).alias(c)
+                for c in X_train_m.columns
+                if pseudo_X[c].dtype != X_train_m[c].dtype
+            ]
+            if _cast_exprs:
+                pseudo_X = pseudo_X.with_columns(_cast_exprs)
+
+            X_aug = pl.concat([X_train_m, pseudo_X], how="vertical")
             y_aug = pl.concat([y_train_m, pl.Series(name=y_train_m.name, values=pseudo_labels)])
 
             # Retrain on augmented data
