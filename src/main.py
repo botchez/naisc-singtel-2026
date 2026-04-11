@@ -152,7 +152,6 @@ def print_runtime_summary(
     mitigation_time: float,
     feat_time: float,
     model_time: float,
-    refine_time: float = 0.0,
     total_elapsed: float = 0.0,
 ) -> None:
     """Print a separate runtime breakdown table using box-drawing characters."""
@@ -180,65 +179,17 @@ def print_runtime_summary(
     print(col_row("Drift Detection", f"{drift_time:.2f}s"))
     print(col_row("Drift Mitigation", f"{mitigation_time:.2f}s"))
     print(col_row("Feature Engineering", f"{feat_time:.2f}s"))
-    if refine_time > 0:
-        print(col_row("Mitigation Refinement", f"{refine_time:.2f}s"))
     print(col_row("Model Training", f"{model_time:.2f}s"))
     print(h_line("╠", "╬", "╣"))
     print(col_row("Total", f"{total_elapsed:.2f}s"))
     print(h_line("╚", "╩", "╝"))
 
 
-def _animate_ascii_typewriter(lines: list[str], duration: float = 1.5) -> None:
-    """Animate ASCII art with a typewriter reveal effect, left-to-right."""
-    num_lines = len(lines)
-    max_width = max(len(line) for line in lines)
-    cols_per_frame = max(1, max_width // 30)
-    num_frames = (max_width + cols_per_frame - 1) // cols_per_frame
-    delay = duration / num_frames
-
-    # Print blank lines to reserve space
-    for _ in lines:
-        sys.stdout.write("\n")
-    sys.stdout.flush()
-
-    for frame in range(num_frames):
-        reveal_col = (frame + 1) * cols_per_frame
-        highlight_start = reveal_col - cols_per_frame
-        # Move cursor up to overwrite
-        sys.stdout.write(f"\033[{num_lines}A")
-        for line in lines:
-            settled = line[:highlight_start]
-            highlighted = line[highlight_start:reveal_col]
-            padding = " " * max(0, max_width - reveal_col)
-            sys.stdout.write(
-                f"\033[0m{settled}\033[32m{highlighted}\033[0m{padding}\n"
-            )
-        sys.stdout.flush()
-        time.sleep(delay)
-
-    # Final frame: full text, colors reset
-    sys.stdout.write(f"\033[{num_lines}A")
-    for line in lines:
-        sys.stdout.write(f"\033[0m{line}\n")
-    sys.stdout.flush()
-
-
 def main():
     parser = argparse.ArgumentParser(description="NAISC Singtel 2026 - Drift Detection & Churn Prediction")
     parser.add_argument("--train_data_filepath", required=True, help="Path to training CSV")
     parser.add_argument("--test_data_filepath", required=True, help="Path to test CSV")
-    parser.add_argument("--drop_only", action="store_true",
-                        help="Skip all transforms: drop every high/moderate drift feature instead")
     args = parser.parse_args()
-
-    # --- Splash banner ---
-    #ascii_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "teamASCII.txt")
-    #if os.path.exists(ascii_path):
-    #    with open(ascii_path) as f:
-    #        lines = f.read().splitlines()
-    #    print("\n")
-    #    _animate_ascii_typewriter(lines)
-    #    time.sleep(1)
 
     _pipeline_start = time.perf_counter()
 
@@ -337,7 +288,7 @@ def main():
     # --- Stage 3: Drift Mitigation ---
     with Timer("Drift mitigation") as mitigation_timer:
         train_m, test_m, drop_cols, mitigation_log, norm_log = apply_all_mitigations(
-            train, test, drift_df, feature_types, drop_only=args.drop_only
+            train, test, drift_df, feature_types
         )
 
     # --- Stage 3b: Feature Strategy Tournament ---
@@ -351,7 +302,7 @@ def main():
     # feature, internal validation can't reliably second-guess that decision.
     _skip = {"Lowercased, hyphens removed", "Abbreviations standardized, lowercased, hyphens removed",
              "Abbreviations standardized", "Frequency encoding", "Drop Feature"}
-    _tourney_features = [] if args.drop_only else [
+    _tourney_features = [
         e for e in mitigation_log
         if e["strategy_applied"] not in _skip
     ]
@@ -482,12 +433,6 @@ def main():
                 drop_cols.append(col)
         if eng_dropped:
             logger.info(f"Dropped {len(eng_dropped)} high-drift engineered features: {eng_dropped}")
-
-    # --- Stage 4b: Mitigation Refinement (SKIPPED for performance) ---
-    # Eliminated: was doing up to 160 model trains + 160 full DataFrame copies
-    # Stage 3's progressive mitigation + Stage 5's weight tournament cover this.
-    refine_timer = Timer("Mitigation refinement (skipped)")
-    refine_timer.elapsed = 0.0
 
     # --- Stage 5: Model Training & Prediction ---
     with Timer("Model training") as model_timer:
@@ -739,7 +684,7 @@ def main():
     ]
     print_model_performance_summary(model_results)
     _pipeline_elapsed = time.perf_counter() - _pipeline_start
-    print_runtime_summary(ingest_timer.elapsed, drift_timer.elapsed, mitigation_timer.elapsed, feat_timer.elapsed, model_timer.elapsed, refine_timer.elapsed, _pipeline_elapsed)
+    print_runtime_summary(ingest_timer.elapsed, drift_timer.elapsed, mitigation_timer.elapsed, feat_timer.elapsed, model_timer.elapsed, _pipeline_elapsed)
 
 
 if __name__ == "__main__":

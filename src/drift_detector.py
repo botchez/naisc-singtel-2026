@@ -1,10 +1,7 @@
 import polars as pl
 import numpy as np
 from scipy import stats
-from polars_compat import (
-    to_numeric_coerce, is_numeric_col, to_pandas_for_lgbm,
-    ensure_pl_df as _ensure_pl_df, ensure_pl_series as _ensure_pl_series,
-)
+from polars_compat import to_numeric_coerce
 
 # Maximum sample size for statistical tests. Beyond this, additional rows
 # add negligible statistical power but cost O(n log n) compute.  100K is
@@ -112,7 +109,6 @@ def detect_numerical_drift(
     train_col: pl.Series, test_col: pl.Series
 ) -> dict:
     """Run drift tests on a single numerical feature."""
-    train_col, test_col = _ensure_pl_series(train_col), _ensure_pl_series(test_col)
     train_null_pct = float(train_col.null_count() / len(train_col))
     test_null_pct = float(test_col.null_count() / len(test_col))
     miss_sev = _missingness_severity(train_null_pct, test_null_pct)
@@ -174,7 +170,6 @@ def detect_categorical_drift(
     train_col: pl.Series, test_col: pl.Series
 ) -> dict:
     """Run drift tests on a single categorical feature."""
-    train_col, test_col = _ensure_pl_series(train_col), _ensure_pl_series(test_col)
     train_null_pct = float(train_col.null_count() / len(train_col))
     test_null_pct = float(test_col.null_count() / len(test_col))
     miss_sev = _missingness_severity(train_null_pct, test_null_pct)
@@ -324,7 +319,6 @@ def generate_drift_description(
     train_col: pl.Series, test_col: pl.Series, feature_type: str, drift_metrics: dict
 ) -> str:
     """Generate a qualitative natural-language description of the drift observed."""
-    train_col, test_col = _ensure_pl_series(train_col), _ensure_pl_series(test_col)
     parts = []
 
     if feature_type == "numerical":
@@ -404,10 +398,7 @@ def generate_drift_description(
     return desc[0].upper() + desc[1:]
 
 
-def _apply_bh_correction(drift_df, ss_factor: float = 1.0):
-    import pandas as pd
-    _input_was_pandas = isinstance(drift_df, pd.DataFrame)
-    drift_df = _ensure_pl_df(drift_df)
+def _apply_bh_correction(drift_df: pl.DataFrame, ss_factor: float = 1.0) -> pl.DataFrame:
     """Apply Benjamini-Hochberg FDR correction across all p-values and re-classify severity."""
     # Collect all p-values (KS and Chi2) for joint correction
     n = len(drift_df)
@@ -431,7 +422,7 @@ def _apply_bh_correction(drift_df, ss_factor: float = 1.0):
                 pval_info.append((i, "chi2_pval"))
 
     if not all_pvals:
-        return drift_df.to_pandas() if _input_was_pandas else drift_df
+        return drift_df
 
     corrected = _bh_correct(np.array(all_pvals))
 
@@ -479,7 +470,7 @@ def _apply_bh_correction(drift_df, ss_factor: float = 1.0):
             new_severities.append(drift_df["severity"][i])
 
     drift_df = drift_df.with_columns(pl.Series("severity", new_severities))
-    return drift_df.to_pandas() if _input_was_pandas else drift_df
+    return drift_df
 
 
 def _analyze_single_feature(train_col, test_col, col_name, feature_type):
@@ -506,7 +497,6 @@ def run_drift_analysis(
     control for multiple testing, then re-classifies severity.
     Uses parallel execution for datasets with many features.
     """
-    train, test = _ensure_pl_df(train), _ensure_pl_df(test)
     from joblib import Parallel, delayed
 
     # Build list of (col, type) pairs to analyze

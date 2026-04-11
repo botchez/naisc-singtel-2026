@@ -85,7 +85,7 @@ def load_all_data(train_path: str, test_path: str):
     train_pl, test_pl = load_data(train_path, test_path)
     feature_types = detect_feature_types(train_pl)
     drift_df_pl = run_drift_analysis(train_pl, test_pl, feature_types)
-    train_m_pl, test_m_pl, drop_cols, mitigation_log, norm_log, _shift_info = apply_all_mitigations(
+    train_m_pl, test_m_pl, drop_cols, mitigation_log, norm_log = apply_all_mitigations(
         train_pl, test_pl, drift_df_pl, feature_types
     )
 

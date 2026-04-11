@@ -5,20 +5,14 @@ from sklearn.metrics import average_precision_score
 from sklearn.model_selection import StratifiedKFold
 import joblib
 from utils import logger
-from polars_compat import (
-    to_numeric_coerce, is_numeric_col, to_pandas_for_lgbm,
-    ensure_pl_df as _ensure_pl_df, ensure_pl_series as _ensure_pl_series,
-)
+from polars_compat import to_numeric_coerce, is_numeric_col, to_pandas_for_lgbm
 
 
-def _encode_target(series) -> pl.Series:
+def _encode_target(series: pl.Series) -> pl.Series:
     """Auto-detect and encode binary target to 0/1.
 
     Handles: "Yes"/"No", 1/0, True/False, "1"/"0", "yes"/"no", etc.
-    Accepts pandas Series or polars Series; always returns polars Series.
     """
-    series = _ensure_pl_series(series)
-
     if series.is_null().all():
         return series.fill_null(0).cast(pl.Int64)
 
@@ -65,22 +59,15 @@ def _encode_target(series) -> pl.Series:
 
 
 def prepare_features(
-    train,
-    test,
+    train: pl.DataFrame,
+    test: pl.DataFrame,
     feature_types: dict[str, list[str]],
     extra_drop_cols: list[str] | None = None,
 ) -> tuple:
     """Minimal preprocessing: encode categoricals, drop IDs, split X/y.
 
-    Accepts pandas or polars DataFrames. Returns pandas if input was pandas
-    (for compatibility with main.py), polars otherwise.
-
     Returns (X_train, y_train, X_test, customer_ids).
     """
-    import pandas as pd
-    _input_was_pandas = isinstance(train, pd.DataFrame)
-    train = _ensure_pl_df(train)
-    test = _ensure_pl_df(test)
 
     target_col = feature_types["target"][0] if feature_types["target"] else None
     id_col = feature_types["id"][0] if feature_types["id"] else None
@@ -285,14 +272,11 @@ def prepare_features(
 
     logger.info(f"Features prepared: {X_train.shape[1]} columns")
 
-    if _input_was_pandas:
-        return X_train.to_pandas(), y_train.to_pandas(), X_test.to_pandas(), customer_ids
     return X_train, y_train, X_test, customer_ids
 
 
 def _to_pandas_with_categoricals(df: pl.DataFrame, cat_cols: list[str] | None = None):
     """Convert polars DataFrame to pandas, preserving categorical dtype for LightGBM."""
-    import pandas as pd
     pdf = to_pandas_for_lgbm(df)
     if cat_cols:
         for col in cat_cols:
@@ -306,8 +290,8 @@ _native_cat_cols: list[str] = []
 
 
 def train_model(
-    X_train,
-    y_train,
+    X_train: pl.DataFrame,
+    y_train: pl.Series,
     sample_weight: np.ndarray | None = None,
 ) -> LGBMClassifier:
     """Train LightGBM with fixed hyperparameters. (DO NOT TOUCH!!!)"""
@@ -318,22 +302,9 @@ def train_model(
         random_state=42,
         importance_type="gain",
     )
-    # LightGBM needs pandas/numpy — convert polars if needed
-    import pandas as pd
-    if isinstance(X_train, pl.DataFrame):
-        X_fit = _to_pandas_with_categoricals(X_train, _native_cat_cols)
-    elif isinstance(X_train, pd.DataFrame):
-        X_fit = X_train
-    else:
-        X_fit = X_train
-
-    if isinstance(y_train, pl.Series):
-        y_fit = y_train.to_numpy()
-    elif isinstance(y_train, pd.Series):
-        y_fit = y_train.to_numpy()
-    else:
-        y_fit = y_train
-
+    # LightGBM needs pandas/numpy
+    X_fit = _to_pandas_with_categoricals(X_train, _native_cat_cols)
+    y_fit = y_train.to_numpy()
     model.fit(X_fit, y_fit, sample_weight=sample_weight)
     tag = "with sample weights" if sample_weight is not None else "uniform weights"
     logger.info(f"Model trained ({tag})")
@@ -342,47 +313,21 @@ def train_model(
 
 def evaluate_and_save(
     model: LGBMClassifier,
-    X_train,
-    y_train,
-    X_test,
+    X_train: pl.DataFrame,
+    y_train: pl.Series,
+    X_test: pl.DataFrame,
     customer_ids: list[str],
-    test,
+    test: pl.DataFrame,
     feature_types: dict[str, list[str]],
     tag: str = "",
 ) -> dict[str, float]:
-    """Predict, compute AU-PRC, save model and predictions.
-
-    Accepts pandas or polars DataFrames for X_train/X_test/test and
-    pandas or polars Series for y_train.
-    """
-    import pandas as pd
+    """Predict, compute AU-PRC, save model and predictions."""
     suffix = f"_{tag}" if tag else ""
 
     # Convert for LightGBM predict_proba (preserve category dtypes)
-    if isinstance(X_train, pl.DataFrame):
-        X_train_lgbm = _to_pandas_with_categoricals(X_train, _native_cat_cols)
-    elif isinstance(X_train, pd.DataFrame):
-        X_train_lgbm = X_train
-    else:
-        X_train_lgbm = X_train
-
-    if isinstance(X_test, pl.DataFrame):
-        X_test_lgbm = _to_pandas_with_categoricals(X_test, _native_cat_cols)
-    elif isinstance(X_test, pd.DataFrame):
-        X_test_lgbm = X_test
-    else:
-        X_test_lgbm = X_test
-
-    # Convert y_train for sklearn metrics
-    if isinstance(y_train, pl.Series):
-        y_train_np = y_train.to_numpy()
-    elif isinstance(y_train, pd.Series):
-        y_train_np = y_train.to_numpy()
-    else:
-        y_train_np = np.asarray(y_train)
-
-    # Ensure test is accessible (convert to polars for uniform column access)
-    test_pl = _ensure_pl_df(test)
+    X_train_lgbm = _to_pandas_with_categoricals(X_train, _native_cat_cols)
+    X_test_lgbm = _to_pandas_with_categoricals(X_test, _native_cat_cols)
+    y_train_np = y_train.to_numpy()
 
     # Train AU-PRC
     train_proba = model.predict_proba(X_train_lgbm)[:, 1]
@@ -392,10 +337,10 @@ def evaluate_and_save(
     target_col = feature_types["target"][0] if feature_types["target"] else None
     test_proba = model.predict_proba(X_test_lgbm)[:, 1]
     test_auprc = None
-    if target_col and target_col in test_pl.columns and test_pl[target_col].is_not_null().any():
+    if target_col and target_col in test.columns and test[target_col].is_not_null().any():
         # Guard against dummy test labels (all same value) in hidden eval
-        if test_pl[target_col].drop_nulls().n_unique() >= 2:
-            y_test = _encode_target(test_pl[target_col])
+        if test[target_col].drop_nulls().n_unique() >= 2:
+            y_test = _encode_target(test[target_col])
             test_auprc = average_precision_score(y_test.to_numpy(), test_proba)
 
     # Save prediction and model
