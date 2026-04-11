@@ -1,6 +1,6 @@
 import numpy as np
 import polars as pl
-from polars_compat import to_numeric_coerce, is_numeric_col, ensure_pl_df as _ensure_pl_df
+from polars_compat import to_numeric_coerce, is_numeric_col
 from utils import logger
 
 
@@ -38,8 +38,8 @@ def _pairwise_corr_matrix(df: pl.DataFrame, cols: list[str]) -> np.ndarray:
 
 
 def engineer_features(
-    train,
-    test,
+    train: pl.DataFrame,
+    test: pl.DataFrame,
     feature_types: dict[str, list[str]],
     drop_cols: list[str] | None = None,
 ) -> tuple:
@@ -50,13 +50,8 @@ def engineer_features(
     2. Frequency encoding for high-cardinality categoricals (>10 unique)
     3. Ratio features between correlated numerical pairs
 
-    Accepts pandas or polars DataFrames. Returns the same type as the input.
     Returns (train_enriched, test_enriched, new_feature_names) with aligned columns.
     """
-    import pandas as pd
-    _input_was_pandas = isinstance(train, pd.DataFrame)
-    train = _ensure_pl_df(train)
-    test = _ensure_pl_df(test)
 
     skip_cols = set(feature_types.get("id", []) + feature_types.get("target", []))
     if drop_cols:
@@ -325,10 +320,5 @@ def engineer_features(
 
     # Filter to only new features that survived column alignment
     all_new_features = [f for f in all_new_features if f in common_cols]
-
-    # Return pandas if input was pandas (transition compatibility)
-    if _input_was_pandas:
-        train = train.to_pandas()
-        test = test.to_pandas()
 
     return train, test, all_new_features

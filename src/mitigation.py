@@ -1,9 +1,6 @@
 import numpy as np
 import polars as pl
-from polars_compat import (
-    to_numeric_coerce, is_numeric_col,
-    ensure_pl_df as _ensure_pl_df, ensure_pl_series as _ensure_pl_series,
-)
+from polars_compat import to_numeric_coerce, is_numeric_col
 from utils import logger
 
 _MAX_EVAL_SAMPLE = 100_000
@@ -11,8 +8,6 @@ _MAX_EVAL_SAMPLE = 100_000
 
 def _eval_subsample(train_col, test_col, max_n=_MAX_EVAL_SAMPLE, seed=42):
     """Subsample columns for fast strategy evaluation."""
-    train_col = _ensure_pl_series(train_col)
-    test_col = _ensure_pl_series(test_col)
     tr, te = train_col, test_col
     if len(tr) > max_n:
         tr = tr.sample(n=max_n, seed=seed)
@@ -72,8 +67,8 @@ def detect_abbreviation_mappings(
 
 
 def normalize_data_quality(
-    train,
-    test,
+    train: pl.DataFrame,
+    test: pl.DataFrame,
     feature_types: dict[str, list[str]],
 ):
     """Normalize data quality: city abbreviation mapping, lowercase, hyphen removal.
@@ -82,10 +77,8 @@ def normalize_data_quality(
     Returns (train_clean, test_clean, norm_log) where norm_log maps column names
     to lists of normalization action labels applied.
     """
-    import pandas as pd
-    _input_was_pandas = isinstance(train, pd.DataFrame)
-    train_clean = _ensure_pl_df(train).clone()
-    test_clean = _ensure_pl_df(test).clone()
+    train_clean = train.clone()
+    test_clean = test.clone()
 
     skip_cols = set(feature_types.get("id", []) + feature_types.get("target", []))
     norm_log: dict[str, list[str]] = {}
@@ -204,37 +197,16 @@ def normalize_data_quality(
     if fuzzy_skipped:
         logger.info(f"Skipped fuzzy matching for {fuzzy_skipped} high-cardinality columns")
 
-    if _input_was_pandas:
-        return train_clean.to_pandas(), test_clean.to_pandas(), norm_log
     return train_clean, test_clean, norm_log
 
 
 # ── Strategy functions ────────────────────────────────────────────────────
 
 
-def median_align(
-    train_col, test_col
-):
-    """Shift test values so that test median matches train median."""
-    train_col = _ensure_pl_series(train_col)
-    test_col = _ensure_pl_series(test_col)
-    train_vals = to_numeric_coerce(train_col).drop_nulls()
-    test_vals = to_numeric_coerce(test_col).drop_nulls()
-    if len(train_vals) == 0 or len(test_vals) == 0:
-        return train_col, test_col
-    shift = train_vals.median() - test_vals.median()
-    if abs(shift) < 1e-10:
-        return train_col, test_col  # no shift needed
-    test_aligned = to_numeric_coerce(test_col) + shift
-    return train_col, test_aligned.alias(test_col.name)
-
-
 def clip_outliers(
     train_col, test_col
 ):
     """Clip both columns to [1st, 99th] percentile of train."""
-    train_col = _ensure_pl_series(train_col)
-    test_col = _ensure_pl_series(test_col)
     vals = to_numeric_coerce(train_col).drop_nulls().to_numpy().astype(float)
     lo, hi = np.percentile(vals, [1, 99])
     return train_col.clip(lo, hi), test_col.clip(lo, hi)
@@ -244,8 +216,6 @@ def log_transform(
     train_col, test_col
 ):
     """Apply log1p if all values >= 0; return None to skip otherwise."""
-    train_col = _ensure_pl_series(train_col)
-    test_col = _ensure_pl_series(test_col)
     tr_clean = to_numeric_coerce(train_col).drop_nulls()
     te_clean = to_numeric_coerce(test_col).drop_nulls()
     if (tr_clean < 0).any() or (te_clean < 0).any():
@@ -265,8 +235,6 @@ def quantile_bin(
     train_col, test_col, n_bins: int = 10
 ):
     """Discretize into quantile bins defined by train edges."""
-    train_col = _ensure_pl_series(train_col)
-    test_col = _ensure_pl_series(test_col)
     vals = to_numeric_coerce(train_col).drop_nulls().to_numpy().astype(float)
     # Adapt bins to sample size
     n_bins = min(n_bins, max(2, len(vals) // 20))
@@ -285,8 +253,6 @@ def group_rare_categories(
     train_col, test_col, min_freq: float = 0.01
 ):
     """Merge categories below min_freq in train + unseen-in-train into '_other'."""
-    train_col = _ensure_pl_series(train_col)
-    test_col = _ensure_pl_series(test_col)
 
     # Compute frequency of each category in train
     vc = train_col.drop_nulls().value_counts()
@@ -316,45 +282,6 @@ def group_rare_categories(
     return _remap(train_col), _remap(test_col)
 
 
-def encode_temporal_cyclical(
-    train_col, test_col
-):
-    """Parse temporal -> month -> sin/cos pair. Returns (train_sin, train_cos, test_sin, test_cos)."""
-    train_col = _ensure_pl_series(train_col)
-    test_col = _ensure_pl_series(test_col)
-
-    def _to_month(s: pl.Series) -> np.ndarray:
-        # Title-case to restore month abbreviations after lowercase normalization
-        s_title = s.cast(pl.Utf8).str.to_titlecase()
-        for fmt in ["%y-%b", "%b-%y", "%Y-%m", "%m-%Y", "%b %Y", "%Y-%b",
-                    "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"]:
-            try:
-                parsed = s_title.str.to_datetime(fmt, strict=False)
-                not_null_count = parsed.is_not_null().sum()
-                if not_null_count > len(s) * 0.5:
-                    month = parsed.dt.month().fill_null(1).cast(pl.Float64)
-                    return month.to_numpy()
-            except Exception:
-                continue
-        return np.ones(len(s))
-
-    train_month = _to_month(train_col)
-    test_month = _to_month(test_col)
-
-    train_sin = np.sin(2 * np.pi * train_month / 12)
-    train_cos = np.cos(2 * np.pi * train_month / 12)
-    test_sin = np.sin(2 * np.pi * test_month / 12)
-    test_cos = np.cos(2 * np.pi * test_month / 12)
-
-    name = train_col.name
-    return (
-        pl.Series(name=f"{name}_sin", values=train_sin),
-        pl.Series(name=f"{name}_cos", values=train_cos),
-        pl.Series(name=f"{name}_sin", values=test_sin),
-        pl.Series(name=f"{name}_cos", values=test_cos),
-    )
-
-
 def frequency_encode_mitigation(
     train_col, test_col
 ):
@@ -362,8 +289,6 @@ def frequency_encode_mitigation(
 
     Converts categorical to numerical, making it amenable to numerical strategies.
     """
-    train_col = _ensure_pl_series(train_col)
-    test_col = _ensure_pl_series(test_col)
 
     # Build frequency map from train
     vc = train_col.drop_nulls().value_counts()
@@ -393,8 +318,6 @@ def robust_scale(
     train_col, test_col
 ):
     """Scale using median and IQR from train. Distribution-robust alternative to z-score."""
-    train_col = _ensure_pl_series(train_col)
-    test_col = _ensure_pl_series(test_col)
     train_vals = to_numeric_coerce(train_col).drop_nulls().to_numpy().astype(float)
     median = np.median(train_vals)
     q1, q3 = np.percentile(train_vals, [25, 75])
@@ -410,8 +333,6 @@ def robust_scale(
 
 
 def _clip_then_log(train_col, test_col):
-    train_col = _ensure_pl_series(train_col)
-    test_col = _ensure_pl_series(test_col)
     tr_c, te_c = clip_outliers(train_col, test_col)
     # Shift to ensure non-negative before log
     tr_min = tr_c.min()
@@ -440,8 +361,6 @@ def quantile_match(
     then maps to the corresponding value from the training distribution.
     Training data is unchanged; test rank ordering is preserved.
     """
-    train_col = _ensure_pl_series(train_col)
-    test_col = _ensure_pl_series(test_col)
     train_vals = to_numeric_coerce(train_col).drop_nulls().to_numpy().astype(float)
     test_numeric = to_numeric_coerce(test_col)
     test_vals = test_numeric.drop_nulls().to_numpy().astype(float)
@@ -477,8 +396,6 @@ def rank_transform(
 
     Distribution-agnostic: eliminates drift while preserving ordering.
     """
-    train_col = _ensure_pl_series(train_col)
-    test_col = _ensure_pl_series(test_col)
     train_vals = to_numeric_coerce(train_col).drop_nulls().to_numpy().astype(float)
     sorted_vals = np.sort(train_vals)
     n = len(sorted_vals)
@@ -498,8 +415,8 @@ def rank_transform(
 
 
 def mitigate_feature_progressive(
-    train,
-    test,
+    train: pl.DataFrame,
+    test: pl.DataFrame,
     col: str,
     feature_type: str,
     original_severity: str,
@@ -508,11 +425,6 @@ def mitigate_feature_progressive(
 
     Returns (train, test, log_entry) where log_entry records what happened.
     """
-    import pandas as pd
-    _input_was_pandas = isinstance(train, pd.DataFrame)
-    train = _ensure_pl_df(train)
-    test = _ensure_pl_df(test)
-
     from drift_detector import detect_numerical_drift, detect_categorical_drift
 
     log_entry = {
@@ -547,13 +459,9 @@ def mitigate_feature_progressive(
                     test = test.with_columns(full_result[1].alias(col))
                 log_entry["strategy_applied"] = name
                 log_entry["final_severity"] = drift["severity"]
-                result_train = train.to_pandas() if _input_was_pandas else train
-                result_test = test.to_pandas() if _input_was_pandas else test
-                return result_train, result_test, log_entry
+                return train, test, log_entry
         # All strategies failed -> drop
-        result_train = train.to_pandas() if _input_was_pandas else train
-        result_test = test.to_pandas() if _input_was_pandas else test
-        return result_train, result_test, log_entry
+        return train, test, log_entry
 
     if feature_type == "categorical":
         # Evaluate strategies on subsample, apply winner to full data
@@ -568,9 +476,7 @@ def mitigate_feature_progressive(
             test = test.with_columns(full_te.alias(col))
             log_entry["strategy_applied"] = "Category Consolidation"
             log_entry["final_severity"] = drift["severity"]
-            result_train = train.to_pandas() if _input_was_pandas else train
-            result_test = test.to_pandas() if _input_was_pandas else test
-            return result_train, result_test, log_entry
+            return train, test, log_entry
 
         # Strategy 2: Frequency encode (converts to numerical)
         tr_freq, te_freq = frequency_encode_mitigation(eval_tr, eval_te)
@@ -581,9 +487,7 @@ def mitigate_feature_progressive(
             test = test.with_columns(full_te.alias(col))
             log_entry["strategy_applied"] = "Frequency Encoding"
             log_entry["final_severity"] = drift["severity"]
-            result_train = train.to_pandas() if _input_was_pandas else train
-            result_test = test.to_pandas() if _input_was_pandas else test
-            return result_train, result_test, log_entry
+            return train, test, log_entry
 
         # Strategy 3: Frequency encode + numerical strategies
         num_strategies = [
@@ -605,29 +509,22 @@ def mitigate_feature_progressive(
                     test = test.with_columns(full_result[1].alias(col))
                 log_entry["strategy_applied"] = name
                 log_entry["final_severity"] = drift["severity"]
-                result_train = train.to_pandas() if _input_was_pandas else train
-                result_test = test.to_pandas() if _input_was_pandas else test
-                return result_train, result_test, log_entry
+                return train, test, log_entry
 
         # All categorical strategies failed -> drop
-        result_train = train.to_pandas() if _input_was_pandas else train
-        result_test = test.to_pandas() if _input_was_pandas else test
-        return result_train, result_test, log_entry
+        return train, test, log_entry
 
-    result_train = train.to_pandas() if _input_was_pandas else train
-    result_test = test.to_pandas() if _input_was_pandas else test
-    return result_train, result_test, log_entry
+    return train, test, log_entry
 
 
 # ── Main entry point ─────────────────────────────────────────────────────
 
 
 def apply_all_mitigations(
-    train,
-    test,
-    drift_df,
+    train: pl.DataFrame,
+    test: pl.DataFrame,
+    drift_df: pl.DataFrame,
     feature_types: dict[str, list[str]],
-    drop_only: bool = False,
 ):
     """Run all mitigation stages in order.
 
@@ -638,35 +535,10 @@ def apply_all_mitigations(
 
     Returns (train_mitigated, test_mitigated, drop_cols, mitigation_log, norm_log).
     """
-    import pandas as pd
-    _input_was_pandas = isinstance(train, pd.DataFrame)
-    train = _ensure_pl_df(train)
-    test = _ensure_pl_df(test)
-    drift_df = _ensure_pl_df(drift_df)
-
     from drift_detector import _analyze_single_feature, _small_sample_factor, _apply_bh_correction
 
-    # drop_only mode: skip all transforms, drop every high/moderate-drift feature
-    if drop_only:
-        drop_cols = []
-        if len(drift_df) > 0:
-            for sev in ("high", "moderate"):
-                sev_rows = drift_df.filter(pl.col("severity") == sev)
-                for i in range(len(sev_rows)):
-                    col = sev_rows["column"][i]
-                    if col in train.columns:
-                        drop_cols.append(col)
-        logger.info(f"drop_only mode: dropping {len(drop_cols)} high/moderate-drift features, no transforms")
-        if _input_was_pandas:
-            return train.to_pandas(), test.to_pandas(), drop_cols, [], {}
-        return train, test, drop_cols, [], {}
-
     # Stage 1: Data quality normalization
-    # normalize_data_quality now works internally with polars; pass polars in, get polars out
     train_m, test_m, norm_log = normalize_data_quality(train, test, feature_types)
-    # Ensure we stay in polars land after normalization
-    train_m = _ensure_pl_df(train_m)
-    test_m = _ensure_pl_df(test_m)
 
     # Stage 2: Re-check drift only for columns modified by normalization
     # (avoids re-running all 500 features when only a few changed)
@@ -703,8 +575,7 @@ def apply_all_mitigations(
                 recheck_count += 1
         if recheck_count > 0:
             ss_factor = _small_sample_factor(len(train_m), len(test_m))
-            # _apply_bh_correction accepts both pandas/polars and returns same type
-            drift_df_norm = _ensure_pl_df(_apply_bh_correction(drift_df_norm, ss_factor))
+            drift_df_norm = _apply_bh_correction(drift_df_norm, ss_factor)
             # Sort by severity
             severity_order = {"high": 0, "moderate": 1, "low": 2, "unknown": 3}
             drift_df_norm = drift_df_norm.with_columns(
@@ -736,13 +607,9 @@ def apply_all_mitigations(
             continue
         if (i + 1) % 25 == 0:
             logger.info(f"  High-drift progress: {i + 1}/{len(high_drift_features)}")
-        # mitigate_feature_progressive accepts both pandas/polars; pass polars
         train_m, test_m, entry = mitigate_feature_progressive(
             train_m, test_m, col, ftype, severity
         )
-        # Ensure we stay in polars
-        train_m = _ensure_pl_df(train_m)
-        test_m = _ensure_pl_df(test_m)
         mitigation_log.append(entry)
         if entry["strategy_applied"] == "Drop Feature":
             drop_cols.append(col)
@@ -875,6 +742,4 @@ def apply_all_mitigations(
                                        "original_severity": "moderate", "strategy_applied": best_strategy,
                                        "final_severity": best_sev})
 
-    if _input_was_pandas:
-        return train_m.to_pandas(), test_m.to_pandas(), drop_cols, mitigation_log, norm_log
     return train_m, test_m, drop_cols, mitigation_log, norm_log
