@@ -3,17 +3,9 @@ import polars as pl
 from polars_compat import to_numeric_coerce, is_numeric_col
 from utils import logger
 
-_MAX_EVAL_SAMPLE = 100_000
-
-
-def _eval_subsample(train_col, test_col, max_n=_MAX_EVAL_SAMPLE, seed=42):
-    """Subsample columns for fast strategy evaluation."""
-    tr, te = train_col, test_col
-    if len(tr) > max_n:
-        tr = tr.sample(n=max_n, seed=seed)
-    if len(te) > max_n:
-        te = te.sample(n=max_n, seed=seed)
-    return tr, te
+# Strategy evaluation runs on full columns. Drift tests internally subsample
+# at 100K with seed=42 (see drift_detector._subsample_*), which guarantees
+# consistent rows between strategy eval and any re-verification.
 
 
 
@@ -452,19 +444,17 @@ def mitigate_feature_progressive(
             ("Discretization", lambda tc, sc: quantile_bin(tc, sc)),
             ("Rank Transform", lambda tc, sc: rank_transform(tc, sc)),
         ]
-        # Evaluate strategies on subsample, apply winner to full data
-        eval_tr, eval_te = _eval_subsample(train[col], test[col])
+        # Apply each strategy to full columns; drift test internally uses
+        # the same seed=42 100K subsample, so severity reflects reality.
         for name, fn in strategies:
-            result = fn(eval_tr, eval_te)
+            result = fn(train[col], test[col])
             if result is None:
                 continue  # strategy not applicable (e.g. log with negatives)
             tr_col, te_col = result
             drift = detect_numerical_drift(tr_col, te_col)
             if drift["severity"] != "high":
-                full_result = fn(train[col], test[col])
-                if full_result is not None:
-                    train = train.with_columns(full_result[0].alias(col))
-                    test = test.with_columns(full_result[1].alias(col))
+                train = train.with_columns(tr_col.alias(col))
+                test = test.with_columns(te_col.alias(col))
                 log_entry["strategy_applied"] = name
                 log_entry["final_severity"] = drift["severity"]
                 return train, test, log_entry
@@ -472,27 +462,22 @@ def mitigate_feature_progressive(
         return train, test, log_entry
 
     if feature_type == "categorical":
-        # Evaluate strategies on subsample, apply winner to full data
-        eval_tr, eval_te = _eval_subsample(train[col], test[col])
-
         # Strategy 1: Group rare categories
-        tr_col, te_col = group_rare_categories(eval_tr, eval_te)
+        tr_col, te_col = group_rare_categories(train[col], test[col])
         drift = detect_categorical_drift(tr_col, te_col)
         if drift["severity"] != "high":
-            full_tr, full_te = group_rare_categories(train[col], test[col])
-            train = train.with_columns(full_tr.alias(col))
-            test = test.with_columns(full_te.alias(col))
+            train = train.with_columns(tr_col.alias(col))
+            test = test.with_columns(te_col.alias(col))
             log_entry["strategy_applied"] = "Category Consolidation"
             log_entry["final_severity"] = drift["severity"]
             return train, test, log_entry
 
         # Strategy 2: Frequency encode (converts to numerical)
-        tr_freq, te_freq = frequency_encode_mitigation(eval_tr, eval_te)
+        tr_freq, te_freq = frequency_encode_mitigation(train[col], test[col])
         drift = detect_numerical_drift(tr_freq, te_freq)
         if drift["severity"] != "high":
-            full_tr, full_te = frequency_encode_mitigation(train[col], test[col])
-            train = train.with_columns(full_tr.alias(col))
-            test = test.with_columns(full_te.alias(col))
+            train = train.with_columns(tr_freq.alias(col))
+            test = test.with_columns(te_freq.alias(col))
             log_entry["strategy_applied"] = "Frequency Encoding"
             log_entry["final_severity"] = drift["severity"]
             return train, test, log_entry
@@ -510,11 +495,8 @@ def mitigate_feature_progressive(
             tr_num, te_num = result
             drift = detect_numerical_drift(tr_num, te_num)
             if drift["severity"] != "high":
-                full_freq_tr, full_freq_te = frequency_encode_mitigation(train[col], test[col])
-                full_result = fn(full_freq_tr, full_freq_te)
-                if full_result is not None:
-                    train = train.with_columns(full_result[0].alias(col))
-                    test = test.with_columns(full_result[1].alias(col))
+                train = train.with_columns(tr_num.alias(col))
+                test = test.with_columns(te_num.alias(col))
                 log_entry["strategy_applied"] = name
                 log_entry["final_severity"] = drift["severity"]
                 return train, test, log_entry
@@ -668,24 +650,21 @@ def apply_all_mitigations(
                 ("Quantile matching", lambda tc, sc: quantile_match(tc, sc)),
                 ("Rank transform", lambda tc, sc: rank_transform(tc, sc)),
             ]
-            eval_tr, eval_te = _eval_subsample(train_m[col], test_m[col])
             best_strategy = None
             best_psi = orig_psi
-            best_fn = None
+            best_result = None
             best_sev = None
             for name, fn in strategies:
-                result = fn(eval_tr, eval_te)
+                result = fn(train_m[col], test_m[col])
                 if result is None:
                     continue
                 tr_col, te_col = result
                 drift = detect_numerical_drift(tr_col, te_col)
                 new_psi = drift.get("psi", orig_psi) or orig_psi
                 if drift["severity"] == "low":
-                    # Immediate accept -- apply to full data
-                    full_result = fn(train_m[col], test_m[col])
-                    if full_result is not None:
-                        train_m = train_m.with_columns(full_result[0].alias(col))
-                        test_m = test_m.with_columns(full_result[1].alias(col))
+                    # Immediate accept
+                    train_m = train_m.with_columns(tr_col.alias(col))
+                    test_m = test_m.with_columns(te_col.alias(col))
                     logger.info(f"  {col}: {name} (moderate -> low)")
                     mitigation_log.append({"column": col, "feature_type": ftype,
                                            "original_severity": "moderate", "strategy_applied": name,
@@ -695,31 +674,28 @@ def apply_all_mitigations(
                 elif new_psi < best_psi:
                     best_psi = new_psi
                     best_strategy = name
-                    best_fn = fn
+                    best_result = (tr_col, te_col)
                     best_sev = drift["severity"]
             # Apply best improvement even if still moderate
-            if best_strategy and best_fn:
-                full_result = best_fn(train_m[col], test_m[col])
-                if full_result is not None:
-                    train_m = train_m.with_columns(full_result[0].alias(col))
-                    test_m = test_m.with_columns(full_result[1].alias(col))
+            if best_strategy and best_result is not None:
+                train_m = train_m.with_columns(best_result[0].alias(col))
+                test_m = test_m.with_columns(best_result[1].alias(col))
                 logger.info(f"  {col}: {best_strategy} (moderate, PSI {orig_psi:.4f} -> {best_psi:.4f})")
                 mitigation_log.append({"column": col, "feature_type": ftype,
                                        "original_severity": "moderate", "strategy_applied": best_strategy,
                                        "final_severity": best_sev})
 
         elif ftype == "categorical":
-            eval_tr, eval_te = _eval_subsample(train_m[col], test_m[col])
             cat_strategies = [
                 ("Rare category grouping", lambda tc, sc: group_rare_categories(tc, sc), "cat"),
                 ("Frequency encoding", lambda tc, sc: frequency_encode_mitigation(tc, sc), "num"),
             ]
             best_strategy = None
             best_jsd = orig_jsd
-            best_fn = None
+            best_result = None
             best_sev = None
             for name, fn, detect_type in cat_strategies:
-                tr_col, te_col = fn(eval_tr, eval_te)
+                tr_col, te_col = fn(train_m[col], test_m[col])
                 if detect_type == "cat":
                     drift = detect_categorical_drift(tr_col, te_col)
                     new_jsd = drift.get("jsd", orig_jsd) or orig_jsd
@@ -727,9 +703,8 @@ def apply_all_mitigations(
                     drift = detect_numerical_drift(tr_col, te_col)
                     new_jsd = drift.get("psi", orig_jsd) or orig_jsd
                 if drift["severity"] == "low":
-                    full_tr, full_te = fn(train_m[col], test_m[col])
-                    train_m = train_m.with_columns(full_tr.alias(col))
-                    test_m = test_m.with_columns(full_te.alias(col))
+                    train_m = train_m.with_columns(tr_col.alias(col))
+                    test_m = test_m.with_columns(te_col.alias(col))
                     logger.info(f"  {col}: {name} (moderate -> low)")
                     mitigation_log.append({"column": col, "feature_type": ftype,
                                            "original_severity": "moderate", "strategy_applied": name,
@@ -739,12 +714,11 @@ def apply_all_mitigations(
                 elif new_jsd < best_jsd:
                     best_jsd = new_jsd
                     best_strategy = name
-                    best_fn = fn
+                    best_result = (tr_col, te_col)
                     best_sev = drift["severity"]
-            if best_strategy and best_fn:
-                full_tr, full_te = best_fn(train_m[col], test_m[col])
-                train_m = train_m.with_columns(full_tr.alias(col))
-                test_m = test_m.with_columns(full_te.alias(col))
+            if best_strategy and best_result is not None:
+                train_m = train_m.with_columns(best_result[0].alias(col))
+                test_m = test_m.with_columns(best_result[1].alias(col))
                 logger.info(f"  {col}: {best_strategy} (moderate, JSD {orig_jsd:.4f} -> {best_jsd:.4f})")
                 mitigation_log.append({"column": col, "feature_type": ftype,
                                        "original_severity": "moderate", "strategy_applied": best_strategy,

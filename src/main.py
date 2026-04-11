@@ -242,7 +242,7 @@ def main():
 
         # --- Dynamic pipeline cap: keep runtime under 10 minutes ---
         # Based on benchmark: 2M rows × 200 cols ≈ 230s computation.
-        # Budget 480s for computation (leaving ~2 min for CSV I/O).
+        # Budget 300s for computation (leaving ~5 min for CSV I/O and stage overhead).
         _RUNTIME_BUDGET_S = 300
         _COST_PER_ROW_COL = 8.0e-7  # seconds per row × column (from 2M×200 on 2-core Docker)
         n_cols = len(train.columns)
@@ -315,12 +315,9 @@ def main():
         import numpy as np
 
         # Baseline model: raw features (no mitigation) — shows value of drift handling
-        _MAX_BASELINE_SAMPLE = 100_000
-        train_baseline = train.sample(n=min(_MAX_BASELINE_SAMPLE, len(train)), seed=42) if len(train) > _MAX_BASELINE_SAMPLE else train
-        if len(train) > _MAX_BASELINE_SAMPLE:
-            logger.info(f"Baseline model: subsampling {_MAX_BASELINE_SAMPLE}/{len(train)} rows")
+        # Uses the same (capped) train as the mitigated model for a fair comparison.
         X_train_b, y_train_b, X_test_b, customer_ids = prepare_features(
-            train_baseline, test, feature_types
+            train, test, feature_types
         )
         lgbm_b = train_model(X_train_b, y_train_b)
         baseline_metrics = evaluate_and_save(
@@ -334,9 +331,6 @@ def main():
         )
 
         # --- Feature selection: use decision sample for importances ---
-        from sklearn.metrics import average_precision_score
-        from model import _encode_target
-
         try:
             if _decision_idx is not None and len(X_train_m) > _DECISION_SAMPLE_SIZE:
                 fs_idx = _decision_idx[_decision_idx < len(X_train_m)]

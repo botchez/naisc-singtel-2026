@@ -292,7 +292,6 @@ _native_cat_cols: list[str] = []
 def train_model(
     X_train: pl.DataFrame,
     y_train: pl.Series,
-    sample_weight: np.ndarray | None = None,
 ) -> LGBMClassifier:
     """Train LightGBM with fixed hyperparameters. (DO NOT TOUCH!!!)"""
     model = LGBMClassifier(
@@ -302,12 +301,10 @@ def train_model(
         random_state=42,
         importance_type="gain",
     )
-    # LightGBM needs pandas/numpy
     X_fit = _to_pandas_with_categoricals(X_train, _native_cat_cols)
     y_fit = y_train.to_numpy()
-    model.fit(X_fit, y_fit, sample_weight=sample_weight)
-    tag = "with sample weights" if sample_weight is not None else "uniform weights"
-    logger.info(f"Model trained ({tag})")
+    model.fit(X_fit, y_fit)
+    logger.info("Model trained")
     return model
 
 
