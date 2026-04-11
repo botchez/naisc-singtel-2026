@@ -216,8 +216,8 @@ def main():
         if mem_before > mem_after + 0.1:
             logger.info(f"Downcasted numeric columns: {mem_before:.1f}MB -> {mem_after:.1f}MB")
 
-        # --- Build a single decision sample for drift detection, feature selection,
-        # and weight tournament. Full data flows through mitigation/FE/final model. ---
+        # --- Build a single decision sample for drift detection and feature selection.
+        # Full data flows through mitigation/FE/final model. ---
         from utils import stratified_subsample_idx, _parse_month_labels
 
         _DECISION_SAMPLE_SIZE = 100_000
@@ -291,131 +291,7 @@ def main():
             train, test, drift_df, feature_types
         )
 
-    # --- Stage 3b: Feature Strategy Tournament ---
-    # For each drifted feature, evaluate {current, raw, drop} by AU-PRC
-    # on temporal holdout with 3-seed averaging. Replaces drop validation
-    # and weight tournament — spend compute where it matters most.
-    _STRATEGY_SEEDS = [42, 123, 456]
-
-    # Collect only transformed features (skip normalization-only and drops).
-    # Drops are trusted — if all 6 progressive strategies failed on a high-drift
-    # feature, internal validation can't reliably second-guess that decision.
-    _skip = {"Lowercased, hyphens removed", "Abbreviations standardized, lowercased, hyphens removed",
-             "Abbreviations standardized", "Frequency encoding", "Drop Feature"}
-    _tourney_features = [
-        e for e in mitigation_log
-        if e["strategy_applied"] not in _skip
-    ]
-
-    if _tourney_features:
-        from sklearn.metrics import average_precision_score
-        from model import _encode_target
-        import numpy as np
-
-        logger.info(f"Feature strategy tournament: {len(_tourney_features)} features to evaluate")
-
-        # Subsample + temporal holdout setup
-        _FST_SAMPLE = min(50_000, len(train_m))
-        if len(train_m) > _FST_SAMPLE:
-            # Add row index before sampling so we can match rows in original data
-            _fst_indexed = train_m.with_row_index("__fst_idx__").sample(n=_FST_SAMPLE, seed=42)
-            _fst_row_idx = _fst_indexed["__fst_idx__"].to_list()
-            _fst_mitigated = _fst_indexed.drop("__fst_idx__")
-            _fst_original = train[_fst_row_idx]
-        else:
-            _fst_mitigated = train_m
-            _fst_original = train
-
-        # Parse temporal column for holdout
-        _fst_months = None
-        for tc in feature_types.get("temporal", []):
-            if tc in _fst_mitigated.columns:
-                _fst_months = _parse_month_labels(_fst_mitigated[tc])
-                if _fst_months is not None:
-                    break
-
-        if _fst_months is not None:
-            _fst_months_np = _fst_months.to_numpy(allow_copy=True) if isinstance(_fst_months, pl.Series) else _fst_months
-            unique_months = sorted(np.unique(_fst_months_np))
-            n_val_months = max(1, len(unique_months) // 5)
-            val_months = set(unique_months[-n_val_months:])
-            _fst_val_mask = np.isin(_fst_months_np, list(val_months))
-            logger.info(f"  Temporal holdout: val months={sorted(val_months)}")
-        else:
-            _fst_rng = np.random.RandomState(99)
-            _fst_n = len(_fst_mitigated)
-            _fst_val_mask = np.zeros(_fst_n, dtype=bool)
-            _fst_val_mask[_fst_rng.choice(_fst_n, size=max(1, _fst_n // 5), replace=False)] = True
-
-        _fst_train_m = _fst_mitigated.filter(~pl.Series(values=_fst_val_mask))
-        _fst_val_m = _fst_mitigated.filter(pl.Series(values=_fst_val_mask))
-        _fst_train_raw = _fst_original.filter(~pl.Series(values=_fst_val_mask))
-        _fst_val_raw = _fst_original.filter(pl.Series(values=_fst_val_mask))
-
-        target_col = feature_types["target"][0]
-        _fst_y_val = _encode_target(_fst_val_m[target_col]).to_numpy()
-
-        def _fst_score(train_data, val_data, extra_drops, seeds=_STRATEGY_SEEDS):
-            """AU-PRC averaged over multiple seeds for stability."""
-            scores = []
-            for seed in seeds:
-                X_tr, y_tr, X_va, _ = prepare_features(
-                    train_data, val_data, feature_types, extra_drop_cols=extra_drops
-                )
-                m = LGBMClassifier(
-                    verbosity=-1, objective="binary", is_unbalance=True,
-                    random_state=seed, importance_type="gain",
-                )
-                X_tr_pd = X_tr.to_pandas() if hasattr(X_tr, 'to_pandas') else X_tr
-                X_va_pd = X_va.to_pandas() if hasattr(X_va, 'to_pandas') else X_va
-                m.fit(X_tr_pd, y_tr.to_numpy() if hasattr(y_tr, 'to_numpy') else y_tr)
-                scores.append(average_precision_score(_fst_y_val, m.predict_proba(X_va_pd)[:, 1]))
-            return np.mean(scores)
-
-        # Evaluate each transformed feature: current transform vs raw vs drop
-        for entry in _tourney_features:
-            col = entry["column"]
-            strategy = entry["strategy_applied"]
-
-            # --- Strategy: current (transform as-is) ---
-            current_score = _fst_score(_fst_train_m, _fst_val_m, drop_cols)
-
-            # --- Strategy: drop ---
-            drop_score = _fst_score(_fst_train_m, _fst_val_m, list(drop_cols) + [col])
-
-            # --- Strategy: raw (swap transformed column with original) ---
-            if col in _fst_train_raw.columns and col in _fst_val_raw.columns:
-                raw_train = _fst_train_m.with_columns(_fst_train_raw[col].alias(col))
-                raw_val = _fst_val_m.with_columns(_fst_val_raw[col].alias(col))
-                raw_score = _fst_score(raw_train, raw_val, drop_cols)
-            else:
-                raw_score = -1.0
-
-            # Pick winner (require 0.005 improvement over current to switch)
-            candidates = [("current", current_score), ("drop", drop_score), ("raw", raw_score)]
-            candidates.sort(key=lambda x: x[1], reverse=True)
-            best_name, best_sc = candidates[0]
-
-            if best_name == "current" or best_sc <= current_score + 0.005:
-                logger.info(f"  {col}: keep {strategy} (current={current_score:.4f}, drop={drop_score:.4f}, raw={raw_score:.4f})")
-            elif best_name == "drop":
-                drop_cols.append(col)
-                entry["strategy_applied"] = "Drop Feature (tournament)"
-                logger.info(f"  {col}: SWITCH to drop (current={current_score:.4f}, drop={drop_score:.4f}, raw={raw_score:.4f})")
-            elif best_name == "raw":
-                if col in train.columns:
-                    train_m = train_m.with_columns(train[col].alias(col))
-                    test_m = test_m.with_columns(test[col].alias(col))
-                    entry["strategy_applied"] = "Reverted to raw (tournament)"
-                logger.info(f"  {col}: SWITCH to raw (current={current_score:.4f}, drop={drop_score:.4f}, raw={raw_score:.4f})")
-
-        logger.info(f"Feature strategy tournament complete. Final drops: {drop_cols}")
-
     # --- Stage 4: Feature Engineering ---
-    # Save pre-FE mitigated data for later comparison (FE may not help)
-    train_m_no_fe, test_m_no_fe = train_m, test_m
-    drop_cols_no_fe = list(drop_cols)
-
     with Timer("Feature engineering") as feat_timer:
         train_m, test_m, new_feature_names = engineer_features(train_m, test_m, feature_types, drop_cols=drop_cols)
 
@@ -502,84 +378,7 @@ def main():
         except Exception as e:
             logger.warning(f"Feature selection skipped: {e}")
 
-        # --- FE validation: compare with-FE vs without-FE ---
-        from model import _to_pandas_with_categoricals, _native_cat_cols
-        try:
-            X_train_nofe, y_train_nofe, X_test_nofe, _ = prepare_features(
-                train_m_no_fe, test_m_no_fe, feature_types, extra_drop_cols=drop_cols_no_fe
-            )
-            _nofe_fs = train_model(X_train_nofe, y_train_nofe)
-            _nofe_imps = dict(zip(X_train_nofe.columns, _nofe_fs.feature_importances_))
-            _nofe_zero = [c for c, imp in _nofe_imps.items() if imp == 0]
-            if _nofe_zero and len(_nofe_zero) < len(X_train_nofe.columns):
-                X_train_nofe = X_train_nofe.drop(_nofe_zero)
-                X_test_nofe = X_test_nofe.drop(_nofe_zero)
-            _nofe_remaining = {c: _nofe_imps[c] for c in X_train_nofe.columns if c in _nofe_imps}
-            _nofe_top = [c for c in sorted(_nofe_remaining, key=lambda c: _nofe_remaining[c], reverse=True)[:8]
-                         if is_numeric_col(X_train_nofe[c])]
-            _nofe_int_tr, _nofe_int_te = [], []
-            for i, ca in enumerate(_nofe_top):
-                for cb in _nofe_top[i+1:]:
-                    fn = f"{ca}_x_{cb}"
-                    if fn not in X_train_nofe.columns:
-                        _nofe_int_tr.append((pl.col(ca) * pl.col(cb)).alias(fn))
-                        _nofe_int_te.append((pl.col(ca) * pl.col(cb)).alias(fn))
-            if _nofe_int_tr:
-                X_train_nofe = X_train_nofe.with_columns(_nofe_int_tr)
-                X_test_nofe = X_test_nofe.with_columns(_nofe_int_te)
-
-            # Month-stratified 80/20 split for FE validation
-            _val_frac = 0.2
-            _nofe_pd = _to_pandas_with_categoricals(X_train_nofe, _native_cat_cols)
-            _fe_pd = _to_pandas_with_categoricals(X_train_m, _native_cat_cols)
-            _nofe_y = y_train_nofe.to_numpy()
-            _fe_y = y_train_m.to_numpy()
-
-            _fe_rng = np.random.RandomState(42)
-            _fe_months = _month_vals
-            if isinstance(_fe_months, pl.Series):
-                _fe_months = _fe_months.to_numpy(allow_copy=True)
-
-            # Build val mask for FE data
-            _fe_val_mask = np.zeros(len(_fe_y), dtype=bool)
-            if _fe_months is not None:
-                for g in np.unique(_fe_months):
-                    g_idx = np.where(_fe_months == g)[0]
-                    n_val_g = max(1, int(len(g_idx) * _val_frac))
-                    chosen = _fe_rng.choice(g_idx, size=n_val_g, replace=False)
-                    _fe_val_mask[chosen] = True
-            _fe_tr = np.where(~_fe_val_mask)[0]
-            _fe_va = np.where(_fe_val_mask)[0]
-
-            _fe_mdl = LGBMClassifier(verbosity=-1, objective="binary", is_unbalance=True, random_state=42, importance_type="gain")
-            _fe_mdl.fit(_fe_pd.iloc[_fe_tr], _fe_y[_fe_tr])
-            _fe_sc = average_precision_score(_fe_y[_fe_va], _fe_mdl.predict_proba(_fe_pd.iloc[_fe_va])[:, 1])
-
-            # Build val mask for no-FE data (same seed)
-            _nofe_rng = np.random.RandomState(42)
-            _nofe_val_mask = np.zeros(len(_nofe_y), dtype=bool)
-            if _fe_months is not None:
-                for g in np.unique(_fe_months):
-                    g_idx = np.where(_fe_months == g)[0]
-                    n_val_g = max(1, int(len(g_idx) * _val_frac))
-                    chosen = _nofe_rng.choice(g_idx, size=n_val_g, replace=False)
-                    _nofe_val_mask[chosen] = True
-            _nofe_tr = np.where(~_nofe_val_mask)[0]
-            _nofe_va = np.where(_nofe_val_mask)[0]
-
-            _nofe_mdl = LGBMClassifier(verbosity=-1, objective="binary", is_unbalance=True, random_state=42, importance_type="gain")
-            _nofe_mdl.fit(_nofe_pd.iloc[_nofe_tr], _nofe_y[_nofe_tr])
-            _nofe_sc = average_precision_score(_nofe_y[_nofe_va], _nofe_mdl.predict_proba(_nofe_pd.iloc[_nofe_va])[:, 1])
-
-            logger.info(f"FE validation: with_FE={_fe_sc:.4f}, without_FE={_nofe_sc:.4f}")
-            if _nofe_sc > _fe_sc:
-                logger.info(f"FE validation: dropping FE features (without_FE wins by {_nofe_sc - _fe_sc:.4f})")
-                X_train_m, y_train_m, X_test_m = X_train_nofe, y_train_nofe, X_test_nofe
-                test_m = test_m_no_fe
-            else:
-                logger.info(f"FE validation: keeping FE features (with_FE wins by {_fe_sc - _nofe_sc:.4f})")
-        except Exception as e:
-            logger.warning(f"FE validation skipped: {e}")
+        from model import _native_cat_cols  # needed by Stage 5b self-training
 
         # --- Stage 5a: Iterative Mitigation (importance-aware) ---
         # Train a quick model to get importances, then re-mitigate features
