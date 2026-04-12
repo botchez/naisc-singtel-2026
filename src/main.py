@@ -87,12 +87,19 @@ def print_drift_mitigation_summary(
         print(full_sep("╚", "╝"))
         return
 
+    # Count by severity
+    n_total = len(drift_df)
+    n_high = len(drift_df.filter(pl.col("severity") == "high"))
+    n_moderate = len(drift_df.filter(pl.col("severity") == "moderate"))
+    n_low = n_total - n_high - n_moderate
+
+    print(full_sep("╠", "╣"))
+    print(full_row(f"{n_total} features analysed: {n_high} high, {n_moderate} moderate, {n_low} low drift"))
+
     # Filter to only drifted features (high or moderate)
     drifted = drift_df.filter(pl.col("severity").is_in(["high", "moderate"]))
 
     if len(drifted) == 0:
-        print(full_sep("╠", "╣"))
-        print(full_row("No high or moderate drift detected across all features."))
         print(full_sep("╚", "╝"))
         return
 
@@ -111,7 +118,8 @@ def print_drift_mitigation_summary(
     print(h_line("╠", "╬", "╣"))
 
     # Data rows
-    for r in drifted.iter_rows(named=True):
+    rows = list(drifted.iter_rows(named=True))
+    for ri, r in enumerate(rows):
         col_name = r["column"][:CW[0] - 2]
         ftype = r["feature_type"]
 
@@ -150,6 +158,8 @@ def print_drift_mitigation_summary(
             mitigation = f"{mitigation} → {iter_action}"
 
         print(col_row_wrap(col_name, ftype, drift_desc, mitigation))
+        if ri < len(rows) - 1:
+            print(h_line("╠", "╬", "╣"))
 
     # Close table
     print(h_line("╚", "╩", "╝"))
@@ -301,10 +311,6 @@ def main():
         )
 
     # --- Stage 4: Feature Engineering ---
-    # Save pre-FE mitigated data for FE validation comparison
-    train_m_no_fe, test_m_no_fe = train_m, test_m
-    drop_cols_no_fe = list(drop_cols)
-
     with Timer("Feature engineering") as feat_timer:
         train_m, test_m, new_feature_names = engineer_features(train_m, test_m, feature_types, drop_cols=drop_cols)
 
@@ -378,10 +384,10 @@ def main():
         # Train a quick model to get importances, then re-mitigate features
         # that are both high-importance AND still have residual drift.
         # This focuses compute on what actually affects predictions.
-        # Runs BEFORE FE validation so the comparison sees post-mitigation state.
+        # This focuses compute on what actually affects predictions.
         from drift_detector import detect_numerical_drift
         from mitigation import rank_transform, quantile_match
-        from model import _to_pandas_with_categoricals, _native_cat_cols
+        from model import _native_cat_cols
         _iter_log = {}  # col -> action string, for summary table
         try:
             _iter_model = train_model(X_train_m, y_train_m)
@@ -440,85 +446,6 @@ def main():
         except Exception as e:
             logger.warning(f"Iterative mitigation skipped: {e}")
 
-        # --- FE validation: compare with-FE vs without-FE ---
-        # Runs AFTER iterative mitigation so comparison sees final mitigated state.
-        from sklearn.metrics import average_precision_score
-        try:
-            X_train_nofe, y_train_nofe, X_test_nofe, _ = prepare_features(
-                train_m_no_fe, test_m_no_fe, feature_types, extra_drop_cols=drop_cols_no_fe
-            )
-            _nofe_fs = train_model(X_train_nofe, y_train_nofe)
-            _nofe_imps = dict(zip(X_train_nofe.columns, _nofe_fs.feature_importances_))
-            _nofe_zero = [c for c, imp in _nofe_imps.items() if imp == 0]
-            if _nofe_zero and len(_nofe_zero) < len(X_train_nofe.columns):
-                X_train_nofe = X_train_nofe.drop(_nofe_zero)
-                X_test_nofe = X_test_nofe.drop(_nofe_zero)
-            _nofe_remaining = {c: _nofe_imps[c] for c in X_train_nofe.columns if c in _nofe_imps}
-            _nofe_top = [c for c in sorted(_nofe_remaining, key=lambda c: _nofe_remaining[c], reverse=True)[:8]
-                         if is_numeric_col(X_train_nofe[c])]
-            _nofe_int_tr, _nofe_int_te = [], []
-            for i, ca in enumerate(_nofe_top):
-                for cb in _nofe_top[i+1:]:
-                    fn = f"{ca}_x_{cb}"
-                    if fn not in X_train_nofe.columns:
-                        _nofe_int_tr.append((pl.col(ca) * pl.col(cb)).alias(fn))
-                        _nofe_int_te.append((pl.col(ca) * pl.col(cb)).alias(fn))
-            if _nofe_int_tr:
-                X_train_nofe = X_train_nofe.with_columns(_nofe_int_tr)
-                X_test_nofe = X_test_nofe.with_columns(_nofe_int_te)
-
-            # Month-stratified 80/20 split for FE validation
-            _val_frac = 0.2
-            _nofe_pd = _to_pandas_with_categoricals(X_train_nofe, _native_cat_cols)
-            _fe_pd = _to_pandas_with_categoricals(X_train_m, _native_cat_cols)
-            _nofe_y = y_train_nofe.to_numpy()
-            _fe_y = y_train_m.to_numpy()
-
-            _fe_rng = np.random.RandomState(42)
-            _fe_months = _month_vals
-            if isinstance(_fe_months, pl.Series):
-                _fe_months = _fe_months.to_numpy(allow_copy=True)
-
-            # Build val mask for FE data
-            _fe_val_mask = np.zeros(len(_fe_y), dtype=bool)
-            if _fe_months is not None:
-                for g in np.unique(_fe_months):
-                    g_idx = np.where(_fe_months == g)[0]
-                    n_val_g = max(1, int(len(g_idx) * _val_frac))
-                    chosen = _fe_rng.choice(g_idx, size=n_val_g, replace=False)
-                    _fe_val_mask[chosen] = True
-            _fe_tr = np.where(~_fe_val_mask)[0]
-            _fe_va = np.where(_fe_val_mask)[0]
-
-            _fe_mdl = LGBMClassifier(verbosity=-1, objective="binary", is_unbalance=True, random_state=42, importance_type="gain")
-            _fe_mdl.fit(_fe_pd.iloc[_fe_tr], _fe_y[_fe_tr])
-            _fe_sc = average_precision_score(_fe_y[_fe_va], _fe_mdl.predict_proba(_fe_pd.iloc[_fe_va])[:, 1])
-
-            # Build val mask for no-FE data (same seed)
-            _nofe_rng = np.random.RandomState(42)
-            _nofe_val_mask = np.zeros(len(_nofe_y), dtype=bool)
-            if _fe_months is not None:
-                for g in np.unique(_fe_months):
-                    g_idx = np.where(_fe_months == g)[0]
-                    n_val_g = max(1, int(len(g_idx) * _val_frac))
-                    chosen = _nofe_rng.choice(g_idx, size=n_val_g, replace=False)
-                    _nofe_val_mask[chosen] = True
-            _nofe_tr = np.where(~_nofe_val_mask)[0]
-            _nofe_va = np.where(_nofe_val_mask)[0]
-
-            _nofe_mdl = LGBMClassifier(verbosity=-1, objective="binary", is_unbalance=True, random_state=42, importance_type="gain")
-            _nofe_mdl.fit(_nofe_pd.iloc[_nofe_tr], _nofe_y[_nofe_tr])
-            _nofe_sc = average_precision_score(_nofe_y[_nofe_va], _nofe_mdl.predict_proba(_nofe_pd.iloc[_nofe_va])[:, 1])
-
-            logger.info(f"FE validation: with_FE={_fe_sc:.4f}, without_FE={_nofe_sc:.4f}")
-            if _nofe_sc > _fe_sc:
-                logger.info(f"FE validation: dropping FE features (without_FE wins by {_nofe_sc - _fe_sc:.4f})")
-                X_train_m, y_train_m, X_test_m = X_train_nofe, y_train_nofe, X_test_nofe
-                test_m = test_m_no_fe
-            else:
-                logger.info(f"FE validation: keeping FE features (with_FE wins by {_fe_sc - _nofe_sc:.4f})")
-        except Exception as e:
-            logger.warning(f"FE validation skipped: {e}")
         # Train final model on full data with uniform weights
         lgbm_m = train_model(X_train_m, y_train_m)
 
