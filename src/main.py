@@ -292,23 +292,16 @@ def main():
         )
 
     # --- Stage 4: Feature Engineering ---
+    # Save pre-FE mitigated data for FE validation comparison
+    train_m_no_fe, test_m_no_fe = train_m, test_m
+    drop_cols_no_fe = list(drop_cols)
+
     with Timer("Feature engineering") as feat_timer:
         train_m, test_m, new_feature_names = engineer_features(train_m, test_m, feature_types, drop_cols=drop_cols)
 
-        # Post-engineering drift check: drop high-drift engineered features
-        from drift_detector import detect_numerical_drift
-        eng_dropped = []
-        for col in new_feature_names:
-            if col not in train_m.columns or col not in test_m.columns:
-                continue
-            drift = detect_numerical_drift(train_m[col], test_m[col])
-            if drift["severity"] == "high":
-                train_m = train_m.drop(col)
-                test_m = test_m.drop(col)
-                eng_dropped.append(col)
-                drop_cols.append(col)
-        if eng_dropped:
-            logger.info(f"Dropped {len(eng_dropped)} high-drift engineered features: {eng_dropped}")
+        # Post-engineering drift check removed — iterative mitigation (Stage 5a)
+        # handles engineered features more intelligently using importance-aware
+        # mitigation instead of blanket dropping.
 
     # --- Stage 5: Model Training & Prediction ---
     with Timer("Model training") as model_timer:
@@ -372,14 +365,14 @@ def main():
         except Exception as e:
             logger.warning(f"Feature selection skipped: {e}")
 
-        from model import _native_cat_cols  # needed by Stage 5b self-training
-
         # --- Stage 5a: Iterative Mitigation (importance-aware) ---
         # Train a quick model to get importances, then re-mitigate features
         # that are both high-importance AND still have residual drift.
         # This focuses compute on what actually affects predictions.
+        # Runs BEFORE FE validation so the comparison sees post-mitigation state.
         from drift_detector import detect_numerical_drift
         from mitigation import rank_transform, quantile_match
+        from model import _to_pandas_with_categoricals, _native_cat_cols
         try:
             _iter_model = train_model(X_train_m, y_train_m)
             _iter_imps = dict(zip(X_train_m.columns, _iter_model.feature_importances_))
@@ -389,10 +382,9 @@ def main():
             # Check top important numeric features for residual drift
             _iter_sorted = sorted(_iter_imps.items(), key=lambda x: x[1], reverse=True)
             _iter_count = 0
+            _iter_dropped = []
             _native_cat_set = set(_native_cat_cols)
             for col, imp in _iter_sorted:
-                if imp < _imp_threshold:
-                    break
                 if col not in X_train_m.columns or col not in X_test_m.columns:
                     continue
                 if not is_numeric_col(X_train_m[col]):
@@ -406,6 +398,13 @@ def main():
                     continue
                 drift = detect_numerical_drift(X_train_m[col], X_test_m[col])
                 if drift["severity"] in ("high", "moderate"):
+                    if imp < _imp_threshold and drift["severity"] == "high":
+                        # Low-importance + high-drift: drop instead of transforming
+                        X_train_m = X_train_m.drop(col)
+                        X_test_m = X_test_m.drop(col)
+                        _iter_dropped.append(col)
+                        logger.info(f"  Iterative mitigation: {col} (imp={imp:.0f}, {drift['severity']}) → dropped (low importance)")
+                        continue
                     # Try quantile match first (preserves scale), fall back to rank transform
                     tr_qm, te_qm = quantile_match(X_train_m[col], X_test_m[col])
                     qm_drift = detect_numerical_drift(tr_qm, te_qm)
@@ -423,9 +422,90 @@ def main():
                 logger.info(f"Iterative mitigation: re-mitigated {_iter_count} high-importance drifted features")
             else:
                 logger.info("Iterative mitigation: no high-importance features with residual drift")
+            if _iter_dropped:
+                logger.info(f"Iterative mitigation: dropped {len(_iter_dropped)} low-importance high-drift features: {_iter_dropped}")
         except Exception as e:
             logger.warning(f"Iterative mitigation skipped: {e}")
 
+        # --- FE validation: compare with-FE vs without-FE ---
+        # Runs AFTER iterative mitigation so comparison sees final mitigated state.
+        from sklearn.metrics import average_precision_score
+        try:
+            X_train_nofe, y_train_nofe, X_test_nofe, _ = prepare_features(
+                train_m_no_fe, test_m_no_fe, feature_types, extra_drop_cols=drop_cols_no_fe
+            )
+            _nofe_fs = train_model(X_train_nofe, y_train_nofe)
+            _nofe_imps = dict(zip(X_train_nofe.columns, _nofe_fs.feature_importances_))
+            _nofe_zero = [c for c, imp in _nofe_imps.items() if imp == 0]
+            if _nofe_zero and len(_nofe_zero) < len(X_train_nofe.columns):
+                X_train_nofe = X_train_nofe.drop(_nofe_zero)
+                X_test_nofe = X_test_nofe.drop(_nofe_zero)
+            _nofe_remaining = {c: _nofe_imps[c] for c in X_train_nofe.columns if c in _nofe_imps}
+            _nofe_top = [c for c in sorted(_nofe_remaining, key=lambda c: _nofe_remaining[c], reverse=True)[:8]
+                         if is_numeric_col(X_train_nofe[c])]
+            _nofe_int_tr, _nofe_int_te = [], []
+            for i, ca in enumerate(_nofe_top):
+                for cb in _nofe_top[i+1:]:
+                    fn = f"{ca}_x_{cb}"
+                    if fn not in X_train_nofe.columns:
+                        _nofe_int_tr.append((pl.col(ca) * pl.col(cb)).alias(fn))
+                        _nofe_int_te.append((pl.col(ca) * pl.col(cb)).alias(fn))
+            if _nofe_int_tr:
+                X_train_nofe = X_train_nofe.with_columns(_nofe_int_tr)
+                X_test_nofe = X_test_nofe.with_columns(_nofe_int_te)
+
+            # Month-stratified 80/20 split for FE validation
+            _val_frac = 0.2
+            _nofe_pd = _to_pandas_with_categoricals(X_train_nofe, _native_cat_cols)
+            _fe_pd = _to_pandas_with_categoricals(X_train_m, _native_cat_cols)
+            _nofe_y = y_train_nofe.to_numpy()
+            _fe_y = y_train_m.to_numpy()
+
+            _fe_rng = np.random.RandomState(42)
+            _fe_months = _month_vals
+            if isinstance(_fe_months, pl.Series):
+                _fe_months = _fe_months.to_numpy(allow_copy=True)
+
+            # Build val mask for FE data
+            _fe_val_mask = np.zeros(len(_fe_y), dtype=bool)
+            if _fe_months is not None:
+                for g in np.unique(_fe_months):
+                    g_idx = np.where(_fe_months == g)[0]
+                    n_val_g = max(1, int(len(g_idx) * _val_frac))
+                    chosen = _fe_rng.choice(g_idx, size=n_val_g, replace=False)
+                    _fe_val_mask[chosen] = True
+            _fe_tr = np.where(~_fe_val_mask)[0]
+            _fe_va = np.where(_fe_val_mask)[0]
+
+            _fe_mdl = LGBMClassifier(verbosity=-1, objective="binary", is_unbalance=True, random_state=42, importance_type="gain")
+            _fe_mdl.fit(_fe_pd.iloc[_fe_tr], _fe_y[_fe_tr])
+            _fe_sc = average_precision_score(_fe_y[_fe_va], _fe_mdl.predict_proba(_fe_pd.iloc[_fe_va])[:, 1])
+
+            # Build val mask for no-FE data (same seed)
+            _nofe_rng = np.random.RandomState(42)
+            _nofe_val_mask = np.zeros(len(_nofe_y), dtype=bool)
+            if _fe_months is not None:
+                for g in np.unique(_fe_months):
+                    g_idx = np.where(_fe_months == g)[0]
+                    n_val_g = max(1, int(len(g_idx) * _val_frac))
+                    chosen = _nofe_rng.choice(g_idx, size=n_val_g, replace=False)
+                    _nofe_val_mask[chosen] = True
+            _nofe_tr = np.where(~_nofe_val_mask)[0]
+            _nofe_va = np.where(_nofe_val_mask)[0]
+
+            _nofe_mdl = LGBMClassifier(verbosity=-1, objective="binary", is_unbalance=True, random_state=42, importance_type="gain")
+            _nofe_mdl.fit(_nofe_pd.iloc[_nofe_tr], _nofe_y[_nofe_tr])
+            _nofe_sc = average_precision_score(_nofe_y[_nofe_va], _nofe_mdl.predict_proba(_nofe_pd.iloc[_nofe_va])[:, 1])
+
+            logger.info(f"FE validation: with_FE={_fe_sc:.4f}, without_FE={_nofe_sc:.4f}")
+            if _nofe_sc > _fe_sc:
+                logger.info(f"FE validation: dropping FE features (without_FE wins by {_nofe_sc - _fe_sc:.4f})")
+                X_train_m, y_train_m, X_test_m = X_train_nofe, y_train_nofe, X_test_nofe
+                test_m = test_m_no_fe
+            else:
+                logger.info(f"FE validation: keeping FE features (with_FE wins by {_fe_sc - _nofe_sc:.4f})")
+        except Exception as e:
+            logger.warning(f"FE validation skipped: {e}")
         # Train final model on full data with uniform weights
         lgbm_m = train_model(X_train_m, y_train_m)
 
