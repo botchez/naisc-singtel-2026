@@ -24,6 +24,7 @@ def print_drift_mitigation_summary(
     drop_cols: list[str],
     mitigation_log: list[dict] | None = None,
     norm_log: dict[str, list[str]] | None = None,
+    iter_log: dict[str, str] | None = None,
 ) -> None:
     """Print combined drift detection & mitigation summary as a unified double-line table."""
     CW = (26, 14, 50, 30)
@@ -124,7 +125,10 @@ def print_drift_mitigation_summary(
             sev = r["severity"].capitalize()
             drift_desc = f"{sev}: JSD={r['jsd']:.2f}, Chi2 p={r['chi2_pval']:.3f}"
 
-        # Use strategy from mitigation_log if available
+        # Build mitigation description from all stages
+        # Stage 3: progressive mitigation (strategy_map)
+        # Normalization actions (norm_log)
+        # Stage 5a: iterative mitigation (iter_log)
         if r["column"] in strategy_map:
             mitigation = strategy_map[r["column"]]
         else:
@@ -139,6 +143,11 @@ def print_drift_mitigation_summary(
                 mitigation = "Drop Feature"
             else:
                 mitigation = "Moderate drift, retained"
+
+        # Append iterative mitigation action if this feature was further processed
+        if iter_log and r["column"] in iter_log:
+            iter_action = iter_log[r["column"]]
+            mitigation = f"{mitigation} → {iter_action}"
 
         print(col_row_wrap(col_name, ftype, drift_desc, mitigation))
 
@@ -373,6 +382,7 @@ def main():
         from drift_detector import detect_numerical_drift
         from mitigation import rank_transform, quantile_match
         from model import _to_pandas_with_categoricals, _native_cat_cols
+        _iter_log = {}  # col -> action string, for summary table
         try:
             _iter_model = train_model(X_train_m, y_train_m)
             _iter_imps = dict(zip(X_train_m.columns, _iter_model.feature_importances_))
@@ -403,6 +413,7 @@ def main():
                         X_train_m = X_train_m.drop(col)
                         X_test_m = X_test_m.drop(col)
                         _iter_dropped.append(col)
+                        _iter_log[col] = "Dropped (low importance)"
                         logger.info(f"  Iterative mitigation: {col} (imp={imp:.0f}, {drift['severity']}) → dropped (low importance)")
                         continue
                     # Try quantile match first (preserves scale), fall back to rank transform
@@ -411,11 +422,13 @@ def main():
                     if qm_drift["severity"] == "low":
                         X_train_m = X_train_m.with_columns(tr_qm.alias(col))
                         X_test_m = X_test_m.with_columns(te_qm.alias(col))
+                        _iter_log[col] = "Quantile matching"
                         logger.info(f"  Iterative mitigation: {col} (imp={imp:.0f}, {drift['severity']}) → quantile match → low")
                     else:
                         tr_rk, te_rk = rank_transform(X_train_m[col], X_test_m[col])
                         X_train_m = X_train_m.with_columns(tr_rk.alias(col))
                         X_test_m = X_test_m.with_columns(te_rk.alias(col))
+                        _iter_log[col] = "Rank transform"
                         logger.info(f"  Iterative mitigation: {col} (imp={imp:.0f}, {drift['severity']}) → rank transform")
                     _iter_count += 1
             if _iter_count:
@@ -570,7 +583,7 @@ def main():
         shutil.copy("model_mitigated.joblib", "model.joblib")
 
     # --- All tables printed after all stages complete ---
-    print_drift_mitigation_summary(drift_df, drop_cols, mitigation_log, norm_log)
+    print_drift_mitigation_summary(drift_df, drop_cols, mitigation_log, norm_log, _iter_log)
     model_results = [
         ("Baseline", baseline_metrics),
         ("Mitigated", mitigated_metrics),
