@@ -27,7 +27,7 @@ def print_drift_mitigation_summary(
     iter_log: dict[str, str] | None = None,
 ) -> None:
     """Print combined drift detection & mitigation summary as a unified double-line table."""
-    CW = (28, 10, 40, 42)
+    CW = (26, 14, 50, 30)
     FULL_W = sum(CW) + len(CW) - 1
 
     def full_row(text):
@@ -104,91 +104,52 @@ def print_drift_mitigation_summary(
 
     drop_set = set(drop_cols)
 
-    # Title → header
+    # Title → header (introduces column dividers)
     print(h_line("╠", "╦", "╣"))
-    print(col_row("Column", "Severity", "Drift Signal", "Action"))
+    print(col_row("Column", "Type", "Drift Description", "Mitigation"))
+    # Header → data (crossing)
     print(h_line("╠", "╬", "╣"))
 
     # Data rows
     for r in drifted.iter_rows(named=True):
         col_name = r["column"][:CW[0] - 2]
-        severity = r["severity"].upper()
-
-        # Build concise drift description with key metric
         ftype = r["feature_type"]
-        if ftype == "numerical":
-            parts = []
-            psi = r.get("psi") or 0
-            w_norm = r.get("wasserstein_norm") or 0
-            ks_stat = r.get("ks_stat") or 0
-            if psi >= 0.1:
-                parts.append(f"PSI={psi:.3f}")
-            if w_norm >= 0.3:
-                parts.append(f"W={w_norm:.2f}")
-            if ks_stat >= 0.05:
-                parts.append(f"KS={ks_stat:.3f}")
-            # Add qualitative shift direction
-            desc = r.get("drift_description", "") or ""
-            if "higher" in desc:
-                parts.append("mean shifted up")
-            elif "lower" in desc:
-                parts.append("mean shifted down")
-            if "skewness" in desc:
-                parts.append("skew changed")
-            if "range" in desc:
-                parts.append("range changed")
-            drift_desc = "; ".join(parts) if parts else f"PSI={psi:.3f}"
+
+        # Use qualitative description if available, fall back to metrics
+        if "drift_description" in r and r.get("drift_description") is not None:
+            drift_desc = str(r["drift_description"])
+        elif ftype == "numerical":
+            sev = r["severity"].capitalize()
+            drift_desc = f"{sev}: PSI={r['psi']:.2f}, KS p={r['ks_pval']:.3f}"
         else:
-            parts = []
-            jsd = r.get("jsd") or 0
-            cv = r.get("cramers_v") or 0
-            if jsd >= 0.01:
-                parts.append(f"JSD={jsd:.3f}")
-            if cv >= 0.1:
-                parts.append(f"V={cv:.2f}")
-            desc = r.get("drift_description", "") or ""
-            if "dominant category changes" in desc:
-                # Extract the mode change
-                import re
-                m = re.search(r"from '(.+?)' to '(.+?)'", desc)
-                if m:
-                    parts.append(f"mode: {m.group(1)} -> {m.group(2)}")
-            elif "new" in desc and "categorical" in desc:
-                parts.append("unseen categories in test")
-            unseen = r.get("unseen_in_test", "")
-            if unseen and "unseen" not in " ".join(parts):
-                parts.append("unseen categories in test")
-            drift_desc = "; ".join(parts) if parts else f"JSD={jsd:.3f}"
+            sev = r["severity"].capitalize()
+            drift_desc = f"{sev}: JSD={r['jsd']:.2f}, Chi2 p={r['chi2_pval']:.3f}"
 
-        # Build mitigation chain
-        action_parts = []
-
-        # Stage 3: normalization
-        norm_actions = norm_log.get(r["column"], []) if norm_log else []
-        if norm_actions:
-            action_parts.append(", ".join(a.lower() for a in norm_actions))
-
-        # Stage 3: progressive mitigation
+        # Build mitigation description from all stages
+        # Stage 3: progressive mitigation (strategy_map)
+        # Normalization actions (norm_log)
+        # Stage 5a: iterative mitigation (iter_log)
         if r["column"] in strategy_map:
-            strat = strategy_map[r["column"]]
-            if strat != "Drop Feature":
-                action_parts.append(strat.lower())
-            else:
-                action_parts.append("dropped (all strategies failed)")
-        elif r["column"] in drop_set and not norm_actions:
-            action_parts.append("dropped (all strategies failed)")
-
-        # Stage 5a: iterative mitigation
-        if iter_log and r["column"] in iter_log:
-            action_parts.append(iter_log[r["column"]].lower())
-
-        if not action_parts:
-            mitigation = "retained"
+            mitigation = strategy_map[r["column"]]
         else:
-            mitigation = " -> ".join(action_parts)
-            mitigation = mitigation[0].upper() + mitigation[1:]
+            dropped = r["column"] in drop_set
+            actions = norm_log.get(r["column"], []) if norm_log else []
+            if actions:
+                label = ", ".join(a.lower() for a in actions)
+                if dropped:
+                    label += ", dropped"
+                mitigation = label[0].upper() + label[1:]
+            elif dropped:
+                mitigation = "Drop Feature"
+            else:
+                mitigation = "Moderate drift, retained"
 
-        print(col_row_wrap(col_name, severity, drift_desc, mitigation))
+        # Append iterative mitigation action if this feature was further processed
+        if iter_log and r["column"] in iter_log:
+            iter_action = iter_log[r["column"]]
+            mitigation = f"{mitigation} → {iter_action}"
+
+        print(col_row_wrap(col_name, ftype, drift_desc, mitigation))
 
     # Close table
     print(h_line("╚", "╩", "╝"))
