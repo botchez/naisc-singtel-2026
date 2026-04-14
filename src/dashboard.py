@@ -59,7 +59,17 @@ def get_assets():
     model = joblib.load("model.joblib")
     feature_types = detect_feature_types(train)
     drift_df = run_drift_analysis(train, test, feature_types)
-    
+
+    train = train.to_pandas()
+    test = test.to_pandas()
+    drift_df = drift_df.to_pandas()
+
+    for col in feature_types.get("numerical", []):
+        if col in train.columns:
+            train[col] = pd.to_numeric(train[col], errors="coerce")
+        if col in test.columns:
+            test[col] = pd.to_numeric(test[col], errors="coerce")
+
     importance_df = pd.DataFrame({
         'column': model.feature_name_,
         'importance': model.feature_importances_
