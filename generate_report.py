@@ -12,14 +12,30 @@ from fpdf import FPDF
 TEAM = "junyiding"
 DATE = "April 2026"
 
-# Colours (R, G, B)
-DARK_BLUE = (26, 58, 92)
-MED_BLUE = (41, 98, 150)
-LIGHT_BLUE = (220, 235, 250)
+# Colours (R, G, B) - pastel palette
+SLATE = (62, 83, 119)          # deepest accent (headings, cover title)
+PERIWINKLE = (120, 144, 190)   # section bar, subsection text
+LAVENDER = (232, 236, 247)     # soft fill for boxes, mono blocks
+CHARCOAL = (55, 55, 70)        # warm body text (not pure black)
+SOFT_CREAM = (249, 248, 246)   # alternating table rows
+MUTED = (135, 135, 150)        # footer, TOC dots, soft labels
+ROSE = (206, 171, 178)         # warm accent (sub-header line, cover dot, key-results stripe)
+MINT = (198, 220, 210)         # spare accent
+
+# Pastel severity tones
+BLUSH = (244, 213, 216)        # HIGH
+PEACH = (250, 226, 195)        # MODERATE
+SAGE = (213, 232, 212)         # LOW
+
 WHITE = (255, 255, 255)
-BLACK = (0, 0, 0)
-GRAY_BG = (245, 245, 245)
-DARK_GRAY = (80, 80, 80)
+BLACK = (0, 0, 0)              # kept for explicit pure-black needs only
+
+# Aliases: old names keep working but now resolve to pastel palette
+DARK_BLUE = SLATE
+MED_BLUE = PERIWINKLE
+LIGHT_BLUE = LAVENDER
+GRAY_BG = SOFT_CREAM
+DARK_GRAY = MUTED
 
 # Metrics from pipeline run
 BASELINE_TRAIN = 0.9252
@@ -58,56 +74,238 @@ class ReportPDF(FPDF):
         self.set_font("Courier", "", size)
 
     def section_header(self, num, title):
-        """Print a section header with dark-blue background bar and smart page break."""
+        """Soft pastel section header with rounded corners + smart page break."""
         if self.get_y() + 50 > self.h - self.b_margin:
             self.add_page()
         else:
             self.ln(8)
-        self.set_fill_color(*DARK_BLUE)
+        pw = self.w - self.l_margin - self.r_margin
+        y = self.get_y()
+        # Rounded pill bar
+        self.set_fill_color(*PERIWINKLE)
+        self.rect(self.l_margin, y, pw, 8, style="F",
+                  round_corners=True, corner_radius=1.8)
+        # Title text on top
+        self.set_xy(self.l_margin + 3, y)
         self.set_text_color(*WHITE)
         self._set_font("B", 12)
-        self.cell(0, 8, f"  {num}. {title}", new_x="LMARGIN", new_y="NEXT", fill=True)
-        self.set_text_color(*BLACK)
-        self.ln(2)
+        self.cell(pw - 3, 8, f"{num}. {title}", new_x="LMARGIN", new_y="NEXT")
+        self.set_text_color(*CHARCOAL)
+        self.ln(3)
 
     def sub_header(self, num, title):
-        """Print a subsection header with accent line."""
+        """Subsection header (no accent line)."""
         self.ln(2)
-        self.set_text_color(*MED_BLUE)
+        self.set_text_color(*SLATE)
         self._set_font("B", 10.5)
         self.cell(0, 6, f"{num}  {title}", new_x="LMARGIN", new_y="NEXT")
-        y = self.get_y()
-        self.set_draw_color(*MED_BLUE)
-        self.set_line_width(0.3)
-        self.line(self.l_margin, y, self.l_margin + 70, y)
-        self.set_draw_color(0, 0, 0)
-        self.set_line_width(0.2)
-        self.set_text_color(*BLACK)
-        self.ln(1)
+        self.set_text_color(*CHARCOAL)
+        self.ln(1.5)
 
     def body(self, text):
         self._set_font("", 9.5)
-        self.multi_cell(0, 4.5, text)
+        self.set_text_color(*CHARCOAL)
+        self.multi_cell(0, 4.7, text)
         self.ln(1)
 
     def body_bold(self, text):
         self._set_font("B", 9.5)
-        self.multi_cell(0, 4.5, text)
+        self.set_text_color(*CHARCOAL)
+        self.multi_cell(0, 4.7, text)
         self.ln(1)
 
     def small_body(self, text):
         self._set_font("", 8.5)
-        self.multi_cell(0, 4, text)
+        self.set_text_color(*CHARCOAL)
+        self.multi_cell(0, 4.2, text)
         self.ln(1)
 
     def mono_block(self, text):
-        """Monospace block with light background."""
-        self.set_fill_color(*LIGHT_BLUE)
+        """Monospace block with rounded lavender background."""
+        pw = self.w - self.l_margin - self.r_margin
+        lines = text.split("\n")
+        line_h = 3.8
+        pad = 1.5
+        total_h = line_h * len(lines) + pad * 2
+        y0 = self.get_y()
+        # Page break if needed
+        if y0 + total_h > self.h - self.b_margin:
+            self.add_page()
+            y0 = self.get_y()
+        # Rounded lavender background
+        self.set_fill_color(*LAVENDER)
+        self.rect(self.l_margin, y0, pw, total_h, style="F",
+                  round_corners=True, corner_radius=1.8)
+        # Text on top
         self._set_mono(7)
-        for line in text.split("\n"):
-            self.cell(0, 3.5, f"  {line}", new_x="LMARGIN", new_y="NEXT", fill=True)
-        self.set_fill_color(*WHITE)
-        self.ln(2)
+        self.set_text_color(*SLATE)
+        for i, line in enumerate(lines):
+            self.set_xy(self.l_margin + 3, y0 + pad + i * line_h)
+            self.cell(pw - 6, line_h, line)
+        self.set_y(y0 + total_h)
+        self.set_text_color(*CHARCOAL)
+        self.ln(2.5)
+
+    def draw_pipeline_flowchart(self):
+        """Horizontal 5-stage flowchart with coloured rounded boxes + arrows."""
+        stages = [
+            ("Stage 1", "Profiling", "profiler.py",
+             "Load CSVs, fuzzy-match columns, auto-classify types",
+             LAVENDER, PERIWINKLE),
+            ("Stage 2", "Drift Detection", "drift_detector.py",
+             "PSI, KS, Chi2, JSD, Wasserstein + BH FDR",
+             BLUSH, ROSE),
+            ("Stage 3", "Drift Mitigation", "mitigation.py",
+             "Quality norm, progressive per-feature mitigation",
+             PEACH, ROSE),
+            ("Stage 4", "Feature Eng.", "feature_engineer.py",
+             "Missing indicators, frequency enc., ratios",
+             SAGE, PERIWINKLE),
+            ("Stage 5", "Model Training", "model.py",
+             "Baseline vs mitigated + self-training",
+             MINT, SLATE),
+        ]
+        pw = self.w - self.l_margin - self.r_margin
+        box_w = 30.0
+        gap = (pw - box_w * len(stages)) / (len(stages) - 1)
+        box_h = 26.0
+        total_h = box_h + 8  # room for caption
+
+        if self.get_y() + total_h > self.h - self.b_margin:
+            self.add_page()
+
+        y0 = self.get_y()
+        centres_y = y0 + box_h / 2
+
+        for i, (stage_num, title, fname, summary, fill, border) in enumerate(stages):
+            x = self.l_margin + i * (box_w + gap)
+
+            # Box
+            self.set_fill_color(*fill)
+            self.set_draw_color(*border)
+            self.set_line_width(0.35)
+            self.rect(x, y0, box_w, box_h, style="DF",
+                      round_corners=True, corner_radius=1.5)
+
+            # Stage N (small)
+            self.set_text_color(*SLATE)
+            self._set_font("B", 7.5)
+            self.set_xy(x + 1.5, y0 + 1.8)
+            self.cell(box_w - 3, 3.5, stage_num)
+
+            # Title
+            self._set_font("B", 9)
+            self.set_xy(x + 1.5, y0 + 5.5)
+            self.cell(box_w - 3, 4.5, title)
+
+            # File name
+            self.set_text_color(*MUTED)
+            self.set_font("Courier", "", 6.5)
+            self.set_xy(x + 1.5, y0 + 10.2)
+            self.cell(box_w - 3, 3.5, fname)
+
+            # Summary (wrapped)
+            self.set_text_color(*CHARCOAL)
+            self._set_font("", 6.5)
+            self.set_xy(x + 1.5, y0 + 14.0)
+            self.multi_cell(box_w - 3, 3.2, summary)
+
+            # Arrow to next box
+            if i < len(stages) - 1:
+                ax1 = x + box_w + 0.8
+                ax2 = x + box_w + gap - 0.8
+                self.set_draw_color(*PERIWINKLE)
+                self.set_line_width(0.5)
+                self.line(ax1, centres_y, ax2, centres_y)
+                # Arrowhead
+                head = 1.6
+                self.line(ax2, centres_y, ax2 - head, centres_y - head)
+                self.line(ax2, centres_y, ax2 - head, centres_y + head)
+
+        # Reset defaults
+        self.set_line_width(0.2)
+        self.set_draw_color(0, 0, 0)
+        self.set_y(y0 + box_h + 1.5)
+
+        # Caption
+        self.set_text_color(*MUTED)
+        self._set_font("I", 8.5)
+        self.cell(0, 4, "Output: prediction.csv + model.joblib",
+                  align="C", new_x="LMARGIN", new_y="NEXT")
+        self.set_text_color(*CHARCOAL)
+        self.ln(2.5)
+
+    def draw_auprc_bars(self, x, y, w, h, baseline, mitigated):
+        """Small two-bar AU-PRC comparison chart drawn with rect primitives."""
+        # Title
+        self.set_text_color(*SLATE)
+        self._set_font("B", 8)
+        self.set_xy(x, y)
+        self.cell(w, 4, "Test AU-PRC", align="C")
+
+        # Plot frame
+        plot_x = x + 10.0
+        plot_y = y + 6.0
+        plot_w = w - 13.0
+        plot_h = 30.0
+        baseline_y_axis = plot_y + plot_h  # y=0 line
+
+        # Y-axis ticks at 0.0, 0.5, 1.0
+        self.set_draw_color(215, 215, 222)
+        self.set_line_width(0.2)
+        self.set_text_color(*MUTED)
+        self._set_font("", 6.5)
+        for tick in (0.0, 0.5, 1.0):
+            ty = baseline_y_axis - tick * plot_h
+            self.line(plot_x, ty, plot_x + plot_w, ty)
+            self.set_xy(x, ty - 1.6)
+            self.cell(9.0, 3.2, f"{tick:.1f}", align="R")
+
+        # Bars
+        bar_w = 12.0
+        gap = 6.0
+        bars_total = bar_w * 2 + gap
+        bars_x0 = plot_x + (plot_w - bars_total) / 2
+
+        for idx, (value, label, fill) in enumerate([
+            (baseline, "Baseline", PERIWINKLE),
+            (mitigated, "Mitigated", ROSE),
+        ]):
+            bx = bars_x0 + idx * (bar_w + gap)
+            bh = value * plot_h
+            by = baseline_y_axis - bh
+
+            self.set_fill_color(*fill)
+            self.set_draw_color(*SLATE)
+            self.set_line_width(0.25)
+            self.rect(bx, by, bar_w, bh, style="DF",
+                      round_corners=True, corner_radius=0.6)
+
+            # Value label above bar
+            self.set_text_color(*SLATE)
+            self._set_font("B", 7.5)
+            self.set_xy(bx - 2, by - 3.8)
+            self.cell(bar_w + 4, 3.2, f"{value:.4f}", align="C")
+
+            # Category label below bar
+            self.set_text_color(*CHARCOAL)
+            self._set_font("", 7)
+            self.set_xy(bx - 2, baseline_y_axis + 0.8)
+            self.cell(bar_w + 4, 3.2, label, align="C")
+
+        # +% annotation above mitigated bar
+        improvement = (mitigated - baseline) / baseline * 100
+        mit_bx = bars_x0 + (bar_w + gap)
+        mit_by = baseline_y_axis - mitigated * plot_h
+        self.set_text_color(*ROSE)
+        self._set_font("BI", 7)
+        self.set_xy(mit_bx - 2, mit_by - 7.8)
+        self.cell(bar_w + 4, 3.2, f"+{improvement:.1f}%", align="C")
+
+        # Reset
+        self.set_line_width(0.2)
+        self.set_draw_color(0, 0, 0)
+        self.set_text_color(*CHARCOAL)
 
     def table(self, headers, rows, col_widths=None, font_size=8.5):
         """Draw a simple table with alternating row colours."""
@@ -153,68 +351,81 @@ class ReportPDF(FPDF):
         self.ln(2)
 
     def simple_table(self, headers, rows, col_widths=None, font_size=8.5, row_bg=None):
-        """Table with automatic text wrapping in cells."""
+        """Table with automatic text wrapping, rounded cells, soft borders."""
         w = self.w - self.l_margin - self.r_margin
         if col_widths is None:
             col_widths = [w / len(headers)] * len(headers)
 
-        # header
-        self.set_fill_color(*DARK_BLUE)
+        # header - slate pill cells
+        self.set_fill_color(*SLATE)
+        self.set_draw_color(*SLATE)
         self.set_text_color(*WHITE)
         self._set_font("B", font_size)
+        header_h = 6
+        x_start = self.l_margin
+        y_h = self.get_y()
         for i, h in enumerate(headers):
-            self.cell(col_widths[i], 5.5, f" {h}", border=1, fill=True)
-        self.ln()
+            x = x_start + sum(col_widths[:i])
+            self.rect(x, y_h, col_widths[i], header_h, style="F",
+                      round_corners=True, corner_radius=1.0)
+            self.set_xy(x + 1.5, y_h)
+            self.cell(col_widths[i] - 3, header_h, str(h))
+        self.set_y(y_h + header_h)
 
         # rows
-        self.set_text_color(*BLACK)
+        self.set_text_color(*CHARCOAL)
         self._set_font("", font_size)
-        save_draw = self.draw_color
-        self.set_draw_color(180, 180, 180)
+        self.set_draw_color(215, 215, 222)
         for r_idx, row in enumerate(rows):
             if row_bg and r_idx < len(row_bg):
                 bg = row_bg[r_idx]
             elif r_idx % 2 == 0:
-                bg = GRAY_BG
+                bg = SOFT_CREAM
             else:
                 bg = WHITE
 
-            # Calculate max height needed across all cells in this row
+            # Row height from longest wrapped cell
             max_h = 5.5
             for i, cell in enumerate(row):
-                cw = max(col_widths[i] - 2, 5)
+                cw = max(col_widths[i] - 3, 5)
                 lines = self.multi_cell(cw, 4.5, str(cell), dry_run=True, output="LINES")
-                max_h = max(max_h, len(lines) * 4.5 + 1)
+                max_h = max(max_h, len(lines) * 4.5 + 1.2)
 
-            x_start = self.l_margin
             y_start = self.get_y()
-
             if y_start + max_h > self.h - self.b_margin:
                 self.add_page()
                 y_start = self.get_y()
 
-            # Draw uniform-height cells
+            # Uniform-height rounded cells
             for i, cell in enumerate(row):
                 x = x_start + sum(col_widths[:i])
                 self.set_fill_color(*bg)
-                self.rect(x, y_start, col_widths[i], max_h, style="DF")
-                self.set_xy(x + 1, y_start + 0.5)
-                self.multi_cell(col_widths[i] - 2, 4.5, str(cell))
+                self.rect(x, y_start, col_widths[i], max_h, style="DF",
+                          round_corners=True, corner_radius=0.8)
+                self.set_xy(x + 1.5, y_start + 0.7)
+                self.multi_cell(col_widths[i] - 3, 4.5, str(cell))
 
             self.set_y(y_start + max_h)
-        self.draw_color = save_draw
+        self.set_draw_color(0, 0, 0)
+        self.set_text_color(*CHARCOAL)
         self.ln(2)
 
     def bullet(self, text):
-        self._set_font("", 9.5)
+        """Periwinkle marker dash, charcoal body."""
+        self._set_font("B", 10)
+        self.set_text_color(*PERIWINKLE)
         self.set_x(self.l_margin)
-        w = self.w - self.l_margin - self.r_margin
-        self.multi_cell(w, 4.5, f"  -  {text}")
+        self.cell(5, 4.7, "-")
+        self._set_font("", 9.5)
+        self.set_text_color(*CHARCOAL)
+        w = self.w - self.l_margin - self.r_margin - 5
+        # multi_cell continues from current x
+        self.multi_cell(w, 4.7, text)
 
     def footer(self):
         self.set_y(-15)
         self._set_font("I", 7.5)
-        self.set_text_color(*DARK_GRAY)
+        self.set_text_color(*MUTED)
         self.cell(0, 10, f"Team {TEAM} | NAISC 2026 Singtel Adaptive Drift Intelligence Challenge",
                   align="L")
         self.cell(0, 10, f"Page {self.page_no()}/{{nb}}", align="R")
@@ -232,31 +443,28 @@ def build_report():
     # PAGE 1: Cover
     # ======================================================================
     pdf.add_page()
-    # Cover accent: vertical bar on left
-    pdf.set_fill_color(*DARK_BLUE)
-    pdf.rect(0, 0, 4, pdf.h, style="F")
-    pdf.ln(50)
-    pdf.set_text_color(*DARK_BLUE)
+
+    pdf.ln(55)
+    pdf.set_text_color(*SLATE)
     pdf.set_font("Helvetica", "B", 28)
     pdf.cell(0, 14, "Adaptive Drift Intelligence", align="C", new_x="LMARGIN", new_y="NEXT")
     pdf.cell(0, 14, "Challenge", align="C", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(6)
+    pdf.set_text_color(*PERIWINKLE)
     pdf.set_font("Helvetica", "", 16)
     pdf.cell(0, 10, "Technical Report", align="C", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(4)
-    pdf.set_draw_color(*DARK_BLUE)
-    pdf.set_line_width(0.8)
-    pdf.line(pdf.l_margin + 40, pdf.get_y(), pdf.w - pdf.r_margin - 40, pdf.get_y())
-    pdf.ln(8)
+    pdf.ln(10)
+
+    pdf.set_text_color(*SLATE)
     pdf.set_font("Helvetica", "B", 14)
     pdf.cell(0, 8, "NAISC Singtel 2026", align="C", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(6)
     pdf.set_font("Helvetica", "", 12)
-    pdf.set_text_color(*DARK_GRAY)
+    pdf.set_text_color(*MUTED)
     pdf.cell(0, 7, f"Team: {TEAM}", align="C", new_x="LMARGIN", new_y="NEXT")
     pdf.cell(0, 7, DATE, align="C", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(16)
-    pdf.set_text_color(*BLACK)
+    pdf.set_text_color(*CHARCOAL)
     pdf.set_font("Helvetica", "I", 10)
     pdf.multi_cell(0, 5, (
         "A 5-stage automated pipeline for robust churn prediction through "
@@ -271,10 +479,10 @@ def build_report():
     pdf.add_page()
 
     # Table of contents
-    pdf.set_text_color(*DARK_BLUE)
+    pdf.set_text_color(*SLATE)
     pdf._set_font("B", 14)
     pdf.cell(0, 8, "Table of Contents", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_text_color(*BLACK)
+    pdf.set_text_color(*CHARCOAL)
     pdf.ln(2)
     toc = [
         ("1", "System Architecture", "3"),
@@ -287,7 +495,11 @@ def build_report():
     ]
     pdf._set_font("", 10)
     for num, title, pg in toc:
+        pdf.set_text_color(*SLATE)
+        pdf._set_font("B", 10)
         pdf.cell(8, 5.5, num + ".")
+        pdf._set_font("", 10)
+        pdf.set_text_color(*CHARCOAL)
         title_w = pdf.get_string_width(title) + 2
         pdf.cell(title_w, 5.5, title)
         # Leader dots
@@ -295,20 +507,21 @@ def build_report():
         dot_w = pdf.get_string_width(" . ")
         n_dots = max(1, int(remaining / dot_w))
         dot_str = (" . " * n_dots).rstrip()
-        pdf.set_text_color(180, 180, 180)
+        pdf.set_text_color(*MUTED)
         pdf._set_font("", 8)
         pdf.cell(remaining, 5.5, dot_str, align="L")
-        pdf.set_text_color(*BLACK)
-        pdf._set_font("", 10)
+        pdf.set_text_color(*SLATE)
+        pdf._set_font("B", 10)
         pdf.cell(12, 5.5, pg, align="R")
         pdf.ln()
+    pdf.set_text_color(*CHARCOAL)
     pdf.ln(4)
 
     # Executive Summary
-    pdf.set_text_color(*DARK_BLUE)
+    pdf.set_text_color(*SLATE)
     pdf._set_font("B", 14)
     pdf.cell(0, 8, "Executive Summary", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_text_color(*BLACK)
+    pdf.set_text_color(*CHARCOAL)
     pdf.ln(2)
 
     pdf.body(
@@ -332,16 +545,24 @@ def build_report():
         f"to {MITIGATED_TEST:.4f} (mitigated), a {((MITIGATED_TEST - BASELINE_TEST) / BASELINE_TEST * 100):.1f}% "
         f"relative improvement. Total pipeline runtime: {RUNTIME['Total']}."
     )
-    # Highlight box
+    # Soft highlight box with rose left stripe
     y_box = pdf.get_y()
     pdf._set_font("", 9.5)
-    lines = pdf.multi_cell(pw - 10, 4.5, key_text, dry_run=True, output="LINES")
-    box_h = len(lines) * 4.5 + 5
-    pdf.set_fill_color(*LIGHT_BLUE)
-    pdf.rect(pdf.l_margin, y_box, pw, box_h, style="F")
-    pdf.set_xy(pdf.l_margin + 5, y_box + 2.5)
-    pdf.multi_cell(pw - 10, 4.5, key_text)
-    pdf.set_y(y_box + box_h + 2)
+    lines = pdf.multi_cell(pw - 13, 4.7, key_text, dry_run=True, output="LINES")
+    box_h = len(lines) * 4.7 + 6
+    # Lavender rounded background
+    pdf.set_fill_color(*LAVENDER)
+    pdf.rect(pdf.l_margin, y_box, pw, box_h, style="F",
+             round_corners=True, corner_radius=2.5)
+    # Rose accent stripe (rounded pill on left)
+    pdf.set_fill_color(*ROSE)
+    pdf.rect(pdf.l_margin + 1.5, y_box + 1.5, 2, box_h - 3, style="F",
+             round_corners=True, corner_radius=1.0)
+    # Text inside
+    pdf.set_text_color(*CHARCOAL)
+    pdf.set_xy(pdf.l_margin + 7, y_box + 3)
+    pdf.multi_cell(pw - 13, 4.7, key_text)
+    pdf.set_y(y_box + box_h + 2.5)
     pdf.body_bold("Key Innovations:")
     innovations = [
         "Multi-metric compound severity classification (not single-threshold)",
@@ -368,31 +589,7 @@ def build_report():
         "column names or manual intervention required."
     )
 
-    pipeline_diagram = (
-        "Stage 1: Data Ingestion & Profiling        (profiler.py)\n"
-        "  Load CSVs -> Fuzzy-match columns -> Auto-classify types\n"
-        "  -> Numeric coercion -> Memory downcast -> Decision sample (100K)\n"
-        "              |\n"
-        "Stage 2: Drift Detection                   (drift_detector.py)\n"
-        "  Per-feature statistical tests (PSI, KS, Chi2, JSD, Wasserstein)\n"
-        "  -> Severity classification -> BH FDR correction\n"
-        "              |\n"
-        "Stage 3: Drift Mitigation                  (mitigation.py)\n"
-        "  Data quality normalization -> Re-check drift\n"
-        "  -> Progressive per-feature mitigation (mildest to strongest)\n"
-        "              |\n"
-        "Stage 4: Feature Engineering               (feature_engineer.py)\n"
-        "  Missing indicators -> Frequency encoding -> Ratio features\n"
-        "  -> Aggregation features -> Deduplication -> Drift check\n"
-        "              |\n"
-        "Stage 5: Model Training & Prediction       (model.py)\n"
-        "  Baseline model (no mitigation) vs Mitigated model:\n"
-        "    Feature selection -> Interaction terms -> Iterative mitigation\n"
-        "    -> Self-training -> Final predictions\n"
-        "              |\n"
-        "Output: prediction.csv + model.joblib"
-    )
-    pdf.mono_block(pipeline_diagram)
+    pdf.draw_pipeline_flowchart()
 
     pdf.sub_header("1.2", "Design Principles")
     pdf.simple_table(
@@ -506,9 +703,9 @@ def build_report():
         ],
         col_widths=[24, pw - 24],
         row_bg=[
-            (255, 230, 230), (255, 230, 230), (255, 230, 230),
-            (255, 243, 224), (255, 243, 224),
-            (230, 255, 230),
+            BLUSH, BLUSH, BLUSH,
+            PEACH, PEACH,
+            SAGE,
         ],
     )
 
@@ -522,9 +719,9 @@ def build_report():
         ],
         col_widths=[24, pw - 24],
         row_bg=[
-            (255, 230, 230),
-            (255, 243, 224),
-            (230, 255, 230),
+            BLUSH,
+            PEACH,
+            SAGE,
         ],
     )
 
@@ -832,6 +1029,7 @@ def build_report():
             ["Total", str(TOTAL_FEATURES), "100%"],
         ],
         col_widths=[30, 25, 25],
+        row_bg=[BLUSH, PEACH, SAGE, SOFT_CREAM],
     )
 
     pdf.sub_header("6.2", "Drift Mitigation Summary")
@@ -865,16 +1063,25 @@ def build_report():
     )
 
     pdf.sub_header("6.3", "Model Performance")
+    y_start = pdf.get_y()
     pdf.simple_table(
-        ["Metric", "Baseline (no mitigation)", "Mitigated", "Improvement"],
+        ["Metric", "Baseline", "Mitigated", "Improvement"],
         [
             ["AU-PRC (train)", f"{BASELINE_TRAIN:.4f}", f"{MITIGATED_TRAIN:.4f}",
              f"{(MITIGATED_TRAIN - BASELINE_TRAIN) / BASELINE_TRAIN * 100:+.2f}%"],
             ["AU-PRC (test)", f"{BASELINE_TEST:.4f}", f"{MITIGATED_TEST:.4f}",
              f"+{(MITIGATED_TEST - BASELINE_TEST) / BASELINE_TEST * 100:.1f}%"],
         ],
-        col_widths=[30, 38, 30, 25],
+        col_widths=[22, 26, 24, 26],
     )
+    y_table_end = pdf.get_y()
+    chart_h = 44.0
+    pdf.draw_auprc_bars(
+        x=pdf.l_margin + 105, y=y_start, w=60, h=chart_h,
+        baseline=BASELINE_TEST, mitigated=MITIGATED_TEST,
+    )
+    pdf.set_y(max(y_table_end, y_start + chart_h))
+    pdf.ln(1)
     pdf.body(
         f"The mitigated model achieves a {((MITIGATED_TEST - BASELINE_TEST) / BASELINE_TEST * 100):.1f}% "
         f"relative improvement in test AU-PRC over the baseline. Notably, the training AU-PRC "
