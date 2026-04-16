@@ -2,7 +2,18 @@
 
 **Team Name:** junyiding
 
-## Setup
+## Quick Start (Docker)
+
+```bash
+docker build -t naisc . && docker run --rm naisc
+
+# Build once (or after code changes)                                                                                                                                                                                                                                                docker build -t naisc .                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                    
+# Run as many times as you want — no reinstall
+  docker run --cpus=2 -v ${PWD}/stress_test_data:/app/stress_test_data naisc python ./src/main.py --train_data_filepath stress_test_data/train.csv --test_data_filepath stress_test_data/test.csv
+```
+
+## Setup (without Docker)
 
 ```bash
 pip install -r requirements.txt
@@ -31,7 +42,7 @@ python ./src/main.py --train_data_filepath public_data/train.csv --test_data_fil
 Interactive drift visualization dashboard:
 
 ```bash
-streamlit run src/dashboard.py
+python -m streamlit run src/dashboard.py
 ```
 
 Opens in browser at `http://localhost:8501`.
