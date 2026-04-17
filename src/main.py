@@ -461,6 +461,8 @@ def main():
             if col in X_test_lgbm.columns:
                 X_test_lgbm[col] = X_test_lgbm[col].astype("category")
 
+        _self_training_stats = {"n_pseudo": 0, "n_pos": 0, "n_neg": 0,
+                                 "conf_high": _ST_CONF_HIGH, "conf_low": _ST_CONF_LOW}
         for st_iter in range(_ST_MAX_ITERS):
             test_proba = lgbm_m.predict_proba(X_test_lgbm)[:, 1]
 
@@ -495,6 +497,14 @@ def main():
             lgbm_m = train_model(X_aug, y_aug)
 
             pos_pseudo = pseudo_labels.sum()
+            _self_training_stats = {
+                "n_pseudo": int(n_pseudo),
+                "n_pos": int(pos_pseudo),
+                "n_neg": int(n_pseudo - pos_pseudo),
+                "conf_high": _ST_CONF_HIGH,
+                "conf_low": _ST_CONF_LOW,
+                "augmented_train_size": int(len(X_aug)),
+            }
             logger.info(
                 f"Self-training iter {st_iter+1}: {n_pseudo} pseudo-labeled samples "
                 f"({pos_pseudo} pos, {n_pseudo - pos_pseudo} neg), "
@@ -518,6 +528,34 @@ def main():
     print_model_performance_summary(model_results)
     _pipeline_elapsed = time.perf_counter() - _pipeline_start
     print_runtime_summary(ingest_timer.elapsed, drift_timer.elapsed, mitigation_timer.elapsed, feat_timer.elapsed, model_timer.elapsed, _pipeline_elapsed)
+
+    # --- Dashboard artifacts dump ---
+    # Lets src/dashboard.py render every stage's outputs without re-running the pipeline.
+    import joblib as _joblib
+    _joblib.dump({
+        "train": train,
+        "test": test,
+        "feature_types": feature_types,
+        "drift_df": drift_df,
+        "norm_log": norm_log or {},
+        "drop_cols": list(drop_cols),
+        "mitigation_log": mitigation_log,
+        "iter_log": dict(_iter_log),
+        "new_feature_names": list(new_feature_names),
+        "self_training": _self_training_stats,
+        "baseline_metrics": baseline_metrics,
+        "mitigated_metrics": mitigated_metrics,
+        "runtimes": {
+            "ingest": ingest_timer.elapsed,
+            "drift": drift_timer.elapsed,
+            "mitigation": mitigation_timer.elapsed,
+            "feature_eng": feat_timer.elapsed,
+            "model": model_timer.elapsed,
+            "total": _pipeline_elapsed,
+        },
+        "train_shape": tuple(train.shape),
+        "test_shape": tuple(test.shape),
+    }, "dashboard_artifacts.joblib")
 
 
 if __name__ == "__main__":
