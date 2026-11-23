@@ -1,6 +1,7 @@
 # NAISC 2026 — Singtel Track: Adaptive Drift Intelligence Challenge
 
 **Team:** junyiding  
+**Result:** 🏅 Finalist  
 **Competition:** National AI Student Challenge (NAISC) 2026, Singtel track — *Guarding Model Integrity in a Shifting Data World*  
 **Challenge period:** 6 March – 17 April 2026 (submitted 12PM SGT, 17 April 2026)
 
